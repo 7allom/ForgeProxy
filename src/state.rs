@@ -409,6 +409,8 @@ pub struct App {
     /// Selected item (index) in the Item 1 and Item 2 lists.
     pub comparer_sel_a: Option<usize>,
     pub comparer_sel_b: Option<usize>,
+    /// Active Comparer table pane: 0 = Item 1, 1 = Item 2.
+    pub comparer_active_pane: u8,
     /// The open comparison window.
     pub comparer_active_diff: Option<crate::comparer::DiffView>,
     pub comparer_next_id: usize,
@@ -609,6 +611,7 @@ impl App {
             comparer_items: Vec::new(),
             comparer_sel_a: None,
             comparer_sel_b: None,
+            comparer_active_pane: 0,
             comparer_active_diff: None,
             comparer_next_id: 0,
             comparer_paste: String::new(),
@@ -1190,6 +1193,38 @@ mod close_tests {
         assert!(app.dec_hex_error.as_deref().unwrap_or("").contains("Invalid hex sequence"));
         assert_eq!(app.dec_hex_input, "61 64 6");
         assert_eq!(app.dec_raw[0], b"admin");
+    }
+
+    #[test]
+    fn comparer_remove_selected_respects_active_pane_and_fallback() {
+        let (_ctx, mut app) = new_app();
+        crate::comparer::add_text(&mut app, "first", "one");
+        crate::comparer::add_text(&mut app, "second", "two");
+        crate::comparer::add_text(&mut app, "third", "three");
+        assert_eq!(app.comparer_items.len(), 3);
+
+        // Select row 0 in Item 1, row 2 in Item 2 with pane 1 active -> removes row 2
+        app.comparer_sel_a = Some(0);
+        app.comparer_sel_b = Some(2);
+        app.comparer_active_pane = 1;
+        crate::comparer::remove_selected(&mut app);
+        assert_eq!(app.comparer_items.len(), 2);
+        assert_eq!(app.comparer_sel_a, Some(0));
+        assert_eq!(app.comparer_sel_b, None);
+
+        // Fallback: pane 0 is active, but only Item 2 has a selection -> removes Item 2's selection
+        app.comparer_sel_a = None;
+        app.comparer_sel_b = Some(1);
+        app.comparer_active_pane = 0;
+        crate::comparer::remove_selected(&mut app);
+        assert_eq!(app.comparer_items.len(), 1);
+        assert_eq!(app.comparer_items[0].label, "first");
+        assert_eq!(app.comparer_sel_b, None);
+
+        // Out-of-bounds selection is safely clamped without panicking
+        app.comparer_sel_a = Some(99);
+        crate::comparer::remove_selected(&mut app);
+        assert_eq!(app.comparer_sel_a, Some(0));
     }
 }
 

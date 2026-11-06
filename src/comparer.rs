@@ -1,8 +1,7 @@
 //! Comparer: captured items and the two comparisons.
 //!
-//! Words: both items are split into tokens (runs of letters/digits, runs of whitespace,
-//! single punctuation characters, so joining the tokens gives the text back exactly) and
-//! diffed with Myers' algorithm (linear-space, O((N+M)·D)). Runs of changes are grouped:
+//! Words: both items are tokenized at the word level (`diff_words`) and diffed with
+//! `similar::TextDiff` configured with `Algorithm::Patience`. Runs of changes are grouped:
 //! a deletion next to an insertion is a modification, shown on both sides.
 //!
 //! Bytes: the two buffers are compared offset by offset (shown as 16-byte hex dump rows); a
@@ -79,12 +78,15 @@ pub struct ByteDiff {
     pub diff_rows: Vec<usize>,
 }
 
-/// Largest word comparison (tokens in both items together); beyond it, use bytes.
-pub const MAX_WORD_TOKENS: usize = 200_000;
+/// Safety ceiling for word-level comparison (256 KB per item); beyond it, fall back to byte diff.
+pub const MAX_WORD_DIFF_SIZE: usize = 256 * 1024;
+/// Fallback message displayed when an item exceeds [`MAX_WORD_DIFF_SIZE`].
+pub const WORD_DIFF_LIMIT_NOTE: &str = "Item exceeds 256 KB — byte diff active.";
 
 // ---- tokens ---------------------------------------------------------------------------
 
 /// Tokens whose concatenation is exactly `s`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tokenize(s: &str) -> Vec<&str> {
     #[derive(PartialEq, Clone, Copy)]
     enum K { Word, Space, Punct }
@@ -108,159 +110,79 @@ pub fn tokenize(s: &str) -> Vec<&str> {
     out
 }
 
-// ---- Myers diff ------------------------------------------------------------------------
+// ---- word comparison (Patience Diff) -----------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Op {
-    /// a[i] == b[j]
-    Equal(usize, usize),
-    /// a[i] only
-    Delete(usize),
-    /// b[j] only
-    Insert(usize),
-}
-
-/// Edit script turning `a` into `b`, with the fewest insertions and deletions.
-pub fn diff_ops<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Op> {
-    let max = a.len() + b.len() + 1;
-    let mut vf = vec![0usize; 2 * max + 2];
-    let mut vb = vec![0usize; 2 * max + 2];
-    let mut out = Vec::with_capacity(max);
-    conquer(a, 0, a.len(), b, 0, b.len(), &mut vf, &mut vb, &mut out);
-    out
-}
-
-fn conquer<T: PartialEq>(a: &[T], mut a0: usize, mut a1: usize, b: &[T], mut b0: usize, mut b1: usize,
-                         vf: &mut [usize], vb: &mut [usize], out: &mut Vec<Op>) {
-    // common prefix and suffix
-    while a0 < a1 && b0 < b1 && a[a0] == b[b0] {
-        out.push(Op::Equal(a0, b0));
-        a0 += 1;
-        b0 += 1;
+/// Compute a word-level diff using `similar::TextDiff` configured with `Algorithm::Patience`.
+/// Returns `Err(WORD_DIFF_LIMIT_NOTE)` when either input exceeds [`MAX_WORD_DIFF_SIZE`] (256 KB).
+pub fn compute_patience_word_diff(a: &str, b: &str) -> Result<WordDiff, String> {
+    if a.len() > MAX_WORD_DIFF_SIZE || b.len() > MAX_WORD_DIFF_SIZE {
+        return Err(WORD_DIFF_LIMIT_NOTE.into());
     }
-    let mut suffix = 0;
-    while a0 < a1 && b0 < b1 && a[a1 - 1] == b[b1 - 1] {
-        a1 -= 1;
-        b1 -= 1;
-        suffix += 1;
-    }
-    if a0 == a1 {
-        out.extend((b0..b1).map(Op::Insert));
-    } else if b0 == b1 {
-        out.extend((a0..a1).map(Op::Delete));
-    } else {
-        let (x, y) = middle_snake(a, a0, a1, b, b0, b1, vf, vb);
-        conquer(a, a0, x, b, b0, y, vf, vb, out);
-        conquer(a, x, a1, b, y, b1, vf, vb, out);
-    }
-    out.extend((0..suffix).map(|k| Op::Equal(a1 + k, b1 + k)));
-}
-
-/// A split point (x, y) on an optimal path through a[a0..a1] × b[b0..b1] (both non-empty),
-/// found by running the forward and backward searches until they overlap.
-fn middle_snake<T: PartialEq>(a: &[T], a0: usize, a1: usize, b: &[T], b0: usize, b1: usize,
-                              vf: &mut [usize], vb: &mut [usize]) -> (usize, usize) {
-    let n = (a1 - a0) as isize;
-    let m = (b1 - b0) as isize;
-    let delta = n - m;
-    let odd = delta & 1 != 0;
-    let off = (n + m + 1) as isize; // index offset for diagonal k
-    let at = |k: isize| (k + off) as usize;
-    vf[at(1)] = 0;
-    vb[at(1)] = 0;
-    let d_max = (n + m + 1) / 2;
-    for d in 0..=d_max {
-        // forward: furthest x on each diagonal k = x - y
-        let mut k = -d;
-        while k <= d {
-            let mut x = if k == -d || (k != d && vf[at(k - 1)] < vf[at(k + 1)]) { vf[at(k + 1)] as isize } else { vf[at(k - 1)] as isize + 1 };
-            let mut y = x - k;
-            let (sx, sy) = (x, y);
-            while x < n && y < m && a[a0 + x as usize] == b[b0 + y as usize] {
-                x += 1;
-                y += 1;
-            }
-            vf[at(k)] = x as usize;
-            let kb = delta - k; // the same diagonal in backward coordinates
-            if odd && kb >= -(d - 1) && kb <= d - 1 && x + vb[at(kb)] as isize >= n {
-                // split where this forward snake starts: a point on an optimal path
-                return (a0 + sx as usize, b0 + sy as usize);
-            }
-            k += 2;
-        }
-        // backward: furthest distance from the end on each diagonal
-        let mut k = -d;
-        while k <= d {
-            let mut x = if k == -d || (k != d && vb[at(k - 1)] < vb[at(k + 1)]) { vb[at(k + 1)] as isize } else { vb[at(k - 1)] as isize + 1 };
-            let mut y = x - k;
-            while x < n && y < m && a[a1 - 1 - x as usize] == b[b1 - 1 - y as usize] {
-                x += 1;
-                y += 1;
-            }
-            vb[at(k)] = x as usize;
-            let kf = delta - k;
-            if !odd && kf >= -d && kf <= d && x + vf[at(kf)] as isize >= n {
-                return (a0 + (n - x) as usize, b0 + (m - y) as usize);
-            }
-            k += 2;
-        }
-    }
-    // unreachable for non-empty inputs; split anywhere valid
-    (a0 + 1, b0)
-}
-
-// ---- word comparison ---------------------------------------------------------------------
-
-/// None when the items are too large for a word comparison (see `MAX_WORD_TOKENS`).
-pub fn diff_words(a: &str, b: &str) -> Option<WordDiff> {
-    let ta = tokenize(a);
-    let tb = tokenize(b);
-    if ta.len() + tb.len() > MAX_WORD_TOKENS {
-        return None;
-    }
-    let ops = diff_ops(&ta, &tb);
-    let mut out = WordDiff { a: Vec::new(), b: Vec::new(), changes: 0, change_lines: Vec::new() };
+    let diff = similar::TextDiff::configure()
+        .algorithm(similar::Algorithm::Patience)
+        .diff_words(a, b);
+    let old_slices = diff.old_slices();
+    let new_slices = diff.new_slices();
+    let mut out = WordDiff {
+        a: Vec::new(),
+        b: Vec::new(),
+        changes: 0,
+        change_lines: Vec::new(),
+    };
     let push = |spans: &mut Vec<Span>, change: Change, text: &str| match spans.last_mut() {
         Some(last) if last.change == change => last.text.push_str(text),
         _ => spans.push(Span { change, text: text.to_string() }),
     };
     let (mut line_a, mut line_b) = (0usize, 0usize);
-    let mut i = 0;
-    while i < ops.len() {
-        if let Op::Equal(x, y) = ops[i] {
-            push(&mut out.a, Change::Same, ta[x]);
-            push(&mut out.b, Change::Same, tb[y]);
-            line_a += ta[x].matches('\n').count();
-            line_b += tb[y].matches('\n').count();
-            i += 1;
-            continue;
-        }
-        // a run of changes, up to the next equal token
-        let start = i;
-        while i < ops.len() && !matches!(ops[i], Op::Equal(..)) {
-            i += 1;
-        }
-        let run = &ops[start..i];
-        let dels: Vec<&str> = run.iter().filter_map(|o| if let Op::Delete(x) = o { Some(ta[*x]) } else { None }).collect();
-        let ins: Vec<&str> = run.iter().filter_map(|o| if let Op::Insert(y) = o { Some(tb[*y]) } else { None }).collect();
-        // whitespace-only changes still count, but a pure layout change reads better as such
-        let (ca, cb) = match (dels.is_empty(), ins.is_empty()) {
-            (false, false) => (Change::Modified, Change::Modified),
-            (false, true) => (Change::Deleted, Change::Same),
-            _ => (Change::Same, Change::Inserted),
-        };
-        out.changes += 1;
-        out.change_lines.push((line_a, line_b));
-        for t in &dels {
-            push(&mut out.a, ca, t);
-            line_a += t.matches('\n').count();
-        }
-        for t in &ins {
-            push(&mut out.b, cb, t);
-            line_b += t.matches('\n').count();
+    for op in diff.ops() {
+        match *op {
+            similar::DiffOp::Equal { old_index, new_index, len } => {
+                for k in 0..len {
+                    let ta = old_slices[old_index + k];
+                    let tb = new_slices[new_index + k];
+                    push(&mut out.a, Change::Same, ta);
+                    push(&mut out.b, Change::Same, tb);
+                    line_a += ta.matches('\n').count();
+                    line_b += tb.matches('\n').count();
+                }
+            }
+            similar::DiffOp::Delete { old_index, old_len, .. } => {
+                out.changes += 1;
+                out.change_lines.push((line_a, line_b));
+                for &t in &old_slices[old_index..old_index + old_len] {
+                    push(&mut out.a, Change::Deleted, t);
+                    line_a += t.matches('\n').count();
+                }
+            }
+            similar::DiffOp::Insert { new_index, new_len, .. } => {
+                out.changes += 1;
+                out.change_lines.push((line_a, line_b));
+                for &t in &new_slices[new_index..new_index + new_len] {
+                    push(&mut out.b, Change::Inserted, t);
+                    line_b += t.matches('\n').count();
+                }
+            }
+            similar::DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                out.changes += 1;
+                out.change_lines.push((line_a, line_b));
+                for &t in &old_slices[old_index..old_index + old_len] {
+                    push(&mut out.a, Change::Modified, t);
+                    line_a += t.matches('\n').count();
+                }
+                for &t in &new_slices[new_index..new_index + new_len] {
+                    push(&mut out.b, Change::Modified, t);
+                    line_b += t.matches('\n').count();
+                }
+            }
         }
     }
-    Some(out)
+    Ok(out)
+}
+
+/// None when either item exceeds `MAX_WORD_DIFF_SIZE` (256 KB).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn diff_words(a: &str, b: &str) -> Option<WordDiff> {
+    compute_patience_word_diff(a, b).ok()
 }
 
 // ---- byte comparison ---------------------------------------------------------------------
@@ -306,16 +228,17 @@ impl PartialEq for WordJob {
 }
 
 impl WordJob {
-    /// Diff `a` and `b` word by word off the UI thread (Myers is O((N+M)·D): large, very
-    /// different items take long enough to freeze the window).
+    /// Diff `a` and `b` word by word off the UI thread using Patience Diff.
     fn start(a: Vec<u8>, b: Vec<u8>) -> Self {
         let slot = std::sync::Arc::new(std::sync::OnceLock::new());
         let out = slot.clone();
         std::thread::spawn(move || {
-            let (a, b) = (String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
-            let res = diff_words(&a, &b).ok_or_else(|| {
-                format!("These items are too large for a word comparison (over {MAX_WORD_TOKENS} words and symbols). Compare bytes instead.")
-            });
+            let res = if a.len() > MAX_WORD_DIFF_SIZE || b.len() > MAX_WORD_DIFF_SIZE {
+                Err(WORD_DIFF_LIMIT_NOTE.to_string())
+            } else {
+                let (a, b) = (String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
+                compute_patience_word_diff(&a, &b)
+            };
             let _ = out.set(res);
         });
         WordJob(slot)
@@ -336,11 +259,22 @@ pub struct DiffView {
     pub bytes: Option<ByteDiff>,
     /// Difference the view last jumped to.
     pub current: Option<usize>,
+    /// Note shown when word diff falls back to byte diff because an item exceeds 256 KB.
+    pub fallback_note: Option<String>,
 }
 
 impl DiffView {
     pub fn new(a: ComparerItem, b: ComparerItem, mode: DiffMode) -> Self {
-        let mut v = DiffView { mode, a, b, words: None, words_job: None, bytes: None, current: None };
+        let mut v = DiffView {
+            mode,
+            a,
+            b,
+            words: None,
+            words_job: None,
+            bytes: None,
+            current: None,
+            fallback_note: None,
+        };
         v.set_mode(mode);
         v
     }
@@ -349,11 +283,29 @@ impl DiffView {
         self.mode = mode;
         self.current = None;
         match mode {
-            DiffMode::Words if self.words.is_none() && self.words_job.is_none() => {
-                self.words_job = Some(WordJob::start(self.a.data.clone(), self.b.data.clone()));
-                self.poll();
+            DiffMode::Words => {
+                if self.a.data.len() > MAX_WORD_DIFF_SIZE || self.b.data.len() > MAX_WORD_DIFF_SIZE {
+                    let note = WORD_DIFF_LIMIT_NOTE.to_string();
+                    self.words = Some(Err(note.clone()));
+                    self.fallback_note = Some(note);
+                    self.mode = DiffMode::Bytes;
+                    if self.bytes.is_none() {
+                        self.bytes = Some(diff_bytes(&self.a.data, &self.b.data));
+                    }
+                } else if let Some(Err(note)) = &self.words {
+                    self.fallback_note = Some(note.clone());
+                    self.mode = DiffMode::Bytes;
+                    if self.bytes.is_none() {
+                        self.bytes = Some(diff_bytes(&self.a.data, &self.b.data));
+                    }
+                } else if self.words.is_none() && self.words_job.is_none() {
+                    self.words_job = Some(WordJob::start(self.a.data.clone(), self.b.data.clone()));
+                    self.poll();
+                }
             }
-            DiffMode::Bytes if self.bytes.is_none() => self.bytes = Some(diff_bytes(&self.a.data, &self.b.data)),
+            DiffMode::Bytes if self.bytes.is_none() => {
+                self.bytes = Some(diff_bytes(&self.a.data, &self.b.data));
+            }
             _ => {}
         }
     }
@@ -363,8 +315,16 @@ impl DiffView {
         let Some(job) = &self.words_job else { return false };
         match job.0.get() {
             Some(res) => {
-                self.words = Some(res.clone());
+                let res_cloned = res.clone();
                 self.words_job = None;
+                if let Err(note) = &res_cloned {
+                    self.fallback_note = Some(note.clone());
+                    self.mode = DiffMode::Bytes;
+                    if self.bytes.is_none() {
+                        self.bytes = Some(diff_bytes(&self.a.data, &self.b.data));
+                    }
+                }
+                self.words = Some(res_cloned);
                 false
             }
             None => true,
@@ -423,6 +383,29 @@ pub fn remove(app: &mut crate::state::App, i: usize) {
     app.comparer_sel_b = fix(app.comparer_sel_b);
 }
 
+/// Remove the item selected in the active Comparer pane (0 = Item 1, 1 = Item 2), falling back to the other pane.
+pub fn remove_selected(app: &mut crate::state::App) {
+    let target = if app.comparer_active_pane == 1 {
+        app.comparer_sel_b.or(app.comparer_sel_a)
+    } else {
+        app.comparer_sel_a.or(app.comparer_sel_b)
+    };
+    if let Some(idx) = target {
+        if idx < app.comparer_items.len() {
+            remove(app, idx);
+        } else {
+            let len = app.comparer_items.len();
+            let clamp = |sel: Option<usize>| match sel {
+                Some(_) if len == 0 => None,
+                Some(s) if s >= len => Some(len - 1),
+                other => other,
+            };
+            app.comparer_sel_a = clamp(app.comparer_sel_a);
+            app.comparer_sel_b = clamp(app.comparer_sel_b);
+        }
+    }
+}
+
 /// Open a comparison of the selected items (they must be two different items).
 pub fn compare_selected(app: &mut crate::state::App, mode: DiffMode) -> bool {
     match (app.comparer_sel_a, app.comparer_sel_b) {
@@ -450,48 +433,20 @@ mod tests {
         assert_eq!(tokenize("naïve café"), ["naïve", " ", "café"]);
     }
 
-    /// LCS length by dynamic programming, to check Myers finds an optimal script.
-    fn lcs_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
-        let mut t = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-        for i in (0..a.len()).rev() {
-            for j in (0..b.len()).rev() {
-                t[i][j] = if a[i] == b[j] { t[i + 1][j + 1] + 1 } else { t[i + 1][j].max(t[i][j + 1]) };
-            }
-        }
-        t[0][0]
-    }
-
-    fn check_script(a: &[u8], b: &[u8]) {
-        let ops = diff_ops(a, b);
-        // the script consumes each side in order, and equal pairs are equal
-        let (mut i, mut j) = (0, 0);
-        for op in &ops {
-            match *op {
-                Op::Equal(x, y) => { assert_eq!((x, y), (i, j)); assert_eq!(a[x], b[y]); i += 1; j += 1; }
-                Op::Delete(x) => { assert_eq!(x, i); i += 1; }
-                Op::Insert(y) => { assert_eq!(y, j); j += 1; }
-            }
-        }
-        assert_eq!((i, j), (a.len(), b.len()), "{a:?} {b:?}");
-        let equal = ops.iter().filter(|o| matches!(o, Op::Equal(..))).count();
-        assert_eq!(equal, lcs_len(a, b), "not optimal for {a:?} / {b:?}");
-    }
-
     #[test]
-    fn myers_is_correct_and_optimal() {
-        for (a, b) in [("", ""), ("abc", ""), ("", "abc"), ("abc", "abc"), ("abcabba", "cbabac"), ("kitten", "sitting"),
-                       ("aaaa", "aa"), ("ab", "ba"), ("xaxbxc", "abc"), ("the quick brown fox", "the quick red fox jumps")] {
-            check_script(a.as_bytes(), b.as_bytes());
-        }
-        // many small random cases over a tiny alphabet (lots of repeats: the hard case)
-        let mut seed = 0x2545_f491_u64;
-        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        for _ in 0..400 {
-            let la = (next() % 12) as usize;
-            let lb = (next() % 12) as usize;
-            let a: Vec<u8> = (0..la).map(|_| b'a' + (next() % 3) as u8).collect();
-            let b: Vec<u8> = (0..lb).map(|_| b'a' + (next() % 3) as u8).collect();
-            check_script(&a, &b);
+    fn patience_word_diff_is_accurate() {
+        for (a, b) in [
+            ("", ""),
+            ("abc", ""),
+            ("", "abc"),
+            ("abc", "abc"),
+            ("the quick brown fox", "the quick red fox jumps"),
+        ] {
+            let d = compute_patience_word_diff(a, b).unwrap();
+            let text_a: String = d.a.iter().map(|s| s.text.as_str()).collect();
+            let text_b: String = d.b.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(text_a, a);
+            assert_eq!(text_b, b);
         }
     }
 
@@ -558,9 +513,18 @@ mod tests {
 
     #[test]
     fn large_inputs_fall_back_to_bytes() {
-        let big = "w ".repeat(MAX_WORD_TOKENS);
+        let big = "a".repeat(MAX_WORD_DIFF_SIZE + 1);
+        assert_eq!(compute_patience_word_diff(&big, "w"), Err(WORD_DIFF_LIMIT_NOTE.to_string()));
         assert!(diff_words(&big, "w").is_none());
-        // a long, mostly-equal input is fast (only the difference is searched)
+
+        let item_a = ComparerItem::from_text(1, "Big", &big);
+        let item_b = ComparerItem::from_text(2, "Small", "w");
+        let v = DiffView::new(item_a, item_b, DiffMode::Words);
+        assert_eq!(v.mode, DiffMode::Bytes);
+        assert_eq!(v.fallback_note.as_deref(), Some(WORD_DIFF_LIMIT_NOTE));
+        assert!(v.bytes.is_some());
+
+        // a long, mostly-equal input within 256 KB succeeds
         let a = "token ".repeat(20_000);
         let b = a.replacen("token", "other", 1);
         assert_eq!(diff_words(&a, &b).unwrap().changes, 1);

@@ -26,6 +26,7 @@ webpki-roots = "1"
 x509-parser = "0.18"
 # native open/save dialogs for project files
 rfd = "0.15"
+similar = { version = "2.6", default-features = false, features = ["inline"] }
 
 [profile.dev]
 opt-level = 1

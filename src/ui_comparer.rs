@@ -48,13 +48,15 @@ pub fn comparer(app: &mut App, ui: &mut Ui, p: &Palette) {
             comparer::compare_selected(app, DiffMode::Bytes);
         }
         ui.add_space(16.0);
-        if theme::plain_button(ui, p, "Remove", app.comparer_sel_a.is_some()).on_hover_text("Remove the item selected in Item 1").clicked() {
-            if let Some(i) = app.comparer_sel_a { comparer::remove(app, i); }
+        let can_remove = app.comparer_sel_a.is_some() || app.comparer_sel_b.is_some();
+        if theme::plain_button(ui, p, "Remove", can_remove).on_hover_text("Remove the selected item").clicked() {
+            comparer::remove_selected(app);
         }
         if theme::plain_button(ui, p, "Clear", !app.comparer_items.is_empty()).clicked() {
             app.comparer_items.clear();
             app.comparer_sel_a = None;
             app.comparer_sel_b = None;
+            app.comparer_active_pane = 0;
         }
     });
     ui.add_space(10.0);
@@ -93,7 +95,13 @@ fn item_list(app: &mut App, ui: &mut Ui, p: &Palette, second: bool, h: f32) {
                 let cells = [(it.id.to_string(), w[0], None), (format!("{}{kind}", it.label), w[1], None), (it.length.to_string(), w[2], None)];
                 let row = theme::table_row(ui, p, &cells, sel, i % 2 == 1);
                 if row.clicked() {
-                    if second { app.comparer_sel_b = Some(i); } else { app.comparer_sel_a = Some(i); }
+                    if second {
+                        app.comparer_sel_b = Some(i);
+                        app.comparer_active_pane = 1;
+                    } else {
+                        app.comparer_sel_a = Some(i);
+                        app.comparer_active_pane = 0;
+                    }
                 }
                 if row.double_clicked() {
                     comparer::compare_selected(app, DiffMode::Words);
@@ -160,6 +168,10 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 if let Some(i) = view.current.filter(|&i| i < targets.len()) {
                     ui.label(RichText::new(format!("{} of {}", i + 1, targets.len())).color(p.text));
                 }
+                if let Some(note) = &view.fallback_note {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(note).size(12.0).color(p.medium));
+                }
                 // scroll once per jump, to a few rows above the difference (whichever side
                 // has it higher up, so it's in view on both)
                 let jumped_id = egui::Id::new("comparer_jumped");
@@ -191,7 +203,12 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                             offsets[1] = word_pane(&mut cols[1], p, "cmp_pane_b", "Item B", b, shared, &font, colors, on_color);
                         });
                     }
-                    Some(Err(msg)) => { ui.label(RichText::new(msg).color(p.high)); }
+                    Some(Err(msg)) => {
+                        let note = msg.clone();
+                        view.fallback_note = Some(note.clone());
+                        view.set_mode(DiffMode::Bytes);
+                        ui.label(RichText::new(note).color(p.medium));
+                    }
                     None => {
                         ui.horizontal(|ui| {
                             ui.spinner();
