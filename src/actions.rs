@@ -409,6 +409,9 @@ pub fn send_text_to_decoder(app: &mut App, text: String) {
     if crate::codec::is_jwt(&text) {
         app.jwt_input = text.trim().to_string();
     }
+    app.dec_raw = vec![text.as_bytes().to_vec()];
+    app.dec_hex_input = crate::ui_tools::format_hex_bytes(text.as_bytes());
+    app.dec_hex_error = None;
     app.dec_blocks = vec![DecBlock { text, hex: false, label: None, color: eframe::egui::Color32::TRANSPARENT }];
     app.dec_view = 0;
     app.tab = Tab::Decoder;

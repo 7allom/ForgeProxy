@@ -380,8 +380,16 @@ pub struct App {
 
     // decoder
     pub dec_blocks: Vec<DecBlock>,
+    /// Raw bytes for each Decoder stage (`dec_raw[0]` is Box 1's raw bytes).
+    pub dec_raw: Vec<Vec<u8>>,
+    /// Editable hex buffer for Box 1 when Hex mode is selected.
+    pub dec_hex_input: String,
+    /// Validation warning when Box 1's hex buffer contains invalid or odd-length hex.
+    pub dec_hex_error: Option<String>,
     /// Decoder view: 0 Transform, 1 JWT Inspector.
     pub dec_view: u8,
+    /// Stage index awaiting confirmation in the Decoder delete/reset modal.
+    pub decoder_pending_delete: Option<usize>,
     /// Inspector panel (Repeater, Intercept, HTTP history): shown, and how wide.
     pub inspector: crate::ui_inspector::InspectorState,
     /// Root CA (loaded or created at startup); None if that failed (see `ca_error`).
@@ -585,7 +593,11 @@ impl App {
             seq_message: String::new(),
             seq_analysis: None,
             dec_blocks: vec![DecBlock { text: String::new(), hex: false, label: None, color: Color32::TRANSPARENT }],
+            dec_raw: vec![Vec::new()],
+            dec_hex_input: String::new(),
+            dec_hex_error: None,
             dec_view: 0,
+            decoder_pending_delete: None,
             inspector: crate::ui_inspector::InspectorState::default(),
             ca: None,
             ca_error: None,
@@ -853,6 +865,25 @@ impl App {
             }
         }
     }
+
+    /// Execute a confirmed Decoder stage deletion (cascading to downstream stages, or resetting all when `idx == 0`).
+    pub fn confirm_decoder_delete(&mut self, idx: usize) {
+        if idx == 0 {
+            self.dec_blocks = vec![DecBlock {
+                text: String::new(),
+                hex: false,
+                label: None,
+                color: Color32::TRANSPARENT,
+            }];
+            self.dec_raw = vec![Vec::new()];
+            self.dec_hex_input.clear();
+            self.dec_hex_error = None;
+        } else if idx < self.dec_blocks.len() {
+            self.dec_blocks.truncate(idx);
+            self.dec_raw.truncate(idx);
+        }
+        self.decoder_pending_delete = None;
+    }
 }
 
 impl eframe::App for App {
@@ -1085,6 +1116,80 @@ mod close_tests {
         assert!(app.collab_msg.starts_with("Poll failed:"));
         let log = app.event_log.lock().unwrap();
         assert!(log.iter().any(|e| e.level == crate::proxy::Level::Error && e.message.contains("Collaborator poll failed")));
+    }
+
+    #[test]
+    fn decoder_cascading_delete_and_modal_messages() {
+        let (_ctx, mut app) = new_app();
+        app.dec_blocks = vec![
+            DecBlock { text: "root".into(), hex: false, label: None, color: Color32::TRANSPARENT },
+            DecBlock { text: "stage1".into(), hex: false, label: Some("Encoded as Base64".into()), color: Color32::WHITE },
+            DecBlock { text: "stage2".into(), hex: false, label: Some("Encoded as URL".into()), color: Color32::WHITE },
+            DecBlock { text: "stage3".into(), hex: false, label: Some("SHA-256 hash".into()), color: Color32::WHITE },
+        ];
+        assert_eq!(
+            crate::ui_tools::decoder_delete_message(0, 4),
+            "Reset Decoder? This will clear all input and remove all transformation stages."
+        );
+        assert_eq!(
+            crate::ui_tools::decoder_delete_message(1, 4),
+            "Delete this stage? This will also remove the 2 subsequent transformation(s) below it."
+        );
+        assert_eq!(
+            crate::ui_tools::decoder_delete_message(3, 4),
+            "Remove this transformation stage?"
+        );
+
+        // Delete last stage (count == 1)
+        app.decoder_pending_delete = Some(3);
+        app.confirm_decoder_delete(3);
+        assert_eq!(app.dec_blocks.len(), 3);
+        assert!(app.decoder_pending_delete.is_none());
+
+        // Cascade delete stage 1 (removes stage 1 and stage 2)
+        app.decoder_pending_delete = Some(1);
+        app.confirm_decoder_delete(1);
+        assert_eq!(app.dec_blocks.len(), 1);
+        assert_eq!(app.dec_blocks[0].text, "root");
+
+        // Reset root stage 0
+        app.decoder_pending_delete = Some(0);
+        app.confirm_decoder_delete(0);
+        assert_eq!(app.dec_blocks.len(), 1);
+        assert!(app.dec_blocks[0].text.is_empty());
+        assert!(app.decoder_pending_delete.is_none());
+    }
+
+    #[test]
+    fn decoder_box1_hex_edit_updates_downstream_and_handles_invalid_hex() {
+        let (_ctx, mut app) = new_app();
+        app.dec_blocks = vec![
+            DecBlock { text: String::new(), hex: true, label: None, color: Color32::TRANSPARENT },
+            DecBlock { text: String::new(), hex: false, label: Some("Encoded as Base64".into()), color: Color32::WHITE },
+        ];
+        app.dec_raw = vec![Vec::new(), Vec::new()];
+
+        // Formatted hex "61 64 6d" -> "adm" -> Base64 "YWRt"
+        app.dec_hex_input = "61 64 6d".into();
+        crate::ui_tools::apply_box1_hex_edit(&mut app);
+        assert!(app.dec_hex_error.is_none());
+        assert_eq!(app.dec_raw[0], b"adm");
+        assert_eq!(app.dec_blocks[0].text, "adm");
+        assert_eq!(app.dec_blocks[1].text, "YWRt");
+
+        // Unformatted hex "61646d696e" -> "admin" -> Base64 "YWRtaW4="
+        app.dec_hex_input = "61646d696e".into();
+        crate::ui_tools::apply_box1_hex_edit(&mut app);
+        assert!(app.dec_hex_error.is_none());
+        assert_eq!(app.dec_raw[0], b"admin");
+        assert_eq!(app.dec_blocks[1].text, "YWRtaW4=");
+
+        // Odd-length or invalid hex while typing sets warning without clearing buffer or panicking
+        app.dec_hex_input = "61 64 6".into();
+        crate::ui_tools::apply_box1_hex_edit(&mut app);
+        assert!(app.dec_hex_error.as_deref().unwrap_or("").contains("Invalid hex sequence"));
+        assert_eq!(app.dec_hex_input, "61 64 6");
+        assert_eq!(app.dec_raw[0], b"admin");
     }
 }
 

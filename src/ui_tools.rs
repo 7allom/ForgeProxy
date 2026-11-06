@@ -826,6 +826,125 @@ fn hex_dump(data: &[u8]) -> String {
         .collect::<Vec<_>>().join("\n")
 }
 
+/// Format raw bytes as space-separated hex pairs (for Box 1's editable Hex view).
+pub fn format_hex_bytes(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse formatted or unformatted hex text (e.g. `"61 64 6d"`, `"61646d"`, or hex dump lines) into bytes.
+pub fn parse_hex_input(input: &str) -> Result<Vec<u8>, String> {
+    let mut cleaned = String::with_capacity(input.len());
+    for line in input.lines() {
+        let rest = if line.len() >= 10
+            && line.as_bytes()[..8].iter().all(|b| b.is_ascii_hexdigit())
+            && &line[8..10] == "  "
+        {
+            &line[10..]
+        } else {
+            line
+        };
+        for ch in rest.chars() {
+            if !ch.is_whitespace() {
+                cleaned.push(ch);
+            }
+        }
+    }
+    if cleaned.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Invalid hex sequence".into());
+    }
+    if cleaned.len() % 2 != 0 {
+        return Err("Invalid hex sequence (odd number of hex digits)".into());
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let bytes = cleaned.as_bytes();
+    let mut k = 0;
+    while k < bytes.len() {
+        let pair = std::str::from_utf8(&bytes[k..k + 2]).map_err(|_| "Invalid hex sequence".to_string())?;
+        let val = u8::from_str_radix(pair, 16).map_err(|_| "Invalid hex sequence".to_string())?;
+        out.push(val);
+        k += 2;
+    }
+    Ok(out)
+}
+
+/// Re-run existing downstream Decoder stages (`1..N`) from `app.dec_raw[0]` so edits in Box 1 update live.
+pub fn recompute_decoder_pipeline(app: &mut App) {
+    let n = app.dec_blocks.len();
+    if app.dec_raw.len() < n {
+        app.dec_raw.resize(n, Vec::new());
+    }
+    for j in 1..n {
+        let prev = app.dec_raw[j - 1].clone();
+        let Some(lbl) = app.dec_blocks[j].label.clone() else { continue };
+        let computed = if let Some(name) = lbl.strip_prefix("Decoded as ") {
+            decoder_ops::Codec::ALL
+                .iter()
+                .find(|c| c.label() == name)
+                .and_then(|&c| decoder_ops::decode(c, &prev))
+        } else if let Some(name) = lbl.strip_prefix("Encoded as ") {
+            decoder_ops::Codec::ALL
+                .iter()
+                .find(|c| c.label() == name)
+                .map(|&c| decoder_ops::encode(c, &prev))
+        } else if let Some(name) = lbl.strip_suffix(" hash") {
+            decoder_ops::Hash::ALL
+                .iter()
+                .find(|h| h.label() == name)
+                .map(|&h| decoder_ops::hash(h, &prev))
+        } else if let Some(name) = lbl.strip_prefix("Smart decode: ") {
+            decoder_ops::Codec::ALL
+                .iter()
+                .find(|c| c.label() == name)
+                .and_then(|&c| decoder_ops::decode(c, &prev))
+        } else {
+            None
+        };
+        if let Some(out) = computed {
+            app.dec_blocks[j].hex = std::str::from_utf8(&out).is_err();
+            app.dec_blocks[j].text = String::from_utf8_lossy(&out).into_owned();
+            app.dec_raw[j] = out;
+        }
+    }
+}
+
+/// Apply an edit to Box 1's hex input, updating `app.dec_raw[0]` and live downstream stages when valid.
+pub fn apply_box1_hex_edit(app: &mut App) {
+    match parse_hex_input(&app.dec_hex_input) {
+        Ok(bytes) => {
+            app.dec_hex_error = None;
+            if app.dec_raw.is_empty() {
+                app.dec_raw.push(Vec::new());
+            }
+            app.dec_raw[0] = bytes.clone();
+            if !app.dec_blocks.is_empty() {
+                app.dec_blocks[0].text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            recompute_decoder_pipeline(app);
+        }
+        Err(err) => {
+            app.dec_hex_error = Some(err);
+        }
+    }
+}
+
+/// Confirmation message for deleting Decoder stage `idx` out of `total_stages`.
+pub fn decoder_delete_message(idx: usize, total_stages: usize) -> String {
+    let count = total_stages.saturating_sub(idx);
+    if idx == 0 {
+        "Reset Decoder? This will clear all input and remove all transformation stages.".into()
+    } else if count > 1 {
+        format!(
+            "Delete this stage? This will also remove the {} subsequent transformation(s) below it.",
+            count - 1
+        )
+    } else {
+        "Remove this transformation stage?".into()
+    }
+}
+
 pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
     sub_tabs(ui, p, &["Transform", "JWT Inspector"], &mut app.dec_view);
     if app.dec_view == 1 {
@@ -848,6 +967,9 @@ pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     let raw_id = egui::Id::new("decoder_raw");
     let mut raw: DecRaw = ui.data(|d| d.get_temp(raw_id)).unwrap_or_default();
+    if app.dec_raw.len() < app.dec_blocks.len() {
+        app.dec_raw.resize(app.dec_blocks.len(), Vec::new());
+    }
     // (block whose output layers are replaced, result: new layers or why nothing came out)
     let mut action: Option<(usize, Result<Vec<(DecBlock, Vec<u8>)>, String>)> = None;
     let mut open_jwt: Option<String> = None;
@@ -855,29 +977,115 @@ pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for i in 0..n {
             let is_last = i + 1 == n;
-            let data = raw.data(i, &app.dec_blocks[i]);
+            let data = if i == 0 && !app.dec_raw[0].is_empty() && (app.dec_blocks[0].hex || String::from_utf8_lossy(&app.dec_raw[0]) == app.dec_blocks[0].text) {
+                app.dec_raw[0].clone()
+            } else {
+                raw.data(i, &app.dec_blocks[i])
+            };
             let has_input = !data.is_empty();
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width((ui.available_width() - 230.0).max(200.0));
-                    if let Some(lbl) = app.dec_blocks[i].label.clone() {
-                        ui.label(RichText::new(lbl).size(11.0).color(app.dec_blocks[i].color));
-                    }
+                    ui.horizontal(|ui| {
+                        if let Some(lbl) = app.dec_blocks[i].label.clone() {
+                            ui.label(RichText::new(lbl).size(11.0).color(app.dec_blocks[i].color));
+                        } else {
+                            ui.label(RichText::new("Input").size(11.0).color(p.disabled));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (btn_label, hover) = if i == 0 {
+                                ("×", "Reset Decoder pipeline")
+                            } else {
+                                ("×", "Delete this transformation stage")
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(btn_label).size(12.5).color(p.disabled))
+                                        .fill(Color32::TRANSPARENT)
+                                        .frame(false),
+                                )
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                app.decoder_pending_delete = Some(i);
+                            }
+                        });
+                    });
                     egui::Frame::new().fill(p.deep).stroke(Stroke::new(1.0_f32, p.header)).show(ui, |ui| {
                         if app.dec_blocks[i].hex {
-                            let mut hex = hex_dump(&data);
-                            ui.add(egui::TextEdit::multiline(&mut hex).desired_rows(4).desired_width(f32::INFINITY).font(FontId::monospace(12.5)).frame(false).interactive(false));
+                            if i == 0 {
+                                if app.dec_hex_input.is_empty() && !data.is_empty() && app.dec_hex_error.is_none() {
+                                    app.dec_hex_input = format_hex_bytes(&data);
+                                }
+                                if ui
+                                    .add(
+                                        egui::TextEdit::multiline(&mut app.dec_hex_input)
+                                            .desired_rows(4)
+                                            .desired_width(f32::INFINITY)
+                                            .font(FontId::monospace(12.5))
+                                            .frame(false)
+                                            .hint_text("61 64 6d 69 6e"),
+                                    )
+                                    .changed()
+                                {
+                                    apply_box1_hex_edit(app);
+                                    if app.dec_hex_error.is_none() {
+                                        raw.bytes.resize(app.dec_blocks.len(), None);
+                                        for (idx, b) in app.dec_raw.iter().enumerate().take(app.dec_blocks.len()) {
+                                            raw.bytes[idx] = Some(b.clone());
+                                        }
+                                    }
+                                }
+                            } else {
+                                let hex = hex_dump(&data);
+                                let mut hex_view: &str = &hex;
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut hex_view)
+                                        .desired_rows(4)
+                                        .desired_width(f32::INFINITY)
+                                        .font(FontId::monospace(12.5))
+                                        .frame(false),
+                                );
+                            }
                         } else {
-                            ui.add(egui::TextEdit::multiline(&mut app.dec_blocks[i].text).desired_rows(4).desired_width(f32::INFINITY).font(FontId::monospace(12.5)).frame(false));
+                            let resp = ui.add(
+                                egui::TextEdit::multiline(&mut app.dec_blocks[i].text)
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY)
+                                    .font(FontId::monospace(12.5))
+                                    .frame(false),
+                            );
+                            if i == 0 && resp.changed() {
+                                let bytes = app.dec_blocks[0].text.as_bytes().to_vec();
+                                app.dec_raw[0] = bytes.clone();
+                                app.dec_hex_input = format_hex_bytes(&bytes);
+                                app.dec_hex_error = None;
+                                recompute_decoder_pipeline(app);
+                                raw.bytes.resize(app.dec_blocks.len(), None);
+                                for (idx, b) in app.dec_raw.iter().enumerate().take(app.dec_blocks.len()) {
+                                    raw.bytes[idx] = Some(b.clone());
+                                }
+                            }
                         }
                     });
+                    if i == 0 && app.dec_blocks[0].hex {
+                        if let Some(err) = &app.dec_hex_error {
+                            ui.label(RichText::new(err).size(11.5).color(p.high));
+                        }
+                    }
                 });
                 ui.vertical(|ui| {
+                    let was_hex = app.dec_blocks[i].hex;
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut app.dec_blocks[i].hex, false, "Text");
                         ui.radio_value(&mut app.dec_blocks[i].hex, true, "Hex");
-                        theme::icon_help(ui, p);
                     });
+                    if i == 0 && !was_hex && app.dec_blocks[0].hex {
+                        app.dec_hex_input = format_hex_bytes(&data);
+                        app.dec_hex_error = None;
+                    } else if i == 0 && was_hex && !app.dec_blocks[0].hex {
+                        app.dec_hex_error = None;
+                    }
                     ui.add_enabled_ui(has_input, |ui| {
                         egui::ComboBox::from_id_salt(("dec", i)).width(190.0).height(f32::INFINITY).selected_text("Decode as ...").show_ui(ui, |ui| {
                             for cc in decoder_ops::Codec::ALL {
@@ -937,20 +1145,75 @@ pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
     });
     if let Some((i, result)) = action {
         raw.bytes.resize(app.dec_blocks.len(), None);
+        app.dec_raw.resize(app.dec_blocks.len(), Vec::new());
         match result {
             Ok(layers) => {
                 // keep block i's exact bytes so the next layer works on them, not on lossy text
-                let input = raw.data(i, &app.dec_blocks[i]);
-                raw.bytes[i] = Some(input);
+                let input = if i == 0 && !app.dec_raw[0].is_empty() && (app.dec_blocks[0].hex || String::from_utf8_lossy(&app.dec_raw[0]) == app.dec_blocks[0].text) {
+                    app.dec_raw[0].clone()
+                } else {
+                    raw.data(i, &app.dec_blocks[i])
+                };
+                raw.bytes[i] = Some(input.clone());
+                app.dec_raw[i] = input;
                 app.dec_blocks.truncate(i + 1);
                 raw.bytes.truncate(i + 1);
+                app.dec_raw.truncate(i + 1);
                 for (block, bytes) in layers {
                     app.dec_blocks.push(block);
-                    raw.bytes.push(Some(bytes));
+                    raw.bytes.push(Some(bytes.clone()));
+                    app.dec_raw.push(bytes);
                 }
                 raw.error = None;
             }
             Err(msg) => raw.error = Some((i, msg)),
+        }
+    }
+    if let Some(idx) = app.decoder_pending_delete {
+        let total_stages = app.dec_blocks.len();
+        if idx >= total_stages {
+            app.decoder_pending_delete = None;
+        } else {
+            let title = if idx == 0 { "Reset Decoder" } else { "Delete Transformation Stage" };
+            let msg = decoder_delete_message(idx, total_stages);
+            let cancel_key = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let confirm_key = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let mut do_cancel = cancel_key;
+            let mut do_delete = confirm_key;
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_width(380.0);
+                    ui.label(RichText::new(msg).color(p.text));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if theme::plain_button(ui, p, "Cancel", true).clicked() {
+                            do_cancel = true;
+                        }
+                        let del_btn = egui::Button::new(bold("Delete", 12.5).color(Color32::WHITE))
+                            .fill(p.high)
+                            .min_size(egui::vec2(72.0, 24.0));
+                        if ui.add(del_btn).clicked() {
+                            do_delete = true;
+                        }
+                    });
+                });
+            if do_cancel {
+                app.decoder_pending_delete = None;
+            } else if do_delete {
+                if idx == 0 {
+                    raw.bytes.clear();
+                    raw.error = None;
+                } else {
+                    raw.bytes.truncate(idx);
+                    if raw.error.as_ref().is_some_and(|(at, _)| *at >= idx) {
+                        raw.error = None;
+                    }
+                }
+                app.confirm_decoder_delete(idx);
+            }
         }
     }
     ui.data_mut(|d| d.insert_temp(raw_id, raw));

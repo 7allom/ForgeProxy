@@ -160,6 +160,7 @@ pub fn reset(app: &mut App) {
     app.collab_interactions.clear();
     app.collab_polling = false;
     app.collab_msg.clear();
+    app.decoder_pending_delete = None;
     app.project_name.clear();
     app.project_path = None;
 }
