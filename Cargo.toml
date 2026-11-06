@@ -1,0 +1,34 @@
+[package]
+name = "forgeproxy"
+version = "0.2.1-alpha"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true }
+egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "socks-proxy"] }  # socks-proxy: Settings > Network > Upstream proxy (SOCKS5)
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }  # JWT Inspector shows claims in token order
+# x509-parser: sign leaf certificates with the saved CA certificate (Issuer::from_ca_cert_der)
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+# TLS for the MITM pipeline; the same ring provider and features ureq already uses
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+# trust anchors for verifying real servers when HTTPS is intercepted (Mozilla's set, as ureq uses)
+webpki-roots = "1"
+# read the root CA certificate (SubjectPublicKeyInfo for the browser's SPKI pin)
+x509-parser = "0.18"
+# native open/save dialogs for project files
+rfd = "0.15"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 2

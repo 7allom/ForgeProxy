@@ -1,0 +1,6 @@
+Noto Sans and Noto Sans Mono
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts)
+
+These fonts are licensed under the SIL Open Font License, Version 1.1.
+The full license text is available at https://openfontlicense.org
+They are bundled unmodified, copied from the system package noto-fonts.

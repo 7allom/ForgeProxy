@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: forgeproxy
+            asset_name: forgeproxy-linux-x86_64.tar.gz
+          - os: windows-latest
+            artifact_name: forgeproxy.exe
+            asset_name: forgeproxy-windows-x86_64.zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux GUI build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Linux binary
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          tar -czvf ${{ matrix.asset_name }} -C target/release ${{ matrix.artifact_name }}
+
+      - name: Package Windows binary
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/${{ matrix.artifact_name }} -DestinationPath ${{ matrix.asset_name }}
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
