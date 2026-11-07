@@ -21,6 +21,7 @@ macro_rules! assert_table {
         }
     }};
 }
+pub use crate::assert_table;
 
 /// Fluent builder for constructing an [`App`] instance in unit tests without boilerplate.
 pub struct MockAppBuilder {
