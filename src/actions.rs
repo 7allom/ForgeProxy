@@ -29,6 +29,7 @@ pub fn send_repeater(app: &mut App) {
     // only supplies the scheme, and is updated to show the real destination
     let url = repeater_target(&tab.request, &tab.url);
     tab.url = url.clone();
+    let req_sent = tab.request.clone();
     let htext = headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n");
     let (htext, body2) = rewrite::apply(&app.mr_rules, true, &htext, &body);
     let hv = parse_headers(&htext);
@@ -46,7 +47,7 @@ pub fn send_repeater(app: &mut App) {
         let (rh, rb) = rewrite::apply(&rules_copy, false, &r.headers, &r.body);
         r.headers = rh;
         r.body = rb;
-        let _ = record_bg(&hist, &nid, "Repeater", &method, &url, &r);
+        let _ = record_bg_full(&hist, &nid, "Repeater", &method, &url, req_sent, &r);
         let _ = tx.send(Job::Repeater { tab: tab_id, result: r, elapsed_ms });
     });
 }
@@ -54,10 +55,12 @@ pub fn send_repeater(app: &mut App) {
 /// "Send to Repeater": the request goes into a new tab (numbered after the others), which
 /// is shown; existing tabs are left as they are.
 pub fn send_to_repeater(app: &mut App, method: &str, url: &str, request: &str) {
-    // the address bar shows where the request will really go (its Host header and path)
-    let url = repeater_target(request, url);
+    let fb = active_fallback_for(app, request);
+    let target = HttpTarget::parse_or_infer(url, request.as_bytes(), fb.as_ref());
+    let path = resolve_request_path(url, request);
+    let full_url = format!("{}{path}", target.to_url());
     let method = request_method(request).unwrap_or_else(|| method.to_string());
-    app.add_repeater_tab(&method, &url, request);
+    app.add_repeater_tab(&method, &full_url, request);
     app.tab = crate::state::Tab::Repeater;
 }
 
@@ -420,11 +423,216 @@ pub fn send_text_to_decoder(app: &mut App, text: String) {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SendTo { Repeater, Intruder, Sequencer, Comparer, ComparerRequest, Decoder, Organizer, Scope }
 
+/// Split an authority (`host:port`, `[::1]:8888`, or `host`) into `(hostname, Option<port>)`.
+pub fn split_host_port(auth: &str) -> (&str, Option<&str>) {
+    let auth = auth.trim();
+    if let Some(rest) = auth.strip_prefix('[') {
+        if let Some(idx) = rest.find(']') {
+            let host = &auth[..=idx + 1];
+            let port = rest[idx + 1..].strip_prefix(':').filter(|p| !p.is_empty());
+            return (host, port);
+        }
+    }
+    match auth.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && !p.is_empty() => (h, Some(p)),
+        _ => (auth, None),
+    }
+}
+
+/// Unified HTTP/HTTPS target endpoint (`scheme://host[:port]`) resolved across all tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpTarget {
+    pub is_tls: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+impl HttpTarget {
+    /// Format this target as an origin URL (`http://host[:port]` or `https://host[:port]`),
+    /// omitting the port only when it matches the scheme's default (80 for HTTP, 443 for HTTPS).
+    pub fn to_url(&self) -> String {
+        let scheme = if self.is_tls { "https" } else { "http" };
+        let default_port = if self.is_tls { 443 } else { 80 };
+        let bare = self.host.trim_start_matches('[').trim_end_matches(']');
+        let host_fmt = if bare.contains(':') {
+            format!("[{bare}]")
+        } else {
+            bare.to_string()
+        };
+        if self.port == default_port {
+            format!("{scheme}://{host_fmt}")
+        } else {
+            format!("{scheme}://{host_fmt}:{}", self.port)
+        }
+    }
+
+    /// Resolve an [`HttpTarget`] from a source URL, raw HTTP request bytes, and an optional
+    /// fallback target context.
+    ///
+    /// Resolution precedence:
+    /// 1. An absolute-form request line (`GET http://...` or `GET https://...`) in `raw_http`.
+    /// 2. Explicit `url` scheme (`http://` vs `https://`) combined with `Host:` header / URL
+    ///    authority, ignoring Repeater's untouched `DEFAULT_REP_URL` placeholder when `Host:`
+    ///    points to a different host.
+    /// 3. Port-inferred scheme (`443` -> `https`, `80`/`8080`/`8888`/etc. -> `http`) or
+    ///    inheritance from `fallback` when targeting the same host.
+    pub fn parse_or_infer(url: &str, raw_http: &[u8], fallback: Option<&HttpTarget>) -> Self {
+        let raw_str = String::from_utf8_lossy(raw_http);
+        let clean_req = raw_str.replace('§', "");
+
+        if let Some(req_target) = request_target(&clean_req) {
+            if req_target.starts_with("http://") || req_target.starts_with("https://") {
+                let (s, a, _) = url_parts(&req_target);
+                let (h, p_opt) = split_host_port(&a);
+                let bare_h = h.trim_start_matches('[').trim_end_matches(']').to_string();
+                if !bare_h.is_empty() {
+                    let is_tls = s == "https";
+                    let default_port = if is_tls { 443 } else { 80 };
+                    let port = p_opt.and_then(|p| p.parse::<u16>().ok()).unwrap_or(default_port);
+                    return HttpTarget {
+                        is_tls,
+                        host: bare_h,
+                        port,
+                    };
+                }
+            }
+        }
+
+        let req_host_raw = host_header(&clean_req)
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
+        let req_parsed: Option<(String, Option<u16>)> = req_host_raw.as_deref().and_then(|rh| {
+            let (h, p_opt) = split_host_port(rh);
+            let bare = h.trim_start_matches('[').trim_end_matches(']').to_string();
+            (!bare.is_empty()).then(|| (bare, p_opt.and_then(|p| p.parse::<u16>().ok())))
+        });
+
+        let (bar_scheme, bar_authority, _) = url_parts(url);
+        let (bar_h_raw, bar_p_str) = split_host_port(&bar_authority);
+        let bar_host = bar_h_raw.trim_start_matches('[').trim_end_matches(']').to_string();
+        let bar_port: Option<u16> = bar_p_str.and_then(|p| p.parse::<u16>().ok());
+
+        let is_stale_default_rep = url.trim() == crate::state::DEFAULT_REP_URL
+            && req_parsed
+                .as_ref()
+                .is_some_and(|(rh, _)| !rh.eq_ignore_ascii_case("example.com"));
+
+        let bar_matches_req_host = match (&req_parsed, bar_host.is_empty()) {
+            (Some((rh, _)), false) => rh.eq_ignore_ascii_case(&bar_host),
+            (None, false) => true,
+            _ => false,
+        };
+
+        let (host, explicit_port) = if let Some((rh, rp)) = req_parsed {
+            let port = if rp.is_some() {
+                rp
+            } else if !is_stale_default_rep && bar_matches_req_host && bar_port.is_some() {
+                bar_port
+            } else if let Some(fb) = fallback.filter(|fb| fb.host.eq_ignore_ascii_case(&rh)) {
+                Some(fb.port)
+            } else {
+                None
+            };
+            (rh, port)
+        } else if !bar_host.is_empty() && !is_stale_default_rep {
+            let port = bar_port.or_else(|| {
+                fallback
+                    .filter(|fb| fb.host.eq_ignore_ascii_case(&bar_host))
+                    .map(|fb| fb.port)
+            });
+            (bar_host, port)
+        } else if let Some(fb) = fallback {
+            return fb.clone();
+        } else {
+            return HttpTarget {
+                is_tls: false,
+                host: "localhost".to_string(),
+                port: 80,
+            };
+        };
+
+        let has_known_bar_scheme =
+            !is_stale_default_rep && (bar_scheme == "http" || bar_scheme == "https");
+
+        if has_known_bar_scheme && (bar_matches_req_host || req_host_raw.is_none()) {
+            let is_tls = bar_scheme == "https";
+            let default_port = if is_tls { 443 } else { 80 };
+            let port = explicit_port.unwrap_or(default_port);
+            return HttpTarget { is_tls, host, port };
+        }
+
+        let fb_match = fallback.filter(|fb| {
+            fb.host.eq_ignore_ascii_case(&host)
+                && (explicit_port.is_none() || explicit_port == Some(fb.port))
+        });
+
+        let (is_tls, port) = match explicit_port {
+            Some(443) => (fb_match.map_or(true, |fb| fb.is_tls), 443),
+            Some(80) => (fb_match.map_or(false, |fb| fb.is_tls), 80),
+            Some(p) => (fb_match.map_or(false, |fb| fb.is_tls), p),
+            None => match fb_match {
+                Some(fb) => (fb.is_tls, fb.port),
+                None => (false, 80),
+            },
+        };
+
+        HttpTarget { is_tls, host, port }
+    }
+}
+
+fn active_fallback_for(app: &App, request: &str) -> Option<HttpTarget> {
+    let clean = request.replace('§', "");
+    let req_host = host_header(&clean).map(|h| {
+        split_host_port(&h)
+            .0
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string()
+    });
+    let mut candidates = Vec::new();
+    let int_u = app.int_target.trim();
+    if !int_u.is_empty() && int_u != crate::state::DEFAULT_INT_TARGET {
+        candidates.push(HttpTarget::parse_or_infer(int_u, b"", None));
+    }
+    if let Some(tab) = app.repeater_tabs.get(app.active_repeater_tab) {
+        let u = tab.url.trim();
+        if !u.is_empty() && u != crate::state::DEFAULT_REP_URL {
+            candidates.push(HttpTarget::parse_or_infer(u, b"", None));
+        }
+    }
+    if let Some(rh) = &req_host {
+        if let Some(matched) = candidates.iter().find(|c| c.host.eq_ignore_ascii_case(rh)) {
+            return Some(matched.clone());
+        }
+    }
+    candidates.into_iter().next()
+}
+
+fn resolve_request_path(url: &str, request: &str) -> String {
+    let clean = request.replace('§', "");
+    let (_, _, bar_path) = url_parts(url);
+    let target = request_target(&clean).unwrap_or_default();
+    if target.starts_with("http://") || target.starts_with("https://") {
+        url_parts(&target).2
+    } else if target.starts_with('/') {
+        target
+    } else {
+        bar_path
+    }
+}
+
+/// Resolve the target origin (`scheme://host[:port]`) using [`HttpTarget::parse_or_infer`].
+pub fn resolve_target_origin(app: &App, url: &str, request: &str) -> String {
+    let fb = active_fallback_for(app, request);
+    HttpTarget::parse_or_infer(url, request.as_bytes(), fb.as_ref()).to_url()
+}
+
 /// "Send to Intruder": populates the Intruder target and request template from a raw request
-/// and switches to the Intruder tab.
+/// and switches to the Intruder tab, resolving the target through [`HttpTarget::parse_or_infer`].
 pub fn send_to_intruder(app: &mut App, url: &str, request: &str) {
-    let full_url = repeater_target(request, url);
-    app.int_target = origin_of(&full_url);
+    let fb = active_fallback_for(app, request);
+    let target = HttpTarget::parse_or_infer(url, request.as_bytes(), fb.as_ref());
+    app.int_target = target.to_url();
     app.int_template = request.to_string();
     // results of the previous attack belong to the previous request
     reset_attack(app);
@@ -435,9 +643,10 @@ pub fn send_to_intruder(app: &mut App, url: &str, request: &str) {
 /// "Send to Sequencer": populates the Sequencer live-capture request template and target origin,
 /// resets any previous token collection, and switches to the Sequencer tab.
 pub fn send_to_sequencer(app: &mut App, url: &str, request: &str) {
-    let full_url = repeater_target(request, url);
+    let fb = active_fallback_for(app, request);
+    let target = HttpTarget::parse_or_infer(url, request.as_bytes(), fb.as_ref());
+    app.seq_origin = target.to_url();
     app.seq_template = request.to_string();
-    app.seq_origin = origin_of(&full_url);
     app.seq_samples.clear();
     app.seq_analysis = None;
     app.seq_message.clear();
@@ -448,7 +657,10 @@ pub fn send_to_sequencer(app: &mut App, url: &str, request: &str) {
 /// "Send to Organizer": stores the request/response in the Organizer inbox and switches to Organizer.
 pub fn send_to_organizer(app: &mut App, url: &str, request: &str, response: &str) {
     use crate::state::{OrgItem, OrgStatus, Tab};
-    let full_url = repeater_target(request, url);
+    let fb = active_fallback_for(app, request);
+    let target = HttpTarget::parse_or_infer(url, request.as_bytes(), fb.as_ref());
+    let path = resolve_request_path(url, request);
+    let full_url = format!("{}{path}", target.to_url());
     let (host, path) = http::split_url(&full_url);
     let method = request_method(request).unwrap_or_else(|| "GET".to_string());
     app.organizer.push(OrgItem {
@@ -536,7 +748,7 @@ pub fn entry_url(e: &HttpEntry) -> String {
 }
 
 pub fn send_to(app: &mut App, e: &HttpEntry, to: SendTo) {
-    use crate::state::{OrgItem, OrgStatus, Tab};
+    use crate::state::Tab;
     match to {
         SendTo::Repeater => send_to_repeater(app, &e.method, &entry_url(e), &raw_request(e)),
         SendTo::Intruder => send_to_intruder(app, &entry_url(e), &raw_request(e)),
@@ -553,20 +765,7 @@ pub fn send_to(app: &mut App, e: &HttpEntry, to: SendTo) {
             let text = if !e.request.trim().is_empty() { raw_request(e) } else { e.response.clone() };
             send_text_to_decoder(app, text);
         }
-        SendTo::Organizer => {
-            app.organizer.push(OrgItem {
-                method: e.method.clone(),
-                host: e.host.clone(),
-                path: e.path.clone(),
-                note: String::new(),
-                highlight: None,
-                status: OrgStatus::New,
-                request: raw_request(e),
-                response: e.response.clone(),
-                url: entry_url(e),
-            });
-            app.tab = Tab::Organizer;
-        }
+        SendTo::Organizer => send_to_organizer(app, &entry_url(e), &raw_request(e), &e.response),
         SendTo::Scope => app.target_scope.add(&scope_prefix(e)),
     }
 }
@@ -736,11 +935,7 @@ mod tests {
     }
 
     fn test_app() -> (egui::Context, App) {
-        let ctx = egui::Context::default();
-        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        // a screenshot path keeps the real proxy listener off
-        let app = App::new(&cc, Some("/dev/null".into()), None, false);
-        (ctx, app)
+        crate::test_utils::MockAppBuilder::new().build_with_ctx()
     }
 
     /// Run update frames until the attack finishes (or a generous timeout).
@@ -846,37 +1041,241 @@ mod tests {
     }
 
     #[test]
-    fn send_to_sequencer_and_inter_tool_routing_work() {
-        let (_ctx, mut app) = test_app();
-        app.seq_samples = vec!["old_tok".into()];
-        let raw_req = "POST /session HTTP/1.1\nHost: auth.example.com\n\nuser=alice";
-        send_to_sequencer(&mut app, "https://auth.example.com/session", raw_req);
-        assert_eq!(app.tab, crate::state::Tab::Sequencer);
-        assert_eq!(app.seq_origin, "https://auth.example.com");
-        assert_eq!(app.seq_template, raw_req);
-        assert!(app.seq_samples.is_empty());
+    fn http_target_parse_or_infer_matrix() {
+        use crate::assert_table;
 
-        // Self-link filtering in centralized context menu targets
-        for tool_tab in [
-            crate::state::Tab::Repeater,
-            crate::state::Tab::Intruder,
-            crate::state::Tab::Sequencer,
-            crate::state::Tab::Comparer,
-            crate::state::Tab::Decoder,
-            crate::state::Tab::Organizer,
-        ] {
-            let targets = crate::ui_tools::traffic_context_menu_targets(tool_tab);
-            assert_eq!(targets.len(), 5, "calling tool {:?} should hide only itself", tool_tab);
-            let self_label = format!("Send to {}", tool_tab.label());
-            assert!(
-                targets.iter().all(|(l, _)| *l != self_label),
-                "redundant self-link {:?} should be hidden",
-                self_label
-            );
+        struct Case<'a> {
+            desc: &'a str,
+            url: &'a str,
+            raw_http: &'a [u8],
+            fallback: Option<HttpTarget>,
+            expected: HttpTarget,
+            expected_url: &'a str,
         }
 
-        // Non-destination views (Proxy, Target, Logger, Discover) show all 6 standard targets
-        let proxy_targets = crate::ui_tools::traffic_context_menu_targets(crate::state::Tab::Proxy);
-        assert_eq!(proxy_targets.len(), 6);
+        let cases = [
+            Case {
+                desc: "explicit http URL with custom port",
+                url: "http://127.0.0.1:8888/login",
+                raw_http: b"POST /login HTTP/1.1\nHost: 127.0.0.1:8888\n\nuser=admin",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "127.0.0.1".into(), port: 8888 },
+                expected_url: "http://127.0.0.1:8888",
+            },
+            Case {
+                desc: "explicit https URL on custom port",
+                url: "https://127.0.0.1:8888/login",
+                raw_http: b"POST /login HTTP/1.1\nHost: 127.0.0.1:8888\n\nuser=admin",
+                fallback: None,
+                expected: HttpTarget { is_tls: true, host: "127.0.0.1".into(), port: 8888 },
+                expected_url: "https://127.0.0.1:8888",
+            },
+            Case {
+                desc: "explicit https URL on default port 443 omits port in to_url",
+                url: "https://example.com/api",
+                raw_http: b"",
+                fallback: None,
+                expected: HttpTarget { is_tls: true, host: "example.com".into(), port: 443 },
+                expected_url: "https://example.com",
+            },
+            Case {
+                desc: "explicit http URL on default port 80 omits port in to_url",
+                url: "http://example.com/api",
+                raw_http: b"",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "example.com".into(), port: 80 },
+                expected_url: "http://example.com",
+            },
+            Case {
+                desc: "explicit http scheme on port 443 is preserved",
+                url: "http://target.local:443/",
+                raw_http: b"GET / HTTP/1.1\nHost: target.local:443\n\n",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "target.local".into(), port: 443 },
+                expected_url: "http://target.local:443",
+            },
+            Case {
+                desc: "port-inferred https from schemeless authority :443",
+                url: "api.internal:443/v1",
+                raw_http: b"",
+                fallback: None,
+                expected: HttpTarget { is_tls: true, host: "api.internal".into(), port: 443 },
+                expected_url: "https://api.internal",
+            },
+            Case {
+                desc: "port-inferred http from schemeless authority :8080",
+                url: "api.internal:8080/v1",
+                raw_http: b"",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "api.internal".into(), port: 8080 },
+                expected_url: "http://api.internal:8080",
+            },
+            Case {
+                desc: "raw HTTP bytes with Host: 127.0.0.1:8888 and empty URL infers http",
+                url: "",
+                raw_http: b"POST /login HTTP/1.1\nHost: 127.0.0.1:8888\n\nuser=admin",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "127.0.0.1".into(), port: 8888 },
+                expected_url: "http://127.0.0.1:8888",
+            },
+            Case {
+                desc: "raw HTTP bytes with custom port Host: internal.corp:8443 and TLS fallback on same host",
+                url: "",
+                raw_http: b"GET /admin HTTP/1.1\nHost: internal.corp:8443\n\n",
+                fallback: Some(HttpTarget { is_tls: true, host: "internal.corp".into(), port: 8443 }),
+                expected: HttpTarget { is_tls: true, host: "internal.corp".into(), port: 8443 },
+                expected_url: "https://internal.corp:8443",
+            },
+            Case {
+                desc: "raw HTTP bytes with Host header without port inherits fallback scheme and port on same host",
+                url: "",
+                raw_http: b"POST /login HTTP/1.1\nHost: 127.0.0.1\n\nuser=admin",
+                fallback: Some(HttpTarget { is_tls: true, host: "127.0.0.1".into(), port: 8888 }),
+                expected: HttpTarget { is_tls: true, host: "127.0.0.1".into(), port: 8888 },
+                expected_url: "https://127.0.0.1:8888",
+            },
+            Case {
+                desc: "untouched DEFAULT_REP_URL does not force https onto pasted local HTTP request",
+                url: crate::state::DEFAULT_REP_URL,
+                raw_http: b"POST /login HTTP/1.1\nHost: 127.0.0.1:8888\n\nuser=admin",
+                fallback: Some(HttpTarget { is_tls: true, host: "example.com".into(), port: 443 }),
+                expected: HttpTarget { is_tls: false, host: "127.0.0.1".into(), port: 8888 },
+                expected_url: "http://127.0.0.1:8888",
+            },
+            Case {
+                desc: "IPv6 host and port in raw Host header",
+                url: "",
+                raw_http: b"GET /ipv6 HTTP/1.1\nHost: [::1]:8888\n\n",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "::1".into(), port: 8888 },
+                expected_url: "http://[::1]:8888",
+            },
+            Case {
+                desc: "absolute-form request line overrides stale URL bar",
+                url: "https://stale.example.com/",
+                raw_http: b"GET http://abs.local:9000/p HTTP/1.1\nHost: abs.local:9000\n\n",
+                fallback: None,
+                expected: HttpTarget { is_tls: false, host: "abs.local".into(), port: 9000 },
+                expected_url: "http://abs.local:9000",
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let got = HttpTarget::parse_or_infer(case.url, case.raw_http, case.fallback.as_ref());
+            assert_eq!(got, case.expected, "case #{idx} ({}) target mismatch", case.desc);
+            assert_eq!(got.to_url(), case.expected_url, "case #{idx} ({}) to_url mismatch", case.desc);
+        });
+    }
+
+    #[test]
+    fn inter_tool_routing_preserves_target_and_payload_matrix() {
+        use crate::assert_table;
+        use crate::state::Tab;
+        use crate::test_utils::{HttpFixture, MockAppBuilder};
+
+        let fixtures = [
+            (
+                "plaintext localhost:8888 POST",
+                HttpFixture::post("127.0.0.1", "/login", "user=admin&pass=secret").with_port(8888),
+            ),
+            (
+                "TLS default port 443 GET",
+                HttpFixture::get("auth.example.com", "/session?id=42").with_tls(true),
+            ),
+            (
+                "plaintext custom port 8080 PUT",
+                HttpFixture::post("internal.corp", "/api/v1/items", "{\"k\":\"v\"}")
+                    .with_method("PUT")
+                    .with_port(8080),
+            ),
+            (
+                "TLS custom port 8443 POST",
+                HttpFixture::post("secure.corp", "/token", "grant=client").with_tls(true).with_port(8443),
+            ),
+        ];
+
+        assert_table!(fixtures, |idx, (desc, fx)| {
+            let expected_origin = fx.origin();
+            let expected_url = fx.url();
+            let raw_req = fx.raw_request();
+            let entry = fx.clone().into_history_entry(idx + 1, "Proxy");
+
+            // 1. Send to Intruder (direct & via send_to)
+            let mut app = MockAppBuilder::new().build();
+            send_to_intruder(&mut app, &expected_url, &raw_req);
+            assert_eq!(app.tab, Tab::Intruder, "case #{idx} ({desc}): Intruder tab");
+            assert_eq!(app.int_target, expected_origin, "case #{idx} ({desc}): Intruder target");
+            assert_eq!(app.int_template, raw_req, "case #{idx} ({desc}): Intruder payload bit-for-bit");
+
+            // 2. Send to Repeater
+            let mut app = MockAppBuilder::new().build();
+            send_to(&mut app, &entry, SendTo::Repeater);
+            assert_eq!(app.tab, Tab::Repeater, "case #{idx} ({desc}): Repeater tab");
+            let rep = app.repeater_tabs.last().expect("Repeater tab created");
+            assert_eq!(rep.method, fx.method, "case #{idx} ({desc}): Repeater method");
+            assert_eq!(rep.url, expected_url, "case #{idx} ({desc}): Repeater url");
+            assert_eq!(rep.request, raw_req, "case #{idx} ({desc}): Repeater payload bit-for-bit");
+
+            // 3. Send to Sequencer
+            let mut app = MockAppBuilder::new().build();
+            app.seq_samples = vec!["stale_tok".into()];
+            send_to(&mut app, &entry, SendTo::Sequencer);
+            assert_eq!(app.tab, Tab::Sequencer, "case #{idx} ({desc}): Sequencer tab");
+            assert_eq!(app.seq_origin, expected_origin, "case #{idx} ({desc}): Sequencer origin");
+            assert_eq!(app.seq_template, raw_req, "case #{idx} ({desc}): Sequencer payload bit-for-bit");
+            assert!(app.seq_samples.is_empty(), "case #{idx} ({desc}): Sequencer samples cleared");
+
+            // 4. Send to Organizer
+            let mut app = MockAppBuilder::new().build();
+            send_to(&mut app, &entry, SendTo::Organizer);
+            let org = app.organizer.last().expect("Organizer item created");
+            assert_eq!(org.method, fx.method, "case #{idx} ({desc}): Organizer method");
+            assert_eq!(org.url, expected_url, "case #{idx} ({desc}): Organizer url");
+            assert_eq!(org.request, raw_req, "case #{idx} ({desc}): Organizer request bit-for-bit");
+            assert_eq!(org.response, entry.response, "case #{idx} ({desc}): Organizer response bit-for-bit");
+
+            // 5. Send to Decoder
+            let mut app = MockAppBuilder::new().build();
+            send_to(&mut app, &entry, SendTo::Decoder);
+            assert_eq!(app.tab, Tab::Decoder, "case #{idx} ({desc}): Decoder tab");
+            assert_eq!(app.dec_blocks[0].text, raw_req, "case #{idx} ({desc}): Decoder text bit-for-bit");
+            assert_eq!(app.dec_raw[0], raw_req.as_bytes(), "case #{idx} ({desc}): Decoder raw bytes bit-for-bit");
+
+            // 6. Send to Comparer (Request)
+            let mut app = MockAppBuilder::new().build();
+            send_to(&mut app, &entry, SendTo::ComparerRequest);
+            assert_eq!(app.tab, Tab::Comparer, "case #{idx} ({desc}): Comparer tab");
+            let comp = app.comparer_items.last().expect("Comparer item created");
+            assert_eq!(comp.data, raw_req.as_bytes(), "case #{idx} ({desc}): Comparer bytes bit-for-bit");
+        });
+    }
+
+    #[test]
+    fn context_menu_targets_filter_calling_tool() {
+        use crate::assert_table;
+        use crate::state::Tab;
+
+        let cases = [
+            (Tab::Repeater, 5, Some("Send to Repeater")),
+            (Tab::Intruder, 5, Some("Send to Intruder")),
+            (Tab::Sequencer, 5, Some("Send to Sequencer")),
+            (Tab::Comparer, 5, Some("Send to Comparer")),
+            (Tab::Decoder, 5, Some("Send to Decoder")),
+            (Tab::Organizer, 5, Some("Send to Organizer")),
+            (Tab::Proxy, 6, None),
+            (Tab::Target, 6, None),
+            (Tab::Logger, 6, None),
+        ];
+
+        assert_table!(cases, |idx, (tab, expected_len, hidden_label)| {
+            let targets = crate::ui_tools::traffic_context_menu_targets(tab);
+            assert_eq!(targets.len(), expected_len, "case #{idx} ({tab:?}): target count");
+            if let Some(hidden) = hidden_label {
+                assert!(
+                    targets.iter().all(|(l, _)| *l != hidden),
+                    "case #{idx} ({tab:?}): self-link {hidden:?} must be hidden"
+                );
+            }
+        });
     }
 }

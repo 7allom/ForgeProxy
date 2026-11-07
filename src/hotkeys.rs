@@ -33,7 +33,11 @@ fn sc(shift: bool, k: Key) -> KeyboardShortcut {
 }
 
 fn selected(app: &App) -> Option<std::sync::Arc<crate::http::HttpEntry>> {
-    let id = app.history_sel?;
+    let id = match app.tab {
+        Tab::Target => app.target_selected_history_id.or(app.history_sel)?,
+        Tab::Discover => app.discover_sel.or(app.history_sel)?,
+        _ => app.history_sel?,
+    };
     app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).cloned()
 }
 
@@ -46,7 +50,35 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     }
     for (k, to) in [(Key::R, SendTo::Repeater), (Key::I, SendTo::Intruder), (Key::O, SendTo::Organizer)] {
         if hit(k, false) {
-            if let Some(e) = selected(app) {
+            if app.tab == Tab::Repeater {
+                let tab = app.rep().clone();
+                if !tab.request.trim().is_empty() {
+                    match to {
+                        SendTo::Repeater => actions::send_to_repeater(app, &tab.method, &tab.url, &tab.request),
+                        SendTo::Intruder => actions::send_to_intruder(app, &tab.url, &tab.request),
+                        SendTo::Organizer => actions::send_to_organizer(app, &tab.url, &tab.request, tab.response.as_deref().unwrap_or("")),
+                        _ => {}
+                    }
+                }
+            } else if app.tab == Tab::Proxy && app.proxy_sub == 0 {
+                let held_req = app.proxy.held.lock().unwrap_or_else(|e| e.into_inner()).first().map(|h| (h.id, h.url.clone(), h.raw.clone()));
+                if let Some((id, url, raw)) = held_req {
+                    let req = if app.held_loaded == Some(id) && !app.held_edit.trim().is_empty() {
+                        app.held_edit.clone()
+                    } else {
+                        raw
+                    };
+                    let method = actions::request_method(&req).unwrap_or_else(|| "GET".to_string());
+                    match to {
+                        SendTo::Repeater => actions::send_to_repeater(app, &method, &url, &req),
+                        SendTo::Intruder => actions::send_to_intruder(app, &url, &req),
+                        SendTo::Organizer => actions::send_to_organizer(app, &url, &req, ""),
+                        _ => {}
+                    }
+                } else if let Some(e) = selected(app) {
+                    actions::send_to(app, &e, to);
+                }
+            } else if let Some(e) = selected(app) {
                 actions::send_to(app, &e, to);
             }
         }

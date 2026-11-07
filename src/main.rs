@@ -44,6 +44,8 @@ mod ui_target;
 mod ui_tools;
 mod upstream;
 mod viewer;
+#[cfg(test)]
+pub mod test_utils;
 
 use eframe::egui;
 use state::{App, Tab};

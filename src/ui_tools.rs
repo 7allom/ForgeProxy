@@ -315,7 +315,17 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
                 ui.label(RichText::new(format!("{} payload positions", intruder::count_positions(&app.int_template))).size(11.5).color(p.text));
             });
         });
+        let tpl_before = app.int_template.clone();
         let out = editor::message_editor(ui, p, "int_pos", &mut app.int_template, true, true, 240.0);
+        if app.int_template != tpl_before {
+            let clean = app.int_template.replace('§', "");
+            if actions::host_header(&clean).is_some()
+                || actions::request_target(&clean)
+                    .is_some_and(|t| t.starts_with("http://") || t.starts_with("https://"))
+            {
+                app.int_target = actions::resolve_target_origin(app, "", &app.int_template);
+            }
+        }
         if let Some(r) = out.cursor_range {
             let (a, b) = (r.primary.ccursor.index, r.secondary.ccursor.index);
             app.int_sel = if a != b { Some((a.min(b), a.max(b))) } else { app.int_sel.filter(|_| !out.response.has_focus()) };
@@ -554,8 +564,13 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
             });
             ui.add_space(4.0);
         };
-        let tab_url = app.repeater_tabs[i].url.clone();
-        let tab_req = app.repeater_tabs[i].request.clone();
+        if app.repeater_tabs.get(i).is_some_and(|t| t.id == tab_id) && app.repeater_tabs[i].url != url_before {
+            sync_repeater_target(&mut app.repeater_tabs[i], &url_before, &request_before);
+        }
+        let url_after_bar = app.repeater_tabs[i].url.clone();
+        let req_after_bar = app.repeater_tabs[i].request.clone();
+        let tab_url = url_after_bar.clone();
+        let tab_req = req_after_bar.clone();
         let tab_resp = app.repeater_tabs[i].response.clone();
         let tab_title = app.repeater_tabs[i].title.clone();
         egui::SidePanel::right("rep_response_pane").resizable(true).default_width(width / 2.0)
@@ -580,13 +595,14 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
                 let h = ui.available_height() - 2.0;
                 // per-tab editor state: cursor and undo history don't leak between tabs
                 let out = editor::message_editor(ui, p, &format!("rep_req:{tab_id}"), &mut app.repeater_tabs[i].request, true, false, h);
+                if app.repeater_tabs.get(i).is_some_and(|t| t.id == tab_id) {
+                    sync_repeater_target(&mut app.repeater_tabs[i], &url_after_bar, &req_after_bar);
+                }
+                let cur_url = app.repeater_tabs[i].url.clone();
                 let cur_req = app.repeater_tabs[i].request.clone();
                 let what = format!("Repeater tab {tab_title} request");
-                attach_editor_context_menu(&out, &cur_req, &cur_req, app, Tab::Repeater, &tab_url, &cur_req, tab_resp.as_deref(), &what);
+                attach_editor_context_menu(&out, &cur_req, &cur_req, app, Tab::Repeater, &cur_url, &cur_req, tab_resp.as_deref(), &what);
             });
-        if app.repeater_tabs.get(i).is_some_and(|t| t.id == tab_id) {
-            sync_repeater_target(&mut app.repeater_tabs[i], &url_before, &request_before);
-        }
     });
     if let Some((url, template)) = to_sequencer {
         actions::send_to_sequencer(app, &url, &template);
@@ -717,7 +733,16 @@ fn sync_repeater_target(tab: &mut crate::repeater::RepeaterTab, url_before: &str
             tab.request = actions::set_request_target(&request, &path);
         }
     } else if tab.request != request_before {
-        tab.url = actions::repeater_target(&tab.request, &tab.url);
+        let (_, bar_auth, _) = actions::url_parts(&tab.url);
+        let same_host = actions::host_header(&tab.request).is_none_or(|rh| {
+            let (rh_name, _) = actions::split_host_port(&rh);
+            let (bar_name, _) = actions::split_host_port(&bar_auth);
+            !bar_name.is_empty()
+                && rh_name.eq_ignore_ascii_case(bar_name)
+                && tab.url.trim() != crate::state::DEFAULT_REP_URL
+        });
+        let ref_url = if same_host { tab.url.as_str() } else { "" };
+        tab.url = actions::repeater_target(&tab.request, ref_url);
     }
 }
 

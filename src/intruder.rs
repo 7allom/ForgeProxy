@@ -23,47 +23,175 @@ impl AttackType {
     }
 }
 
+/// Mark `name=value` pairs in a query string or URL-encoded form body (`&` or `;` delimited),
+/// stopping each extracted value strictly at `&`, `;`, `\r`, `\n`, or whitespace so trailing
+/// newlines or blank lines are never captured inside `§...§`.
+fn mark_urlencoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut start = 0;
+    for (idx, ch) in s.char_indices() {
+        if matches!(ch, '&' | ';') {
+            out.push_str(&mark_one_pair(&s[start..idx]));
+            out.push(ch);
+            start = idx + ch.len_utf8();
+        }
+    }
+    out.push_str(&mark_one_pair(&s[start..]));
+    out
+}
+
+fn mark_one_pair(pair: &str) -> String {
+    match pair.split_once('=') {
+        Some((k, v)) if !k.trim().is_empty() && !k.trim().contains(char::is_whitespace) => {
+            let val_end = v
+                .find(|c: char| matches!(c, '&' | ';' | '\r' | '\n') || c.is_whitespace())
+                .unwrap_or(v.len());
+            let (val, suffix) = v.split_at(val_end);
+            format!("{k}=§{val}§{suffix}")
+        }
+        _ => pair.to_string(),
+    }
+}
+
+/// Mark values in a JSON body (`"key": "§value§"` and `"key": §123§`), ensuring the closing
+/// `§` never consumes closing quotes, commas, braces, or trailing whitespace/newlines.
+fn mark_json_body(b: &str) -> String {
+    let bytes = b.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(b.len() + 16);
+    let mut i = 0;
+
+    while i < n {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(n);
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&b[start..i]);
+
+            let ws_start = i;
+            while i < n && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < n && bytes[i] == b':' {
+                i += 1;
+                while i < n && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                out.push_str(&b[ws_start..i]);
+
+                if i < n && bytes[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                    let val_start = i;
+                    while i < n {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(n);
+                        } else if bytes[i] == b'"' {
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.push('§');
+                    out.push_str(&b[val_start..i]);
+                    out.push('§');
+                    if i < n && bytes[i] == b'"' {
+                        out.push('"');
+                        i += 1;
+                    }
+                } else if i < n && !matches!(bytes[i], b'{' | b'[' | b'}' | b']' | b',') {
+                    let val_start = i;
+                    while i < n
+                        && !matches!(bytes[i], b',' | b'}' | b']' | b'\r' | b'\n')
+                        && !bytes[i].is_ascii_whitespace()
+                    {
+                        i += 1;
+                    }
+                    if i > val_start {
+                        out.push('§');
+                        out.push_str(&b[val_start..i]);
+                        out.push('§');
+                    }
+                }
+            } else {
+                i = ws_start;
+            }
+        } else {
+            let ch = b[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 /// "Auto §": clear existing markers, then mark every parameter value in the query string,
-/// the Cookie header and a form-style body (name=value pairs).
+/// the Cookie header, a form-style body (name=value pairs), or a JSON body.
 pub fn auto_positions(template: &str) -> String {
     let clean = template.replace('§', "");
-    let mark = |s: &str, sep: char| -> String {
-        s.split(sep)
-            .map(|pair| match pair.split_once('=') {
-                Some((k, v)) if !k.trim().is_empty() => format!("{k}=§{v}§"),
-                _ => pair.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(&sep.to_string())
+    let (head, sep_str, body) = if let Some((h, b)) = clean.split_once("\r\n\r\n") {
+        (h.to_string(), "\r\n\r\n", Some(b.to_string()))
+    } else if let Some((h, b)) = clean.split_once("\n\n") {
+        (h.to_string(), "\n\n", Some(b.to_string()))
+    } else {
+        (clean.clone(), "", None)
     };
-    let (head, body) = match clean.split_once("\n\n") {
-        Some((h, b)) => (h.to_string(), Some(b.to_string())),
-        None => (clean.clone(), None),
-    };
+    let line_sep = if head.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = Vec::new();
-    for (i, line) in head.lines().enumerate() {
+    for (i, raw_line) in head.split('\n').enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if i == 0 {
             let mut parts: Vec<String> = line.splitn(3, ' ').map(String::from).collect();
             if parts.len() >= 2 {
                 if let Some((path, q)) = parts[1].split_once('?') {
-                    parts[1] = format!("{path}?{}", mark(q, '&'));
+                    parts[1] = format!("{path}?{}", mark_urlencoded(q));
                 }
             }
             out.push(parts.join(" "));
         } else if let Some((k, v)) = line.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("cookie")) {
-            let cookies: Vec<String> = v.split(';').map(|c| {
-                let lead = if c.starts_with(' ') { " " } else { "" };
-                match c.trim().split_once('=') { Some((n, val)) => format!("{lead}{n}=§{val}§"), None => c.to_string() }
-            }).collect();
+            let cookies: Vec<String> = v
+                .split(';')
+                .map(|c| {
+                    let lead: String = c.chars().take_while(|ch| ch.is_whitespace()).collect();
+                    let trimmed = &c[lead.len()..];
+                    match trimmed.split_once('=') {
+                        Some((n, val_part)) if !n.trim().is_empty() => {
+                            let val_end = val_part
+                                .find(|ch: char| matches!(ch, '&' | ';' | '\r' | '\n') || ch.is_whitespace())
+                                .unwrap_or(val_part.len());
+                            let (val, suffix) = val_part.split_at(val_end);
+                            format!("{lead}{n}=§{val}§{suffix}")
+                        }
+                        _ => c.to_string(),
+                    }
+                })
+                .collect();
             out.push(format!("{k}:{}", cookies.join(";")));
         } else {
             out.push(line.to_string());
         }
     }
-    let mut res = out.join("\n");
+    let mut res = out.join(line_sep);
     if let Some(b) = body {
-        res.push_str("\n\n");
-        res.push_str(&if b.contains('=') && !b.trim_start().starts_with('{') { mark(&b, '&') } else { b });
+        res.push_str(sep_str);
+        let trimmed = b.trim_start();
+        let marked_body = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            mark_json_body(&b)
+        } else if b.contains('=') {
+            mark_urlencoded(&b)
+        } else {
+            b
+        };
+        res.push_str(&marked_body);
     }
     res
 }
@@ -282,6 +410,34 @@ mod tests {
         let out = auto_positions(t);
         assert_eq!(out, "POST /a?x=§1§&y=§2§ HTTP/1.1\nCookie: s=§abc§; t=§9§\nHost: h\n\nu=§me§&p=§pw§");
         assert_eq!(count_positions(&out), 6);
+    }
+
+    #[test]
+    fn auto_positions_stops_before_newlines_delimiters_and_whitespace() {
+        // CRLF request with trailing carriage returns, newlines, and blank lines in body
+        let crlf = "POST /login?a=1;b=2 HTTP/1.1\r\nHost: example.com\r\nCookie: sid=tok123\r\n\r\nuser=admin&pass=secret\r\n\r\n";
+        let marked = auto_positions(crlf);
+        assert_eq!(
+            marked,
+            "POST /login?a=§1§;b=§2§ HTTP/1.1\r\nHost: example.com\r\nCookie: sid=§tok123§\r\n\r\nuser=§admin§&pass=§secret§\r\n\r\n"
+        );
+        // Trailing whitespace after parameter value is kept outside §
+        let trailing_ws = "POST /api HTTP/1.1\nHost: example.com\n\nq=search_term   \n\n";
+        assert_eq!(
+            auto_positions(trailing_ws),
+            "POST /api HTTP/1.1\nHost: example.com\n\nq=§search_term§   \n\n"
+        );
+    }
+
+    #[test]
+    fn auto_positions_marks_json_values_without_consuming_quotes_or_commas() {
+        let json_req = "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"value\", \"count\": 123, \"active\": true}\r\n";
+        let marked = auto_positions(json_req);
+        assert_eq!(
+            marked,
+            "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"§value§\", \"count\": §123§, \"active\": §true§}\r\n"
+        );
+        assert_eq!(count_positions(&marked), 3);
     }
 
     #[test]
