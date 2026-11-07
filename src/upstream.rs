@@ -348,6 +348,7 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     fn route(kind: UpstreamProxyType, port: u16) -> Route {
         Route { kind, host: "127.0.0.1".into(), port }
@@ -360,21 +361,123 @@ mod tests {
     }
 
     #[test]
-    fn routes() {
-        let mut c = UpstreamProxyConfig::default();
-        assert_eq!(c.route(), Ok(None), "off: direct");
-        c.enabled = true;
-        assert!(c.route().is_err(), "on without a host: an error, never a silent direct connection");
-        c.host = " proxy.lan ".into();
-        assert_eq!(c.route(), Ok(Some(Route { kind: UpstreamProxyType::HttpConnect, host: "proxy.lan".into(), port: 8080 })));
-        c.proxy_type = UpstreamProxyType::Direct;
-        assert_eq!(c.route(), Ok(None));
-        c.proxy_type = UpstreamProxyType::Socks5;
-        c.port = 0;
-        assert!(c.route().is_err());
-        assert_eq!(authority("::1", 80), "[::1]:80");
-        assert_eq!(authority("[::1]", 80), "[::1]:80");
-        assert_eq!(authority("a.test", 443), "a.test:443");
+    fn upstream_proxy_routing_matrix() {
+        // 1. Route resolution matrix across Direct, HttpConnect, Socks5, disabled, and invalid configs
+        struct RouteCase {
+            name: &'static str,
+            config: UpstreamProxyConfig,
+            expected: Result<Option<Route>, bool>, // Ok(route) or Err(true)
+        }
+
+        let route_cases = [
+            RouteCase {
+                name: "default disabled config routes directly (None)",
+                config: UpstreamProxyConfig::default(),
+                expected: Ok(None),
+            },
+            RouteCase {
+                name: "enabled config with empty host fails closed with Err",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::HttpConnect,
+                    host: String::new(),
+                    port: 8080,
+                },
+                expected: Err(true),
+            },
+            RouteCase {
+                name: "enabled config with whitespace-only host fails closed with Err",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::HttpConnect,
+                    host: "   ".into(),
+                    port: 8080,
+                },
+                expected: Err(true),
+            },
+            RouteCase {
+                name: "enabled HttpConnect trims host and resolves Route",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::HttpConnect,
+                    host: " proxy.lan ".into(),
+                    port: 8080,
+                },
+                expected: Ok(Some(Route {
+                    kind: UpstreamProxyType::HttpConnect,
+                    host: "proxy.lan".into(),
+                    port: 8080,
+                })),
+            },
+            RouteCase {
+                name: "enabled Direct proxy_type routes directly (None)",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::Direct,
+                    host: "proxy.lan".into(),
+                    port: 8080,
+                },
+                expected: Ok(None),
+            },
+            RouteCase {
+                name: "enabled Socks5 on localhost:1080 resolves Socks5 Route",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::Socks5,
+                    host: "127.0.0.1".into(),
+                    port: 1080,
+                },
+                expected: Ok(Some(Route {
+                    kind: UpstreamProxyType::Socks5,
+                    host: "127.0.0.1".into(),
+                    port: 1080,
+                })),
+            },
+            RouteCase {
+                name: "enabled Socks5 with port 0 fails closed with Err",
+                config: UpstreamProxyConfig {
+                    enabled: true,
+                    proxy_type: UpstreamProxyType::Socks5,
+                    host: "proxy.lan".into(),
+                    port: 0,
+                },
+                expected: Err(true),
+            },
+        ];
+
+        assert_table!(route_cases, |case| {
+            let actual = case.config.route().map_err(|_| true);
+            assert_eq!(actual, case.expected, "case '{}'", case.name);
+        });
+
+        // 2. Authority formatting & ureq proxy construction matrix
+        let auth_cases = [
+            ("unbracketed IPv6 literal wrapped in brackets", "::1", 80u16, "[::1]:80"),
+            ("bracketed IPv6 literal avoids double brackets", "[::1]", 80u16, "[::1]:80"),
+            ("domain host and TLS port", "a.test", 443u16, "a.test:443"),
+            ("localhost and custom port", "localhost", 8888u16, "localhost:8888"),
+            ("internal wildcard-style subdomain host", "app.internal", 8080u16, "app.internal:8080"),
+        ];
+
+        assert_table!(auth_cases, |(name, host, port, expected)| {
+            assert_eq!(authority(host, port), expected, "{name}");
+        });
+
+        assert!(ureq_proxy(&route(UpstreamProxyType::HttpConnect, 8080)).is_ok());
+        assert!(ureq_proxy(&route(UpstreamProxyType::Socks5, 1080)).is_ok());
+
+        // 3. Settings serde round-trip
+        let c = UpstreamProxyConfig {
+            enabled: true,
+            proxy_type: UpstreamProxyType::Socks5,
+            host: "10.0.0.2".into(),
+            port: 1080,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"socks5\""), "{json}");
+        assert_eq!(serde_json::from_str::<UpstreamProxyConfig>(&json).unwrap(), c);
+        assert_eq!(serde_json::from_str::<UpstreamProxyConfig>("{}").unwrap(), UpstreamProxyConfig::default());
+        assert!(!ProtocolSettings::default().verify_upstream_tls);
     }
 
     #[test]
@@ -409,15 +512,5 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let e = connect(Some(&route(UpstreamProxyType::HttpConnect, closed)), "a.test", 80, Duration::from_secs(5)).unwrap_err();
         assert!(e.to_string().contains(&format!("upstream proxy 127.0.0.1:{closed}")), "{e}");
-    }
-
-    #[test]
-    fn settings_round_trip() {
-        let c = UpstreamProxyConfig { enabled: true, proxy_type: UpstreamProxyType::Socks5, host: "10.0.0.2".into(), port: 1080 };
-        let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("\"socks5\""), "{json}");
-        assert_eq!(serde_json::from_str::<UpstreamProxyConfig>(&json).unwrap(), c);
-        assert_eq!(serde_json::from_str::<UpstreamProxyConfig>("{}").unwrap(), UpstreamProxyConfig::default());
-        assert!(!ProtocolSettings::default().verify_upstream_tls);
     }
 }

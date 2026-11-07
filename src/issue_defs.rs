@@ -193,3 +193,45 @@ pub const ISSUE_DEFS: &[(u32, &str, &str)] = &[
     (0x09000000, "Bambda generated issue", "Information"),
     (0x0a000000, "Automated test generated issue", "Information"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan;
+    use crate::test_utils::assert_table;
+
+    #[test]
+    fn issue_catalogue_integrity_matrix() {
+        assert_eq!(ISSUE_DEFS.len(), 190);
+        assert_table!(ISSUE_DEFS, |(type_index, name, severity)| {
+            assert!(*type_index > 0, "issue '{name}' must have non-zero type_index");
+            assert!(!name.trim().is_empty(), "issue 0x{type_index:08x} must have a name");
+            assert!(
+                matches!(*severity, "High" | "Medium" | "Low" | "Information"),
+                "issue '{name}' has unexpected severity '{severity}'"
+            );
+        });
+
+        let scanner_defs = [
+            scan::SQL_INJECTION,
+            scan::CSP_NOT_ENFORCED,
+            scan::CLEARTEXT_PASSWORD,
+            scan::INPUT_REFLECTED,
+            scan::TLS_COOKIE_NO_SECURE,
+            scan::COOKIE_NO_HTTPONLY,
+            scan::PASSWORD_AUTOCOMPLETE,
+            scan::FRAMEABLE,
+            scan::DIRECTORY_LISTING,
+            scan::EMAIL_DISCLOSED,
+            scan::PRIVATE_IP_DISCLOSED,
+            scan::CACHEABLE_HTTPS,
+            scan::HSTS_NOT_ENFORCED,
+        ];
+
+        assert_table!(scanner_defs, |(idx, name, sev)| {
+            let found = ISSUE_DEFS.iter().find(|(i, n, _)| *i == idx && *n == name);
+            assert!(found.is_some(), "scanner constant ({idx:#x}, {name}) missing from ISSUE_DEFS");
+            assert_eq!(found.unwrap().2, sev.label(), "severity mismatch for '{name}'");
+        });
+    }
+}

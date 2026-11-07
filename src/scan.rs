@@ -318,21 +318,152 @@ fn contains_private_ip(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
+
     #[test]
-    fn finds_header_and_cookie_issues() {
-        let f = passive_checks("a.test", "/", true, "Content-Type: text/html\nSet-Cookie: s=1; Path=/", "<p>hi</p>");
-        let names: Vec<&str> = f.iter().map(|x| x.name.as_str()).collect();
-        assert!(names.contains(&"Strict transport security not enforced"));
-        assert!(names.contains(&"TLS cookie without secure flag set"));
-        assert!(names.contains(&"Cookie without HttpOnly flag set"));
+    fn passive_scan_matrix() {
+        struct PassiveCase {
+            name: &'static str,
+            secure: bool,
+            headers: &'static str,
+            body: &'static str,
+            expected_present: &'static [&'static str],
+            expected_absent: &'static [&'static str],
+        }
+
+        let cases = [
+            PassiveCase {
+                name: "HTTPS response missing HSTS, CSP, XFO, Cache-Control no-store, and cookie flags",
+                secure: true,
+                headers: "Content-Type: text/html\nSet-Cookie: s=1; Path=/",
+                body: "<p>hi</p>",
+                expected_present: &[
+                    "Strict transport security not enforced",
+                    "Content security policy: not enforced",
+                    "Frameable response (potential Clickjacking)",
+                    "TLS cookie without secure flag set",
+                    "Cookie without HttpOnly flag set",
+                    "Cacheable HTTPS response",
+                ],
+                expected_absent: &[
+                    "Directory listing",
+                    "Password field with autocomplete enabled",
+                    "Cleartext submission of password",
+                    "Email addresses disclosed",
+                    "Private IP addresses disclosed",
+                ],
+            },
+            PassiveCase {
+                name: "hardened HTTPS response with HSTS, CSP, XFO, no-store, and Secure+HttpOnly cookie",
+                secure: true,
+                headers: "Strict-Transport-Security: max-age=31536000\nContent-Security-Policy: default-src 'self'; frame-ancestors 'none'\nX-Frame-Options: DENY\nCache-Control: no-store\nSet-Cookie: id=1; Secure; HttpOnly",
+                body: "<p>hardened</p>",
+                expected_present: &[],
+                expected_absent: &[
+                    "Strict transport security not enforced",
+                    "Content security policy: not enforced",
+                    "Frameable response (potential Clickjacking)",
+                    "TLS cookie without secure flag set",
+                    "Cookie without HttpOnly flag set",
+                    "Cacheable HTTPS response",
+                ],
+            },
+            PassiveCase {
+                name: "plain HTTP password form without autocomplete=off triggers cleartext and autocomplete issues",
+                secure: false,
+                headers: "Content-Type: text/html\nContent-Security-Policy: default-src 'self'\nX-Frame-Options: SAMEORIGIN",
+                body: "<form><input type=\"password\" name=\"pw\"></form>",
+                expected_present: &[
+                    "Password field with autocomplete enabled",
+                    "Cleartext submission of password",
+                ],
+                expected_absent: &[
+                    "Strict transport security not enforced",
+                    "Cacheable HTTPS response",
+                ],
+            },
+            PassiveCase {
+                name: "HTTPS password form with autocomplete=off triggers neither password issue",
+                secure: true,
+                headers: "Strict-Transport-Security: max-age=3600\nContent-Security-Policy: default-src 'self'\nX-Frame-Options: DENY\nCache-Control: no-store",
+                body: "<form><input type=\"password\" autocomplete=\"off\"></form>",
+                expected_present: &[],
+                expected_absent: &[
+                    "Password field with autocomplete enabled",
+                    "Cleartext submission of password",
+                ],
+            },
+            PassiveCase {
+                name: "directory listing, email disclosure, and RFC1918 private IP disclosure",
+                secure: false,
+                headers: "Content-Security-Policy: default-src 'self'\nX-Frame-Options: DENY",
+                body: "<title>Index of /backup</title> Contact ops@corp.internal on 192.168.1.25",
+                expected_present: &[
+                    "Directory listing",
+                    "Email addresses disclosed",
+                    "Private IP addresses disclosed",
+                ],
+                expected_absent: &[],
+            },
+        ];
+
+        assert_table!(cases, |case| {
+            let findings = passive_checks("a.test", "/", case.secure, case.headers, case.body);
+            let names: Vec<&str> = findings.iter().map(|x| x.name.as_str()).collect();
+            for &exp in case.expected_present {
+                assert!(names.contains(&exp), "case '{}': expected '{}' in {names:?}", case.name, exp);
+            }
+            for &abs in case.expected_absent {
+                assert!(!names.contains(&abs), "case '{}': unexpected '{}' in {names:?}", case.name, abs);
+            }
+        });
+
+        // Consolidation deduplicates identical (type_index, host, path) and sorts High -> Info
+        let one = passive_checks("a.test", "/", true, "", "");
+        let mut twice = one.clone();
+        twice.extend(one.clone());
+        assert_eq!(consolidate(twice).len(), one.len());
+
+        // Active reflection & SQL error signature matrix
+        assert!(reflects_marker("hello fp9x2a world", "fp9x2a"));
+        assert!(!reflects_marker("hello world", "fp9x2a"));
+
+        let sql_cases = [
+            ("MySQL syntax error", "Error: You have an error in your SQL syntax near ''", Some("You have an error in your SQL syntax")),
+            ("MSSQL unclosed quote", "Unclosed quotation mark after the character string", Some("Unclosed quotation mark after the character string")),
+            ("Oracle ORA-00933", "ORA-00933: SQL command not properly ended", Some("ORA-00933")),
+            ("PDO SQLSTATE", "Fatal: SQLSTATE[42000]: Syntax error", Some("SQLSTATE[")),
+            ("PostgreSQL error", "Warning: PostgreSQL query failed: ERROR", Some("PostgreSQL query failed")),
+            ("SQLite3 error", "Warning: SQLite3::query(): near \"'\"", Some("SQLite3::query")),
+            ("normal HTML page", "<html><body>Welcome</body></html>", None),
+        ];
+        assert_table!(sql_cases, |(name, body, expected)| {
+            assert_eq!(sql_error_signature(body), expected, "{name}");
+        });
     }
+
     #[test]
-    fn crawl_links_stay_on_site() {
-        let links = extract_links("https://a.test/dir/page", r#"<a href="/x">x</a><a href="y.html">y</a><a href="https://other.test/">o</a>"#);
+    fn crawler_link_and_origin_matrix() {
+        let origin_cases = [
+            ("HTTPS default port and uppercase host", "https://A.Test/x", Some(("https".into(), "a.test".into(), 443u16))),
+            ("HTTP explicit port 8080", "http://a.test:8080", Some(("http".into(), "a.test".into(), 8080u16))),
+            ("userinfo stripped from authority", "https://u:p@b.test/", Some(("https".into(), "b.test".into(), 443u16))),
+            ("IPv6 literal with explicit port", "http://[::1]:9000/p", Some(("http".into(), "::1".into(), 9000u16))),
+            ("non-numeric port rejected", "http://a.test:notaport/", None),
+            ("non-http(s) scheme rejected", "ftp://a.test/", None),
+            ("empty host rejected", "https:///nohost", None),
+        ];
+
+        assert_table!(origin_cases, |(name, url, expected)| {
+            assert_eq!(origin_of_url(url), expected, "{name}");
+        });
+
+        let links = extract_links(
+            "https://a.test/dir/page",
+            r#"<a href="/x">x</a><a href="y.html">y</a><a href="https://other.test/">o</a>"#,
+        );
         assert_eq!(links, vec!["https://a.test/x".to_string(), "https://a.test/dir/y.html".to_string()]);
-    }
-    #[test]
-    fn crawler_stays_on_the_exact_origin() {
+
         let page = r#"
             <a href="/ok1">same, absolute path</a>
             <a href="https://shop.test/ok2">same origin</a>
@@ -345,28 +476,16 @@ mod tests {
             <a href="http://shop.test/x">other scheme</a>
             <a href="https://api.shop.test/x">subdomain</a>"#;
         let links = extract_links("https://shop.test/start", page);
-        assert_eq!(links, ["https://shop.test/ok1", "https://shop.test/ok2", "https://SHOP.test:443/ok3", "https://shop.test/ok4"]);
+        assert_eq!(
+            links,
+            [
+                "https://shop.test/ok1",
+                "https://shop.test/ok2",
+                "https://SHOP.test:443/ok3",
+                "https://shop.test/ok4"
+            ]
+        );
         assert!(links.iter().all(|l| !l.contains("evil") && !l.contains(":8443") && !l.starts_with("http:")));
-        // a base that isn't an http(s) URL yields nothing rather than guessing
         assert!(extract_links("not a url", page).is_empty());
-    }
-
-    #[test]
-    fn origins() {
-        assert_eq!(origin_of_url("https://A.Test/x"), Some(("https".into(), "a.test".into(), 443)));
-        assert_eq!(origin_of_url("http://a.test:8080"), Some(("http".into(), "a.test".into(), 8080)));
-        assert_eq!(origin_of_url("https://u:p@b.test/"), Some(("https".into(), "b.test".into(), 443)));
-        assert_eq!(origin_of_url("http://[::1]:9000/p"), Some(("http".into(), "::1".into(), 9000)));
-        assert_eq!(origin_of_url("http://a.test:notaport/"), None);
-        assert_eq!(origin_of_url("ftp://a.test/"), None);
-        assert_eq!(origin_of_url("https:///nohost"), None);
-    }
-
-    #[test]
-    fn duplicates_are_merged() {
-        let one = passive_checks("a.test", "/", true, "", "");
-        let mut twice = one.clone();
-        twice.extend(one.clone());
-        assert_eq!(consolidate(twice).len(), one.len());
     }
 }

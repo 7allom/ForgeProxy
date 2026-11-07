@@ -137,6 +137,7 @@ impl TargetScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     fn scope(include: &[&str], exclude: &[&str]) -> TargetScope {
         TargetScope {
@@ -147,115 +148,285 @@ mod tests {
     }
 
     #[test]
-    fn empty_scope_includes_everything() {
-        let s = TargetScope::default();
-        assert!(s.is_in_scope("https://anything.test/x"));
-        assert!(s.is_in_scope("anything.test"));
-        // a disabled include rule doesn't close the scope
-        let mut s = scope(&["https://a.test"], &[]);
-        s.include[0].enabled = false;
-        assert!(s.is_in_scope("https://b.test/"));
+    fn scope_evaluation_matrix() {
+        struct ScopeCase {
+            name: &'static str,
+            scope: TargetScope,
+            test_url: &'static str,
+            expected: bool,
+        }
+
+        let mut disabled_rule_scope = scope(&["https://a.test"], &[]);
+        disabled_rule_scope.include[0].enabled = false;
+
+        let mut subdomain_flag_scope = scope(&["https://corp.test/"], &[]);
+        subdomain_flag_scope.include[0].subdomains = true;
+
+        let mut advanced_regex_scope = scope(&[r"^https://[a-z]+\.corp\.test/"], &[r"/logout"]);
+        advanced_regex_scope.advanced = true;
+
+        let cases = [
+            // Empty & disabled scope rules
+            ScopeCase {
+                name: "empty scope includes full URL",
+                scope: TargetScope::default(),
+                test_url: "https://anything.test/x",
+                expected: true,
+            },
+            ScopeCase {
+                name: "empty scope includes bare host",
+                scope: TargetScope::default(),
+                test_url: "anything.test",
+                expected: true,
+            },
+            ScopeCase {
+                name: "disabled include rule leaves scope open for other hosts",
+                scope: disabled_rule_scope,
+                test_url: "https://b.test/",
+                expected: true,
+            },
+            // URL prefixes & scheme/host boundaries
+            ScopeCase {
+                name: "URL prefix matches deeper sub-path with query",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "https://shop.test/app/cart?id=1",
+                expected: true,
+            },
+            ScopeCase {
+                name: "URL prefix rejects sibling path",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "https://shop.test/other",
+                expected: false,
+            },
+            ScopeCase {
+                name: "URL prefix rejects mismatched scheme",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "http://shop.test/app",
+                expected: false,
+            },
+            ScopeCase {
+                name: "URL prefix rejects suffix lookalike host",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "https://shop.test.evil.net/app",
+                expected: false,
+            },
+            ScopeCase {
+                name: "URL prefix rejects prefix lookalike host",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "https://evilshop.test/app",
+                expected: false,
+            },
+            ScopeCase {
+                name: "URL prefix matches uppercase host case-insensitively",
+                scope: scope(&["https://shop.test/app"], &[]),
+                test_url: "https://SHOP.test/app",
+                expected: true,
+            },
+            // Ports, bare hosts, IPv4 & IPv6
+            ScopeCase {
+                name: "explicit port 8080 matches port 8080",
+                scope: scope(&["http://127.0.0.1:8080"], &[]),
+                test_url: "http://127.0.0.1:8080/login",
+                expected: true,
+            },
+            ScopeCase {
+                name: "explicit port 8080 rejects port 8081",
+                scope: scope(&["http://127.0.0.1:8080"], &[]),
+                test_url: "http://127.0.0.1:8081/login",
+                expected: false,
+            },
+            ScopeCase {
+                name: "explicit port 8080 rejects default port 80",
+                scope: scope(&["http://127.0.0.1:8080"], &[]),
+                test_url: "http://127.0.0.1/login",
+                expected: false,
+            },
+            ScopeCase {
+                name: "scheme without port matches explicit default port 443",
+                scope: scope(&["https://a.test"], &[]),
+                test_url: "https://a.test:443/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "scheme without port rejects non-default port 8443",
+                scope: scope(&["https://a.test"], &[]),
+                test_url: "https://a.test:8443/",
+                expected: false,
+            },
+            ScopeCase {
+                name: "bare host matches HTTPS with non-standard port",
+                scope: scope(&["a.test"], &[]),
+                test_url: "https://a.test:8443/x",
+                expected: true,
+            },
+            ScopeCase {
+                name: "bare host matches plain HTTP",
+                scope: scope(&["a.test"], &[]),
+                test_url: "http://a.test/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "bare host matches bare host target",
+                scope: scope(&["a.test"], &[]),
+                test_url: "a.test",
+                expected: true,
+            },
+            ScopeCase {
+                name: "IPv6 origin with port matches exact IPv6 port",
+                scope: scope(&["http://[::1]:9000"], &[]),
+                test_url: "http://[::1]:9000/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "IPv6 origin with port rejects different IPv6 port",
+                scope: scope(&["http://[::1]:9000"], &[]),
+                test_url: "http://[::1]:9001/",
+                expected: false,
+            },
+            // Wildcard domains & subdomains flag
+            ScopeCase {
+                name: "wildcard *.corp.test matches apex domain",
+                scope: scope(&["*.corp.test"], &[]),
+                test_url: "https://corp.test/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "wildcard *.corp.test matches first-level subdomain",
+                scope: scope(&["*.corp.test"], &[]),
+                test_url: "https://api.corp.test/v1",
+                expected: true,
+            },
+            ScopeCase {
+                name: "wildcard *.corp.test matches multi-level bare subdomain",
+                scope: scope(&["*.corp.test"], &[]),
+                test_url: "deep.api.corp.test",
+                expected: true,
+            },
+            ScopeCase {
+                name: "wildcard *.corp.test rejects suffix lookalike",
+                scope: scope(&["*.corp.test"], &[]),
+                test_url: "https://corp.test.evil/",
+                expected: false,
+            },
+            ScopeCase {
+                name: "wildcard *.corp.test rejects prefix lookalike",
+                scope: scope(&["*.corp.test"], &[]),
+                test_url: "https://notcorp.test/",
+                expected: false,
+            },
+            ScopeCase {
+                name: "exact host rule without subdomains flag rejects subdomain",
+                scope: scope(&["https://corp.test/"], &[]),
+                test_url: "https://api.corp.test/",
+                expected: false,
+            },
+            ScopeCase {
+                name: "host rule with subdomains flag enabled matches subdomain",
+                scope: subdomain_flag_scope,
+                test_url: "https://api.corp.test/",
+                expected: true,
+            },
+            // Exclusions overriding inclusions
+            ScopeCase {
+                name: "included subdomain not matching exclusion stays in scope",
+                scope: scope(&["*.corp.test"], &["https://admin.corp.test", "https://corp.test/logout"]),
+                test_url: "https://www.corp.test/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "excluded subdomain overrides broader wildcard inclusion",
+                scope: scope(&["*.corp.test"], &["https://admin.corp.test", "https://corp.test/logout"]),
+                test_url: "https://admin.corp.test/panel",
+                expected: false,
+            },
+            ScopeCase {
+                name: "excluded path prefix overrides host inclusion",
+                scope: scope(&["*.corp.test"], &["https://admin.corp.test", "https://corp.test/logout"]),
+                test_url: "https://corp.test/logout?next=/",
+                expected: false,
+            },
+            ScopeCase {
+                name: "non-excluded path on included host stays in scope",
+                scope: scope(&["*.corp.test"], &["https://admin.corp.test", "https://corp.test/logout"]),
+                test_url: "https://corp.test/login",
+                expected: true,
+            },
+            ScopeCase {
+                name: "exclusion with no include rules allows non-excluded host",
+                scope: scope(&[], &["tracker.test"]),
+                test_url: "https://site.test/",
+                expected: true,
+            },
+            ScopeCase {
+                name: "exclusion with no include rules blocks excluded host",
+                scope: scope(&[], &["tracker.test"]),
+                test_url: "https://tracker.test/pixel",
+                expected: false,
+            },
+            // Advanced regex mode
+            ScopeCase {
+                name: "advanced regex mode matches URL satisfying include and not exclude",
+                scope: advanced_regex_scope.clone(),
+                test_url: "https://api.corp.test/x",
+                expected: true,
+            },
+            ScopeCase {
+                name: "advanced regex mode blocks URL matching exclude regex",
+                scope: advanced_regex_scope.clone(),
+                test_url: "https://api.corp.test/logout",
+                expected: false,
+            },
+            ScopeCase {
+                name: "advanced regex mode rejects URL failing include regex",
+                scope: advanced_regex_scope,
+                test_url: "http://api.corp.test/x",
+                expected: false,
+            },
+        ];
+
+        assert_table!(cases, |case| {
+            assert_eq!(
+                case.scope.is_in_scope(case.test_url),
+                case.expected,
+                "case '{}' for '{}'",
+                case.name,
+                case.test_url
+            );
+        });
     }
 
     #[test]
-    fn url_prefixes() {
-        let s = scope(&["https://shop.test/app"], &[]);
-        assert!(s.is_in_scope("https://shop.test/app/cart?id=1"));
-        assert!(!s.is_in_scope("https://shop.test/other"));
-        assert!(!s.is_in_scope("http://shop.test/app")); // scheme differs
-        // no lookalike hosts
-        assert!(!s.is_in_scope("https://shop.test.evil.net/app"));
-        assert!(!s.is_in_scope("https://evilshop.test/app"));
-        // case-insensitive host
-        assert!(s.is_in_scope("https://SHOP.test/app"));
-    }
-
-    #[test]
-    fn ports() {
-        let s = scope(&["http://127.0.0.1:8080"], &[]);
-        assert!(s.is_in_scope("http://127.0.0.1:8080/login"));
-        assert!(!s.is_in_scope("http://127.0.0.1:8081/login"));
-        assert!(!s.is_in_scope("http://127.0.0.1/login")); // default port 80
-        // scheme without a port means the scheme's default port
-        let s = scope(&["https://a.test"], &[]);
-        assert!(s.is_in_scope("https://a.test:443/"));
-        assert!(!s.is_in_scope("https://a.test:8443/"));
-        // a bare host matches any port and scheme
-        let s = scope(&["a.test"], &[]);
-        assert!(s.is_in_scope("https://a.test:8443/x"));
-        assert!(s.is_in_scope("http://a.test/"));
-        assert!(s.is_in_scope("a.test"));
-        // IPv6
-        let s = scope(&["http://[::1]:9000"], &[]);
-        assert!(s.is_in_scope("http://[::1]:9000/"));
-        assert!(!s.is_in_scope("http://[::1]:9001/"));
-    }
-
-    #[test]
-    fn domains_and_subdomains() {
-        let s = scope(&["*.corp.test"], &[]);
-        assert!(s.is_in_scope("https://corp.test/"));
-        assert!(s.is_in_scope("https://api.corp.test/v1"));
-        assert!(s.is_in_scope("deep.api.corp.test"));
-        assert!(!s.is_in_scope("https://corp.test.evil/"));
-        assert!(!s.is_in_scope("https://notcorp.test/"));
-        let mut s = scope(&["https://corp.test/"], &[]);
-        assert!(!s.is_in_scope("https://api.corp.test/"));
-        s.include[0].subdomains = true;
-        assert!(s.is_in_scope("https://api.corp.test/"));
-    }
-
-    #[test]
-    fn exclusions_override_inclusions() {
-        let s = scope(&["*.corp.test"], &["https://admin.corp.test", "https://corp.test/logout"]);
-        assert!(s.is_in_scope("https://www.corp.test/"));
-        assert!(!s.is_in_scope("https://admin.corp.test/panel"));
-        assert!(!s.is_in_scope("https://corp.test/logout?next=/"));
-        assert!(s.is_in_scope("https://corp.test/login"));
-        // exclusion with no include rules
-        let s = scope(&[], &["tracker.test"]);
-        assert!(s.is_in_scope("https://site.test/"));
-        assert!(!s.is_in_scope("https://tracker.test/pixel"));
-    }
-
-    #[test]
-    fn advanced_mode_uses_regexes() {
-        let mut s = scope(&[r"^https://[a-z]+\.corp\.test/"], &[r"/logout"]);
-        s.advanced = true;
-        assert!(s.is_in_scope("https://api.corp.test/x"));
-        assert!(!s.is_in_scope("https://api.corp.test/logout"));
-        assert!(!s.is_in_scope("http://api.corp.test/x"));
-    }
-
-    #[test]
-    fn add_and_remove() {
+    fn scope_mutation_and_serialization_matrix() {
         let mut s = TargetScope::default();
         s.add("https://a.test/");
         s.add("https://a.test/");
         assert_eq!(s.include.len(), 1);
         assert!(!s.is_in_scope("https://b.test/"));
-        // removing the only include rule reopens the scope, so b.test-style URLs are back in,
-        // and the removed prefix is excluded explicitly
+
+        // removing the only include rule reopens the scope, and excludes the removed prefix explicitly
         s.remove("https://a.test/", "https://a.test/x");
         assert!(s.include.is_empty());
         assert!(!s.is_in_scope("https://a.test/x"));
+
         // adding it again lifts the exclusion
         s.add("https://a.test/");
         assert!(s.exclude.is_empty());
         assert!(s.is_in_scope("https://a.test/x"));
+
         // removing a URL covered by a broader rule excludes just that prefix
         let mut s = scope(&["*.corp.test"], &[]);
         s.remove("https://admin.corp.test/", "https://admin.corp.test/");
         assert!(!s.is_in_scope("https://admin.corp.test/"));
         assert!(s.is_in_scope("https://www.corp.test/"));
-    }
 
-    #[test]
-    fn old_project_rules_still_load() {
-        // rules saved before `subdomains` was optional, and without it
-        let r: ScopeRule = serde_json::from_str(r#"{"enabled":true,"prefix":"https://a.test/","subdomains":true}"#).unwrap();
-        assert!(r.subdomains);
-        let r: ScopeRule = serde_json::from_str(r#"{"enabled":true,"prefix":"a.test"}"#).unwrap();
-        assert!(!r.subdomains);
+        // backward-compatible deserialization with and without `subdomains`
+        let serde_cases = [
+            (r#"{"enabled":true,"prefix":"https://a.test/","subdomains":true}"#, true),
+            (r#"{"enabled":true,"prefix":"a.test"}"#, false),
+        ];
+        assert_table!(serde_cases, |(raw_json, expected_subdomains)| {
+            let rule: ScopeRule = serde_json::from_str(raw_json).unwrap();
+            assert_eq!(rule.subdomains, expected_subdomains, "{raw_json}");
+        });
     }
 }

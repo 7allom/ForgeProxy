@@ -120,68 +120,118 @@ impl SiteMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{assert_table, HttpFixture};
 
     #[test]
-    fn urls_under_one_host_build_a_hierarchy() {
+    fn site_map_tree_insertion_matrix() {
+        // 1. Hierarchical segmentation, query/fragment stripping, deduplication & status tracking
         let mut map = SiteMap::default();
-        map.insert_url("https://example.com/api/v1/users", 1, "GET", Some("200 OK"));
-        map.insert_url("https://example.com/api/v1/orders", 2, "POST", Some("201 Created"));
-        map.insert_url("https://example.com/api/v1/users", 3, "DELETE", Some("204 No Content"));
+        let entries = [
+            HttpFixture::get("example.com", "/api/v1/users?page=1#top")
+                .with_tls(true)
+                .with_response("200 OK", "[]")
+                .into_history_entry(1, "Proxy"),
+            HttpFixture::post("example.com", "/api/v1/orders", "{}")
+                .with_tls(true)
+                .with_response("201 Created", "{}")
+                .into_history_entry(2, "Proxy"),
+            HttpFixture::get("example.com", "/api/v1/users?id=3")
+                .with_method("DELETE")
+                .with_tls(true)
+                .with_response("204 No Content", "")
+                .into_history_entry(3, "Proxy"),
+            // Duplicate insertion of history_id=1 and method="GET" must deduplicate
+            HttpFixture::get("example.com", "/api/v1/users")
+                .with_tls(true)
+                .with_response("200 OK", "[]")
+                .into_history_entry(1, "Proxy"),
+        ];
 
-        // one origin root
+        for e in &entries {
+            map.insert_url(&e.url, e.id, &e.method, Some(&e.status));
+        }
+
         assert_eq!(map.roots.len(), 1);
         let root = &map.roots["https://example.com"];
         assert_eq!(root.name, "https://example.com");
 
-        // api -> v1 -> {orders, users}
         let v1 = &root.children["api"].children["v1"];
         assert_eq!(v1.children.keys().collect::<Vec<_>>(), vec!["orders", "users"]);
 
-        // leaf placement: the two /users requests land on the users node, nothing above it
         let users = &v1.children["users"];
         assert_eq!(users.full_url, "https://example.com/api/v1/users");
         assert_eq!(users.history_ids, vec![1, 3]);
         assert_eq!(users.methods, vec!["GET", "DELETE"]);
-        assert_eq!(users.latest_status.as_deref(), Some("204 No Content"));
+        assert_eq!(users.latest_status.as_deref(), Some("200 OK"));
         assert!(root.children["api"].history_ids.is_empty());
+
+        // 2. Branch collection, multi-origin isolation & root-path filing matrix
+        let mut multi_map = SiteMap::default();
+        let insert_rows = [
+            ("https://a.test/api/users", 1, "GET", Some("200 OK")),
+            ("https://a.test/api/orders", 2, "GET", Some("200 OK")),
+            ("https://a.test/login", 3, "POST", Some("302 Found")),
+            ("https://a.test/", 4, "GET", Some("200 OK")),
+            ("https://a.test", 5, "HEAD", Some("200 OK")),
+            ("http://a.test/x", 6, "GET", None),
+            ("https://b.test/x", 7, "GET", None),
+        ];
+        for (url, id, method, status) in insert_rows {
+            multi_map.insert_url(url, id, method, status);
+        }
+
+        assert_eq!(multi_map.roots.len(), 3, "separate origins (scheme or host) do not merge");
+        assert_eq!(multi_map.roots["https://a.test"].history_ids, vec![4, 5]);
+        assert_eq!(multi_map.roots["https://a.test"].methods, vec!["GET", "HEAD"]);
+
+        let collect_cases = [
+            ("/api branch gathers both leaves under it", "https://a.test/api", vec![1, 2]),
+            ("/login leaf gathers only its own id", "https://a.test/login", vec![3]),
+            ("origin root gathers root ids and all descendant leaves", "https://a.test", vec![1, 2, 3, 4, 5]),
+            ("plain HTTP origin stays isolated from HTTPS origin", "http://a.test/x", vec![6]),
+            ("second host origin stays isolated", "https://b.test/x", vec![7]),
+            ("unknown node gathers empty vector", "https://a.test/missing", vec![]),
+        ];
+
+        assert_table!(collect_cases, |(name, query_url, expected_ids)| {
+            assert_eq!(multi_map.collect_history_ids(query_url), expected_ids, "{name}");
+        });
     }
 
     #[test]
-    fn collect_gathers_a_whole_branch() {
+    fn site_map_issue_association_matrix() {
         let mut map = SiteMap::default();
-        map.insert_url("https://a.test/api/users", 1, "GET", None);
-        map.insert_url("https://a.test/api/orders", 2, "GET", None);
-        map.insert_url("https://a.test/login", 3, "GET", None);
+        let e1 = HttpFixture::get("shop.test", "/account/login")
+            .with_tls(false)
+            .with_response("200 OK", "<input type=\"password\">")
+            .into_history_entry(1, "Proxy");
+        let e2 = HttpFixture::get("shop.test", "/account/profile")
+            .with_tls(true)
+            .with_response("200 OK", "Contact admin@shop.test at 10.0.0.42")
+            .into_history_entry(2, "Proxy");
 
-        // the /api branch gathers both of its leaves, not /login
-        assert_eq!(map.collect_history_ids("https://a.test/api"), vec![1, 2]);
-        // a single leaf
-        assert_eq!(map.collect_history_ids("https://a.test/login"), vec![3]);
-        // the origin gathers everything
-        assert_eq!(map.collect_history_ids("https://a.test"), vec![1, 2, 3]);
-        // an unknown node gathers nothing
-        assert!(map.collect_history_ids("https://a.test/missing").is_empty());
-    }
+        map.insert_url(&e1.url, e1.id, &e1.method, Some(&e1.status));
+        map.insert_url(&e2.url, e2.id, &e2.method, Some(&e2.status));
 
-    #[test]
-    fn separate_origins_do_not_merge() {
-        let mut map = SiteMap::default();
-        map.insert_url("https://a.test/x", 1, "GET", None);
-        map.insert_url("http://a.test/x", 2, "GET", None); // different scheme
-        map.insert_url("https://b.test/x", 3, "GET", None);
-        assert_eq!(map.roots.len(), 3);
-        assert_eq!(map.collect_history_ids("https://a.test/x"), vec![1]);
-        assert_eq!(map.collect_history_ids("http://a.test/x"), vec![2]);
-    }
+        let mut findings = Vec::new();
+        findings.extend(crate::scan::passive_checks(&e1.host, &e1.path, false, "Content-Type: text/html", "<input type=\"password\">"));
+        findings.extend(crate::scan::passive_checks(&e2.host, &e2.path, true, "Content-Type: text/html", "Contact admin@shop.test at 10.0.0.42"));
+        let findings = crate::scan::consolidate(findings);
 
-    #[test]
-    fn root_path_files_on_the_origin() {
-        let mut map = SiteMap::default();
-        map.insert_url("https://a.test/", 1, "GET", Some("200 OK"));
-        map.insert_url("https://a.test", 2, "HEAD", Some("200 OK"));
-        let root = &map.roots["https://a.test"];
-        assert!(root.children.is_empty());
-        assert_eq!(root.history_ids, vec![1, 2]);
-        assert_eq!(root.methods, vec!["GET", "HEAD"]);
+        let assoc_cases = [
+            ("http://shop.test/account/login", "Cleartext submission of password", true),
+            ("http://shop.test/account/login", "Password field with autocomplete enabled", true),
+            ("https://shop.test/account/profile", "Email addresses disclosed", true),
+            ("https://shop.test/account/profile", "Private IP addresses disclosed", true),
+            ("https://shop.test/account/profile", "Cleartext submission of password", false),
+        ];
+
+        assert_table!(assoc_cases, |(node_url, expected_issue, should_exist)| {
+            let ids = map.collect_history_ids(node_url);
+            assert!(!ids.is_empty(), "node {node_url} exists in site map");
+            let (_, node_path) = split_origin_path(node_url);
+            let matched = findings.iter().any(|f| f.path == node_path && f.name == expected_issue);
+            assert_eq!(matched, should_exist, "node '{node_url}' issue '{expected_issue}'");
+        });
     }
 }

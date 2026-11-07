@@ -207,189 +207,208 @@ pub fn to_csv(entries: &[HttpEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{assert_table, HttpFixture};
 
     fn entry(id: usize, method: &str, url: &str, status: &str) -> HttpEntry {
+        let is_tls = url.starts_with("https://");
         let (host, path) = crate::http::split_url(url);
-        HttpEntry {
-            id,
-            tool: "Proxy".into(),
-            method: method.into(),
-            host,
-            path,
-            status: status.into(),
-            length: 0,
-            mime: "text/html".into(),
-            request: String::new(),
-            response: String::new(),
-            url: url.into(),
-            truncated: false,
-            time: 1_700_000_000_000,
+        let mut e = HttpFixture::get(host, path)
+            .with_method(method)
+            .with_tls(is_tls)
+            .with_response(status, "")
+            .into_history_entry(id, "Proxy");
+        e.url = url.into();
+        e.mime = "text/html".into();
+        e.time = 1_700_000_000_000;
+        e
+    }
+
+    #[test]
+    fn curl_generation_matrix() {
+        struct CurlCase {
+            name: &'static str,
+            raw_request: String,
+            target_origin: &'static str,
+            must_contain: Vec<&'static str>,
+            must_not_contain: Vec<&'static str>,
         }
+
+        let post_json_fixture = HttpFixture::post("example.com", "/api/login", "{\"user\":\"root\"}")
+            .with_tls(true)
+            .with_header("Content-Type", "application/json")
+            .with_header("X-Token", "abc");
+
+        let cases = [
+            CurlCase {
+                name: "minimal GET with query params omits --data-raw and Host header",
+                raw_request: "GET /search?q=1 HTTP/1.1\nHost: example.com\nAccept: */*\n\n".into(),
+                target_origin: "https://example.com",
+                must_contain: vec![
+                    "curl -X GET 'https://example.com/search?q=1'",
+                    "-H 'Accept: */*'",
+                ],
+                must_not_contain: vec!["--data-raw", "Host:", "--compressed"],
+            },
+            CurlCase {
+                name: "POST with JSON body and custom headers drops Content-Length",
+                raw_request: post_json_fixture.raw_request(),
+                target_origin: "https://example.com",
+                must_contain: vec![
+                    "-X POST 'https://example.com/api/login'",
+                    "-H 'Content-Type: application/json'",
+                    "-H 'X-Token: abc'",
+                    "--data-raw '{\"user\":\"root\"}'",
+                ],
+                must_not_contain: vec!["Content-Length"],
+            },
+            CurlCase {
+                name: "Accept-Encoding header is replaced with --compressed flag",
+                raw_request: "GET /a HTTP/1.1\nHost: example.com\nAccept-Encoding: gzip, deflate, br\nAccept: */*\n\n".into(),
+                target_origin: "https://example.com",
+                must_contain: vec!["--compressed", "-H 'Accept: */*'"],
+                must_not_contain: vec!["Accept-Encoding"],
+            },
+            CurlCase {
+                name: "request without Accept-Encoding omits --compressed flag",
+                raw_request: "GET /a HTTP/1.1\nHost: example.com\nAccept: */*\n\n".into(),
+                target_origin: "https://example.com",
+                must_contain: vec!["-H 'Accept: */*'"],
+                must_not_contain: vec!["--compressed"],
+            },
+            CurlCase {
+                name: "POSIX shell escaping for single quotes in form body",
+                raw_request: "POST / HTTP/1.1\nHost: a.test\n\nname=O'Brien".into(),
+                target_origin: "http://a.test",
+                must_contain: vec!["--data-raw 'name=O'\\''Brien'"],
+                must_not_contain: vec![],
+            },
+        ];
+
+        assert_table!(cases, |case| {
+            let cmd = to_curl(&case.raw_request, case.target_origin);
+            for expected in &case.must_contain {
+                assert!(cmd.contains(expected), "case '{}': expected {expected:?} in:\n{cmd}", case.name);
+            }
+            for forbidden in &case.must_not_contain {
+                assert!(!cmd.contains(forbidden), "case '{}': unexpected {forbidden:?} in:\n{cmd}", case.name);
+            }
+        });
     }
 
     #[test]
-    fn curl_get_is_minimal() {
-        let raw = "GET /search?q=1 HTTP/1.1\nHost: example.com\nAccept: */*\n\n";
-        let cmd = to_curl(raw, "https://example.com");
-        assert!(cmd.starts_with("curl -X GET 'https://example.com/search?q=1'"), "{cmd}");
-        assert!(cmd.contains("-H 'Accept: */*'"));
-        assert!(!cmd.contains("--data-raw"), "a GET has no body: {cmd}");
-        assert!(!cmd.contains("Host:"), "Host comes from the URL");
-    }
+    fn response_splitting_and_har_csv_export_matrix() {
+        // 1. split_response matrix across line endings, multiline JSON, and missing blank lines
+        let split_cases = [
+            (
+                "CRLF line endings",
+                "200 OK\r\nContent-Type: application/json\r\n\r\n{\"a\":1}",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                "{\"a\":1}",
+            ),
+            (
+                "LF line endings",
+                "200 OK\nContent-Type: application/json\n\n{\"a\":1}",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                "{\"a\":1}",
+            ),
+            (
+                "mixed \\n\\r\\n line endings",
+                "200 OK\nContent-Type: application/json\n\r\n{\"a\":1}",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                "{\"a\":1}",
+            ),
+            (
+                "mixed \\r\\n\\n line endings",
+                "200 OK\r\nContent-Type: application/json\r\n\n{\"a\":1}",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                "{\"a\":1}",
+            ),
+            (
+                "multiline JSON with colons is not mis-parsed as headers",
+                "200 OK\r\nContent-Type: application/json\r\n\r\n{\n  \"user\": \"root\",\n  \"role\": \"admin\"\n}",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                "{\n  \"user\": \"root\",\n  \"role\": \"admin\"\n}",
+            ),
+            (
+                "proxy-trimmed response without blank separator stops at non-header JSON line",
+                "200 OK\nserver: gunicorn\nconnection: close\n{\"basePath\": \"/\", \"host\": \"httpbin.org\"}",
+                vec![
+                    ("server".to_string(), "gunicorn".to_string()),
+                    ("connection".to_string(), "close".to_string()),
+                ],
+                "{\"basePath\": \"/\", \"host\": \"httpbin.org\"}",
+            ),
+            (
+                "header-only response without blank line has empty body",
+                "200 OK\r\nContent-Type: text/html",
+                vec![("Content-Type".to_string(), "text/html".to_string())],
+                "",
+            ),
+        ];
 
-    #[test]
-    fn curl_post_has_body_and_headers() {
-        let raw = "POST /api/login HTTP/1.1\nHost: example.com\nContent-Type: application/json\nX-Token: abc\nContent-Length: 17\n\n{\"user\":\"root\"}";
-        let cmd = to_curl(raw, "https://example.com");
-        assert!(cmd.contains("-X POST"));
-        assert!(cmd.contains("-H 'Content-Type: application/json'"));
-        assert!(cmd.contains("-H 'X-Token: abc'"));
-        assert!(cmd.contains("--data-raw '{\"user\":\"root\"}'"));
-        assert!(!cmd.contains("Content-Length"), "curl sets Content-Length itself");
-    }
+        assert_table!(split_cases, |(name, raw, expected_headers, expected_body)| {
+            let (headers, body) = split_response(raw);
+            assert_eq!(headers, expected_headers, "{name}");
+            assert_eq!(body, expected_body, "{name}");
+        });
 
-    #[test]
-    fn curl_accept_encoding_becomes_compressed() {
-        let raw = "GET /a HTTP/1.1\nHost: example.com\nAccept-Encoding: gzip, deflate, br\nAccept: */*\n\n";
-        let cmd = to_curl(raw, "https://example.com");
-        assert!(cmd.contains("--compressed"), "{cmd}");
-        assert!(!cmd.contains("Accept-Encoding"), "the header is dropped in favour of --compressed: {cmd}");
-        assert!(cmd.contains("-H 'Accept: */*'"), "other headers are kept: {cmd}");
-    }
+        // 2. HAR 1.2 serialization matrix (HTML text, binary base64, and 404 JSON body with colons)
+        let mut html_entry = entry(1, "GET", "https://example.com/a", "200 OK");
+        html_entry.request = "GET /a HTTP/1.1\nHost: example.com\nAccept: */*\n\n".into();
+        html_entry.response = "200 OK\nContent-Type: text/html\n\n<html></html>".into();
+        html_entry.length = 13;
 
-    #[test]
-    fn curl_without_accept_encoding_has_no_compressed() {
-        let raw = "GET /a HTTP/1.1\nHost: example.com\nAccept: */*\n\n";
-        let cmd = to_curl(raw, "https://example.com");
-        assert!(!cmd.contains("--compressed"), "{cmd}");
-    }
+        let mut bin_entry = entry(2, "GET", "https://example.com/img", "200 OK");
+        bin_entry.mime = "image/png".into();
+        bin_entry.response = "200 OK\nContent-Type: image/png\n\nPNG\u{FFFD}\u{FFFD}data".into();
 
-    #[test]
-    fn curl_escapes_single_quotes() {
-        let raw = "POST / HTTP/1.1\nHost: a.test\n\nname=O'Brien";
-        let cmd = to_curl(raw, "http://a.test");
-        assert!(cmd.contains("--data-raw 'name=O'\\''Brien'"), "{cmd}");
-    }
+        let mut json_404_entry = entry(3, "GET", "https://example.com/a", "404 Not Found");
+        json_404_entry.request = "GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n".into();
+        json_404_entry.response = "404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\": \"missing: nope\"}".into();
+        json_404_entry.length = 24;
 
-    #[test]
-    fn har_is_valid_json_with_the_shape() {
-        let mut e = entry(1, "GET", "https://example.com/a", "200 OK");
-        e.request = "GET /a HTTP/1.1\nHost: example.com\nAccept: */*\n\n".into();
-        e.response = "200 OK\nContent-Type: text/html\n\n<html></html>".into();
-        e.length = 13;
-        let json = to_har(&[e]).expect("HAR serializes");
-        let v: serde_json::Value = serde_json::from_str(&json).expect("HAR parses");
+        let har_json = to_har(&[html_entry, bin_entry, json_404_entry]).expect("HAR serializes");
+        let v: serde_json::Value = serde_json::from_str(&har_json).expect("HAR parses");
         assert_eq!(v["log"]["version"], "1.2");
         assert_eq!(v["log"]["creator"]["name"], "ForgeProxy");
-        let entry0 = &v["log"]["entries"][0];
-        assert_eq!(entry0["request"]["method"], "GET");
-        assert_eq!(entry0["request"]["url"], "https://example.com/a");
-        assert_eq!(entry0["response"]["status"], 200);
-        assert_eq!(entry0["response"]["statusText"], "OK");
-        assert_eq!(entry0["response"]["content"]["text"], "<html></html>");
-        assert!(entry0["startedDateTime"].as_str().unwrap().contains('T'));
-    }
 
-    #[test]
-    fn split_response_handles_every_line_ending() {
-        let cases = [
-            ("CRLF", "200 OK\r\nContent-Type: application/json\r\n\r\n{\"a\":1}"),
-            ("LF", "200 OK\nContent-Type: application/json\n\n{\"a\":1}"),
-            ("mixed \\n\\r\\n", "200 OK\nContent-Type: application/json\n\r\n{\"a\":1}"),
-            ("mixed \\r\\n\\n", "200 OK\r\nContent-Type: application/json\r\n\n{\"a\":1}"),
-        ];
-        for (name, raw) in cases {
-            let (headers, body) = split_response(raw);
-            assert_eq!(headers, vec![("Content-Type".to_string(), "application/json".to_string())], "{name}");
-            assert_eq!(body, "{\"a\":1}", "{name}");
-        }
-    }
+        let entries = v["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
 
-    #[test]
-    fn split_response_keeps_multiline_json_with_colons() {
-        let raw = "200 OK\r\nContent-Type: application/json\r\n\r\n{\n  \"user\": \"root\",\n  \"role\": \"admin\"\n}";
-        let (headers, body) = split_response(raw);
-        assert_eq!(headers.len(), 1, "colon lines in the body are not headers: {headers:?}");
-        assert_eq!(headers[0].0, "Content-Type");
-        assert_eq!(body, "{\n  \"user\": \"root\",\n  \"role\": \"admin\"\n}");
-    }
+        // Entry 0: plain text HTML
+        assert_eq!(entries[0]["request"]["method"], "GET");
+        assert_eq!(entries[0]["request"]["url"], "https://example.com/a");
+        assert_eq!(entries[0]["response"]["status"], 200);
+        assert_eq!(entries[0]["response"]["statusText"], "OK");
+        assert_eq!(entries[0]["response"]["content"]["text"], "<html></html>");
+        assert!(entries[0]["response"]["content"].get("encoding").is_none());
+        assert!(entries[0]["startedDateTime"].as_str().unwrap().contains('T'));
 
-    #[test]
-    fn split_response_stops_at_body_without_a_blank_line() {
-        // a proxy-recorded response: the blank separator was trimmed, so the JSON body butts
-        // directly against the headers (as for http://httpbin.org/spec.json)
-        let raw = "200 OK\nserver: gunicorn\nconnection: close\n{\"basePath\": \"/\", \"host\": \"httpbin.org\"}";
-        let (headers, body) = split_response(raw);
-        assert_eq!(headers, vec![
-            ("server".to_string(), "gunicorn".to_string()),
-            ("connection".to_string(), "close".to_string()),
-        ]);
-        assert_eq!(body, "{\"basePath\": \"/\", \"host\": \"httpbin.org\"}");
-    }
+        // Entry 1: binary body with replacement char -> base64
+        let bin_body = "PNG\u{FFFD}\u{FFFD}data";
+        assert_eq!(entries[1]["response"]["content"]["encoding"], "base64");
+        assert_eq!(
+            entries[1]["response"]["content"]["text"],
+            crate::codec::base64_encode(bin_body.as_bytes(), false, true)
+        );
+        assert_eq!(entries[1]["response"]["content"]["size"], bin_body.len());
 
-    #[test]
-    fn har_base64_encodes_binary_body() {
-        let mut e = entry(1, "GET", "https://example.com/img", "200 OK");
-        e.mime = "image/png".into();
-        // a replacement char marks bytes that were binary in the lossy-UTF-8 recording
-        e.response = "200 OK\nContent-Type: image/png\n\nPNG\u{FFFD}\u{FFFD}data".into();
-        let json = to_har(&[e]).expect("HAR serializes");
-        let v: serde_json::Value = serde_json::from_str(&json).expect("HAR parses");
-        let content = &v["log"]["entries"][0]["response"]["content"];
-        assert_eq!(content["encoding"], "base64");
-        let body = "PNG\u{FFFD}\u{FFFD}data";
-        assert_eq!(content["text"], crate::codec::base64_encode(body.as_bytes(), false, true));
-        assert_eq!(content["size"], body.len());
-    }
+        // Entry 2: 404 Not Found with colon in JSON body
+        assert_eq!(entries[2]["response"]["status"], 404);
+        assert_eq!(entries[2]["response"]["statusText"], "Not Found");
+        assert_eq!(entries[2]["response"]["content"]["text"], "{\"error\": \"missing: nope\"}");
+        let resp_headers = entries[2]["response"]["headers"].as_array().unwrap();
+        assert_eq!(resp_headers.len(), 1);
+        assert_eq!(resp_headers[0]["name"], "Content-Type");
 
-    #[test]
-    fn har_text_body_has_no_encoding() {
-        let mut e = entry(1, "GET", "https://example.com/a", "200 OK");
-        e.response = "200 OK\nContent-Type: text/plain\n\nhello".into();
-        let json = to_har(&[e]).expect("HAR serializes");
-        let v: serde_json::Value = serde_json::from_str(&json).expect("HAR parses");
-        let content = &v["log"]["entries"][0]["response"]["content"];
-        assert_eq!(content["text"], "hello");
-        assert!(content.get("encoding").is_none(), "plain text carries no encoding field");
-    }
-
-    #[test]
-    fn split_response_without_a_blank_line_has_no_body() {
-        let (headers, body) = split_response("200 OK\r\nContent-Type: text/html");
-        assert_eq!(headers, vec![("Content-Type".to_string(), "text/html".to_string())]);
-        assert!(body.is_empty());
-    }
-
-    #[test]
-    fn har_status_from_entry_and_body_is_not_parsed_as_headers() {
-        let mut e = entry(1, "GET", "https://example.com/a", "404 Not Found");
-        e.request = "GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n".into();
-        // CRLF response whose body contains a colon line that must NOT become a header
-        e.response = "404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\": \"missing: nope\"}".into();
-        e.length = 24;
-        let json = to_har(&[e]).expect("HAR serializes");
-        let v: serde_json::Value = serde_json::from_str(&json).expect("HAR parses");
-        let resp = &v["log"]["entries"][0]["response"];
-        assert_eq!(resp["status"], 404);
-        assert_eq!(resp["statusText"], "Not Found");
-        assert_eq!(resp["content"]["text"], "{\"error\": \"missing: nope\"}");
-        // exactly one header (Content-Type) — the body's "error"/"missing" lines are excluded
-        let headers = resp["headers"].as_array().unwrap();
-        assert_eq!(headers.len(), 1, "{headers:?}");
-        assert_eq!(headers[0]["name"], "Content-Type");
-    }
-
-    #[test]
-    fn csv_escapes_commas_and_quotes() {
-        let mut e = entry(1, "GET", "https://example.com/a?x=1,2", "200 \"OK\", really");
-        e.mime = "text/plain".into();
-        let csv = to_csv(&[e]);
+        // 3. RFC 4180 CSV export escaping
+        let mut csv_entry = entry(1, "GET", "https://example.com/a?x=1,2", "200 \"OK\", really");
+        csv_entry.mime = "text/plain".into();
+        let csv = to_csv(&[csv_entry]);
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines[0], "#,Time,Method,URL,Status,Length,MIME,Note");
-        // the URL (comma) and status (comma + quotes) are quoted; the quote is doubled
         assert!(lines[1].contains("\"https://example.com/a?x=1,2\""), "{}", lines[1]);
         assert!(lines[1].contains("\"200 \"\"OK\"\", really\""), "{}", lines[1]);
-        // round-trips to 8 fields when parsed by a quote-aware reader
-        assert!(lines[1].ends_with(",")); // empty trailing Note field
+        assert!(lines[1].ends_with(','));
     }
 }
