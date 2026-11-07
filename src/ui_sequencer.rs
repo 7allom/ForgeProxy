@@ -3,7 +3,7 @@
 //! the detailed FIPS report are in [`crate::sequencer`].
 
 use crate::editor;
-use crate::sequencer::{self, TokenLocation};
+use crate::sequencer::{self, TokenFormat, TokenLocation};
 use crate::state::App;
 use crate::theme::{self, bold, Palette};
 use crate::ui_core::sub_tabs;
@@ -66,6 +66,22 @@ fn capture(app: &mut App, ui: &mut Ui, p: &Palette) {
         1 => TokenLocation::Header(text),
         _ => TokenLocation::Regex(text),
     };
+    ui.add_space(6.0);
+    let prev_format = app.seq_format;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Token format:").color(p.text));
+        egui::ComboBox::from_id_salt("seq_token_format")
+            .selected_text(app.seq_format.label())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                for fmt in TokenFormat::ALL {
+                    ui.selectable_value(&mut app.seq_format, fmt, fmt.label());
+                }
+            });
+    });
+    if app.seq_format != prev_format && !app.seq_samples.is_empty() {
+        app.seq_analysis = sequencer::analyze_tokens_with_format(&app.seq_samples, app.seq_format);
+    }
 
     ui.add_space(10.0);
     theme::section_title(ui, p, "Sample size", "How many tokens to collect before stopping.");
@@ -125,7 +141,7 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.horizontal(|ui| {
         theme::section_title(ui, p, "Analysis", "Randomness statistics for the captured tokens.");
         if theme::plain_button(ui, p, "Analyse now", !app.seq_samples.is_empty()).clicked() {
-            app.seq_analysis = sequencer::analyze_tokens(&app.seq_samples);
+            app.seq_analysis = sequencer::analyze_tokens_with_format(&app.seq_samples, app.seq_format);
         }
     });
     ui.add_space(6.0);
@@ -147,10 +163,31 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
             scorecard(ui, p, "Samples", &a.sample_count.to_string(), p.text);
             scorecard(ui, p, "Token length", &len_text, p.text);
             scorecard(ui, p, "Shannon entropy", &format!("{:.2} / {:.2} bits  ({rating})", a.overall_entropy, a.max_possible_entropy), rating_col);
-            let (mono, mono_col) = if a.fips_monobit_passed { ("Passed", p.st_done) } else { ("Failed", p.high) };
-            scorecard(ui, p, "FIPS monobit", &format!("{mono}  ({:.3})", a.monobit_ratio), mono_col);
+            if a.fips_applicable {
+                let (mono, mono_col) = if a.fips_monobit_passed { ("Passed", p.st_done) } else { ("Failed", p.high) };
+                scorecard(ui, p, "FIPS monobit", &format!("{mono}  ({:.3})", a.monobit_ratio), mono_col);
+            } else {
+                scorecard(ui, p, "FIPS monobit", "N/A (ASCII text - rely on Shannon entropy)", p.disabled);
+            }
         });
     });
+    if !a.fips_applicable {
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(p.banner)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "FIPS bitstream tests require decoded binary/hex tokens. Character entropy: {:.2} bits (Max)",
+                        a.max_possible_entropy
+                    ))
+                    .size(12.0)
+                    .color(p.info),
+                );
+            });
+    }
 
     ui.add_space(10.0);
     ui.columns(2, |cols| {
@@ -199,7 +236,7 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
     if app.seq_samples.len() >= sequencer::MIN_TOKENS {
         ui.add_space(10.0);
         egui::CollapsingHeader::new(bold("Detailed FIPS report", 13.0).color(p.strong)).id_salt("seq_fips").show(ui, |ui| {
-            ui.label(RichText::new(sequencer::analyse(&app.seq_samples)).monospace().size(12.0).color(p.text));
+            ui.label(RichText::new(sequencer::analyse_with_format(&app.seq_samples, app.seq_format)).monospace().size(12.0).color(p.text));
         });
     }
 }

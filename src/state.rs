@@ -377,6 +377,7 @@ pub struct App {
     pub seq_template: String,
     pub seq_origin: String,
     pub seq_location: crate::sequencer::TokenLocation,
+    pub seq_format: crate::sequencer::TokenFormat,
     pub seq_target_samples: usize,
     pub seq_samples: Vec<String>,
     pub seq_running: bool,
@@ -597,6 +598,7 @@ impl App {
             seq_template: String::new(),
             seq_origin: String::new(),
             seq_location: crate::sequencer::TokenLocation::default(),
+            seq_format: crate::sequencer::TokenFormat::default(),
             seq_target_samples: 1000,
             seq_samples: Vec::new(),
             seq_running: false,
@@ -948,7 +950,7 @@ impl eframe::App for App {
                 Job::SeqMiss(status) => self.seq_message = format!("No token found in a response ({status}). Check the token location."),
                 Job::SeqDone => {
                     self.seq_running = false;
-                    self.seq_analysis = crate::sequencer::analyze_tokens(&self.seq_samples);
+                    self.seq_analysis = crate::sequencer::analyze_tokens_with_format(&self.seq_samples, self.seq_format);
                 }
                 Job::ScanDone { task, findings } => {
                     if let Some(t) = self.tasks.get_mut(task) {

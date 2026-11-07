@@ -78,6 +78,34 @@ pub fn extract_token(location: &TokenLocation, response: &str) -> Option<String>
     }
 }
 
+/// Token encoding format used when pre-processing tokens for randomness analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TokenFormat {
+    #[default]
+    Auto,
+    Ascii,
+    Hex,
+    Base64,
+}
+
+impl TokenFormat {
+    pub const ALL: [TokenFormat; 4] = [
+        TokenFormat::Auto,
+        TokenFormat::Ascii,
+        TokenFormat::Hex,
+        TokenFormat::Base64,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TokenFormat::Auto => "Auto",
+            TokenFormat::Ascii => "Raw/ASCII",
+            TokenFormat::Hex => "Hex",
+            TokenFormat::Base64 => "Base64",
+        }
+    }
+}
+
 /// Structured randomness statistics over a set of captured tokens: lengths, Shannon entropy
 /// (overall and per character position) and the FIPS monobit ratio. The detailed FIPS
 /// bit-level report is [`analyse`].
@@ -93,10 +121,16 @@ pub struct SequencerAnalysis {
     /// Entropy (bits) of the character distribution at each position, left to right.
     pub per_char_entropy: Vec<f64>,
     pub char_distribution: std::collections::BTreeMap<char, usize>,
-    /// Proportion of 1 bits across all tokens' bytes.
+    /// Proportion of 1 bits across all decoded token bytes (0.0 when format is Ascii).
     pub monobit_ratio: f64,
     /// The monobit ratio is within the FIPS band (0.485..=0.515).
     pub fips_monobit_passed: bool,
+    /// True when tokens were decoded to raw binary bytes (Hex or Base64) so FIPS bitstream
+    /// tests are meaningful; false for raw/ASCII text where 8-bit ASCII byte representation
+    /// is inherently skewed.
+    pub fips_applicable: bool,
+    /// The resolved token format used during analysis (`Hex`, `Base64`, or `Ascii`).
+    pub detected_format: TokenFormat,
 }
 
 /// Shannon entropy (bits) of a set of counts summing to `total`.
@@ -114,49 +148,98 @@ fn shannon_entropy(counts: impl Iterator<Item = usize>, total: usize) -> f64 {
         .sum()
 }
 
-/// If every (non-blank) token is hexadecimal, or every one is standard Base64, the raw bytes
-/// they decode to; otherwise `None` (tokens are used as their own bytes). Hex is preferred
-/// where both could match, since its alphabet is a subset of Base64's.
-fn decoded_token_bytes(tokens: &[String]) -> Option<Vec<u8>> {
-    let toks: Vec<&str> = tokens.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
-    if toks.is_empty() {
+fn decode_hex_str(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    // hex: even length, all hex digits
-    if toks.iter().all(|t| t.len() % 2 == 0 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
-        let mut out = Vec::new();
-        for t in &toks {
-            let b = t.as_bytes();
-            for pair in b.chunks_exact(2) {
-                let hi = (pair[0] as char).to_digit(16)?;
-                let lo = (pair[1] as char).to_digit(16)?;
-                out.push((hi * 16 + lo) as u8);
-            }
-        }
-        return Some(out);
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.as_bytes().chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
     }
-    // Base64, standard or URL-safe ('+/' or '-_'), padded or not (e.g. Google's unpadded
-    // URL-safe AEC cookies of 98-100 chars). Accept any length a real encoding can have:
-    // at most two trailing '=' and a pad-trimmed length that is not %4 == 1 (impossible).
-    let is_base64 = toks.iter().all(|t| {
-        let body = t.trim_end_matches('=');
-        let pad = t.len() - body.len();
-        pad <= 2 && body.len() % 4 != 1 && body.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_'))
-    });
-    if is_base64 {
-        let mut out = Vec::new();
-        for t in &toks {
-            out.extend(crate::codec::base64_decode(t));
-        }
-        if !out.is_empty() {
-            return Some(out);
-        }
-    }
-    None
+    Some(out)
 }
 
-/// Compute randomness statistics for `tokens`. `None` when there are no tokens.
+fn is_valid_base64_str(t: &str) -> bool {
+    if t.is_empty() {
+        return false;
+    }
+    let body = t.trim_end_matches('=');
+    let pad = t.len() - body.len();
+    pad <= 2
+        && !body.is_empty()
+        && body.len() % 4 != 1
+        && body.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_'))
+}
+
+/// Resolve the effective token format (`Hex`, `Base64`, or `Ascii`) and decode each non-empty
+/// token into raw bytes when the resolved format is `Hex` or `Base64`.
+///
+/// In `Auto` mode:
+/// - If all tokens are valid even-length hex strings, treat as `Hex`.
+/// - Else if all tokens are valid Base64 and the sample uses Base64-distinguishing characters
+///   (`+`, `/`, `-`, `_`, or `=` padding), treat as `Base64`. Pure alphanumeric (`A-Za-z0-9`)
+///   tokens without Base64 symbols or padding use a 62-char alphabet (`5.95` bits/char) rather
+///   than 64-char Base64, so `Auto` treats them as `Ascii` to avoid a false-negative monobit
+///   skew on missing 6-bit values `62` (`111110`) and `63` (`111111`).
+pub fn decode_tokens_with_format(tokens: &[String], format: TokenFormat) -> (TokenFormat, Option<Vec<Vec<u8>>>) {
+    let toks: Vec<&str> = tokens.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    if toks.is_empty() {
+        return (TokenFormat::Ascii, None);
+    }
+    match format {
+        TokenFormat::Ascii => (TokenFormat::Ascii, None),
+        TokenFormat::Hex => {
+            let mut per_tok = Vec::with_capacity(toks.len());
+            for t in &toks {
+                match decode_hex_str(t) {
+                    Some(b) if !b.is_empty() => per_tok.push(b),
+                    _ => return (TokenFormat::Ascii, None),
+                }
+            }
+            (TokenFormat::Hex, Some(per_tok))
+        }
+        TokenFormat::Base64 => {
+            if !toks.iter().all(|t| is_valid_base64_str(t)) {
+                return (TokenFormat::Ascii, None);
+            }
+            let mut per_tok = Vec::with_capacity(toks.len());
+            for t in &toks {
+                let b = crate::codec::base64_decode(t);
+                if b.is_empty() {
+                    return (TokenFormat::Ascii, None);
+                }
+                per_tok.push(b);
+            }
+            (TokenFormat::Base64, Some(per_tok))
+        }
+        TokenFormat::Auto => {
+            if toks.iter().all(|t| t.len() % 2 == 0 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return decode_tokens_with_format(tokens, TokenFormat::Hex);
+            }
+            let has_b64_markers = toks.iter().any(|t| {
+                t.ends_with('=') || t.bytes().any(|b| matches!(b, b'+' | b'/' | b'-' | b'_'))
+            });
+            if has_b64_markers && toks.iter().all(|t| is_valid_base64_str(t)) {
+                return decode_tokens_with_format(tokens, TokenFormat::Base64);
+            }
+            (TokenFormat::Ascii, None)
+        }
+    }
+}
+
+/// Compute randomness statistics for `tokens` using `TokenFormat::Auto`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn analyze_tokens(tokens: &[String]) -> Option<SequencerAnalysis> {
+    analyze_tokens_with_format(tokens, TokenFormat::Auto)
+}
+
+/// Compute randomness statistics for `tokens` using the specified [`TokenFormat`].
+/// FIPS 140-2 bitstream checks run ONLY on decoded raw bytes (`Hex` or `Base64`).
+/// When the resolved format is `Ascii` (or un-decodable alphanumeric text), flat byte-level
+/// FIPS monobit checks are skipped (`fips_applicable = false`).
+pub fn analyze_tokens_with_format(tokens: &[String], format: TokenFormat) -> Option<SequencerAnalysis> {
     if tokens.is_empty() {
         return None;
     }
@@ -191,26 +274,17 @@ pub fn analyze_tokens(tokens: &[String]) -> Option<SequencerAnalysis> {
         })
         .collect();
 
-    // The monobit test wants the raw entropy bits. When the tokens are hex or base64, the
-    // text encoding skews the bit balance (ASCII '0'..'f' are not bit-balanced), so decode them
-    // to the bytes they represent first; otherwise a perfectly random hex token would fail.
-    let decoded = decoded_token_bytes(tokens);
-    let (ones, total_bits): (u64, u64) = match &decoded {
-        Some(bytes) => (bytes.iter().map(|b| b.count_ones() as u64).sum(), bytes.len() as u64 * 8),
-        None => {
-            let mut ones = 0u64;
-            let mut bits = 0u64;
-            for token in tokens {
-                for b in token.as_bytes() {
-                    ones += b.count_ones() as u64;
-                    bits += 8;
-                }
-            }
-            (ones, bits)
+    let (detected_format, decoded) = decode_tokens_with_format(tokens, format);
+    let (monobit_ratio, fips_monobit_passed, fips_applicable) = match decoded {
+        Some(per_tok) => {
+            let ones: u64 = per_tok.iter().flatten().map(|b| b.count_ones() as u64).sum();
+            let total_bits: u64 = per_tok.iter().map(|v| v.len() as u64 * 8).sum();
+            let ratio = if total_bits > 0 { ones as f64 / total_bits as f64 } else { 0.0 };
+            let passed = (0.485..=0.515).contains(&ratio);
+            (ratio, passed, true)
         }
+        None => (0.0, false, false),
     };
-    let monobit_ratio = if total_bits > 0 { ones as f64 / total_bits as f64 } else { 0.0 };
-    let fips_monobit_passed = (0.485..=0.515).contains(&monobit_ratio);
 
     Some(SequencerAnalysis {
         sample_count: tokens.len(),
@@ -222,6 +296,8 @@ pub fn analyze_tokens(tokens: &[String]) -> Option<SequencerAnalysis> {
         char_distribution,
         monobit_ratio,
         fips_monobit_passed,
+        fips_applicable,
+        detected_format,
     })
 }
 
@@ -258,7 +334,6 @@ fn chi2_sf(x: f64, df: f64) -> f64 {
 }
 
 struct Position {
-    charset: Vec<char>,
     bits: u32,
     p_value: f64,
 }
@@ -276,24 +351,25 @@ fn char_positions(padded: &[Vec<char>], width: usize) -> Vec<Position> {
             let exp = n / k.max(1) as f64;
             let x2: f64 = counts.values().map(|&o| (o as f64 - exp).powi(2) / exp).sum();
             let p_value = if k >= 2 { chi2_sf(x2, (k - 1) as f64) } else { 0.0 };
-            Position { charset: counts.keys().copied().collect(), bits, p_value }
+            Position { bits, p_value }
         })
         .collect()
 }
 
-/// Per-token bit strings, built from each character's index in its position's character set.
-fn token_bits(padded: &[Vec<char>], positions: &[Position]) -> Vec<Vec<u8>> {
-    padded
+/// Per-token bit strings built strictly from decoded raw bytes (padded with leading 0 bytes to
+/// match the longest decoded token in the sample).
+fn decoded_byte_bits(decoded: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let max_bytes = decoded.iter().map(|b| b.len()).max().unwrap_or(0);
+    decoded
         .iter()
-        .map(|t| {
-            let mut out = Vec::new();
-            for (pos, info) in positions.iter().enumerate() {
-                if info.bits == 0 {
-                    continue;
-                }
-                let idx = info.charset.iter().position(|c| *c == t[pos]).unwrap_or(0) as u32 & ((1 << info.bits) - 1);
-                for b in (0..info.bits).rev() {
-                    out.push(((idx >> b) & 1) as u8);
+        .map(|bytes| {
+            let mut out = Vec::with_capacity(max_bytes * 8);
+            for _ in 0..(max_bytes - bytes.len()) {
+                out.extend([0u8; 8]);
+            }
+            for &byte in bytes {
+                for shift in (0..8).rev() {
+                    out.push((byte >> shift) & 1);
                 }
             }
             out
@@ -337,8 +413,14 @@ fn fips(seq: &[u8]) -> (bool, bool, bool, bool) {
     (monobit, poker, runs_ok, long_ok)
 }
 
-/// Plain-language report.
+/// Plain-language report using `TokenFormat::Auto`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn analyse(raw: &[String]) -> String {
+    analyse_with_format(raw, TokenFormat::Auto)
+}
+
+/// Plain-language report using the specified [`TokenFormat`].
+pub fn analyse_with_format(raw: &[String], format: TokenFormat) -> String {
     let tokens: Vec<String> = raw.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).take(MAX_TOKENS).collect();
     if tokens.len() < MIN_TOKENS {
         return format!("At least {MIN_TOKENS} tokens are needed to analyse ({} so far). {RECOMMENDED_TOKENS} is usually enough; {MAX_TOKENS} gives FIPS-compliant results.", tokens.len());
@@ -361,16 +443,6 @@ pub fn analyse(raw: &[String]) -> String {
     let possible: u32 = positions.iter().map(|p| p.bits).sum();
     let duplicates = kept.len() - kept.iter().collect::<std::collections::HashSet<_>>().len();
 
-    let bits = token_bits(&padded, &positions);
-    let nbits = bits.first().map(|b| b.len()).unwrap_or(0);
-    let mut passed = [0usize; 4];
-    for b in 0..nbits {
-        let seq: Vec<u8> = bits.iter().map(|t| t[b]).collect();
-        let r = fips(&seq);
-        for (k, ok) in [r.0, r.1, r.2, r.3].into_iter().enumerate() {
-            passed[k] += ok as usize;
-        }
-    }
     let quality = if duplicates > 0 {
         "poor (tokens repeat)"
     } else if effective >= 64 {
@@ -384,14 +456,39 @@ pub fn analyse(raw: &[String]) -> String {
     } else {
         "extremely poor"
     };
-    let note = if kept.len() < MAX_TOKENS { format!("\n(Sample of {}: FIPS pass criteria scaled to this size; {MAX_TOKENS} tokens give formal FIPS results.)", kept.len()) } else { String::new() };
+
+    let (_, decoded) = decode_tokens_with_format(&kept, format);
+    let fips_section = match decoded {
+        Some(per_tok) => {
+            let bits = decoded_byte_bits(&per_tok);
+            let nbits = bits.first().map(|b| b.len()).unwrap_or(0);
+            let mut passed = [0usize; 4];
+            for b in 0..nbits {
+                let seq: Vec<u8> = bits.iter().map(|t| t[b]).collect();
+                let r = fips(&seq);
+                for (k, ok) in [r.0, r.1, r.2, r.3].into_iter().enumerate() {
+                    passed[k] += ok as usize;
+                }
+            }
+            let note = if kept.len() < MAX_TOKENS {
+                format!("\n(Sample of {}: FIPS pass criteria scaled to this size; {MAX_TOKENS} tokens give formal FIPS results.)", kept.len())
+            } else {
+                String::new()
+            };
+            format!(
+                "Bit-level FIPS tests, bit positions passing (of {nbits}):\n  monobit {}   poker {}   runs {}   long runs {}{note}",
+                passed[0], passed[1], passed[2], passed[3]
+            )
+        }
+        None => "Bit-level FIPS tests: N/A (ASCII text - rely on Shannon entropy)".to_string(),
+    };
+
     format!(
         "Tokens analysed: {} ({} ignored for abnormal length)\nToken length: {width} characters (short tokens padded at the start with 0)\nRepeated tokens: {duplicates}\n\n\
          Overall quality of randomness: {quality}\nEffective entropy at a significance level of 1%: {effective} bits (of {possible} possible)\n\n\
-         Bit-level FIPS tests, bit positions passing (of {nbits}):\n  monobit {}   poker {}   runs {}   long runs {}{note}",
+         {fips_section}",
         kept.len(),
         tokens.len() - kept.len(),
-        passed[0], passed[1], passed[2], passed[3]
     )
 }
 
@@ -524,5 +621,46 @@ mod tests {
         let t: Vec<String> = (0..2000).map(|i| format!("{i:08}")).collect();
         let r = analyse(&t);
         assert!(!r.contains("excellent") && !r.contains("good"), "{r}");
+    }
+
+    #[test]
+    fn token_format_auto_and_ascii_avoid_fips_monobit_false_negative() {
+        // 62-char alphanumeric tokens (A-Za-z0-9, max entropy log2(62) = 5.95 bits)
+        const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut x: u64 = 0x517CC1B727220A95;
+        let t: Vec<String> = (0..300)
+            .map(|_| {
+                (0..24)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        ALPHANUM[(x as usize) % ALPHANUM.len()] as char
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // In Auto mode, pure alphanumeric text resolves to Ascii and skips flat byte-level FIPS monobit
+        let a = analyze_tokens_with_format(&t, TokenFormat::Auto).unwrap();
+        assert_eq!(a.detected_format, TokenFormat::Ascii);
+        assert!(!a.fips_applicable);
+        assert_eq!(format!("{:.2}", a.max_possible_entropy), "5.95");
+        assert_eq!(entropy_rating(a.overall_entropy, a.max_possible_entropy), "Excellent");
+
+        let report = analyse_with_format(&t, TokenFormat::Auto);
+        assert!(report.contains("N/A (ASCII text - rely on Shannon entropy)"), "{report}");
+
+        // Explicit Ascii on hex tokens also marks FIPS as N/A
+        let hex_toks: Vec<String> = (0..20).map(|_| "a5a5".to_string()).collect();
+        let ascii_override = analyze_tokens_with_format(&hex_toks, TokenFormat::Ascii).unwrap();
+        assert_eq!(ascii_override.detected_format, TokenFormat::Ascii);
+        assert!(!ascii_override.fips_applicable);
+
+        // Explicit Hex on hex tokens decodes and runs FIPS
+        let hex_explicit = analyze_tokens_with_format(&hex_toks, TokenFormat::Hex).unwrap();
+        assert_eq!(hex_explicit.detected_format, TokenFormat::Hex);
+        assert!(hex_explicit.fips_applicable);
+        assert!(hex_explicit.fips_monobit_passed);
     }
 }
