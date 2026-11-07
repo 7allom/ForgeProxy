@@ -242,7 +242,9 @@ fn split_template(template: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Build one request from the template pieces and the value chosen for each position
-/// (`None` keeps that position's default).
+/// (`None` keeps that position's default). If the request contains a `Content-Length`
+/// header (without `§` markers on that header line itself) and a body separated by a
+/// blank line, `Content-Length` is dynamically updated to match the substituted body length.
 fn fill_values(parts: &[String], defaults: &[String], values: &[Option<String>]) -> String {
     let mut out = String::new();
     for k in 0..defaults.len() {
@@ -253,7 +255,142 @@ fn fill_values(parts: &[String], defaults: &[String], values: &[Option<String>])
         }
     }
     out.push_str(parts.get(defaults.len()).map_or("", |s| s.as_str()));
-    out
+    sync_content_length(out)
+}
+
+/// Update `Content-Length` in `raw` to match the byte length of the body after `\r\n\r\n` or `\n\n`.
+pub fn sync_content_length(raw: String) -> String {
+    let (sep, split_idx) = if let Some(idx) = raw.find("\r\n\r\n") {
+        ("\r\n\r\n", idx)
+    } else if let Some(idx) = raw.find("\n\n") {
+        ("\n\n", idx)
+    } else {
+        return raw;
+    };
+    let head = &raw[..split_idx];
+    let body = &raw[split_idx + sep.len()..];
+    let has_cl = head.lines().skip(1).any(|l| {
+        l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+    });
+    if !has_cl {
+        return raw;
+    }
+    let line_sep = if sep == "\r\n\r\n" { "\r\n" } else { "\n" };
+    let updated_head: Vec<String> = head
+        .split('\n')
+        .enumerate()
+        .map(|(i, raw_line)| {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if i > 0 {
+                if let Some((k, _)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        return format!("{}: {}", k.trim(), body.len());
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    format!("{}{sep}{body}", updated_head.join(line_sep))
+}
+
+/// Configurable payload generators for Intruder payload sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PayloadGenerator {
+    /// Static list of strings.
+    SimpleList(Vec<String>),
+    /// Inclusive numeric range `from..=to` with `step`, optional `prefix`, and zero-padding width.
+    NumberRange {
+        from: i64,
+        to: i64,
+        step: i64,
+        pad_width: usize,
+        prefix: String,
+    },
+    /// Cartesian product of per-slot token lists joined by `separator`.
+    CustomIterator {
+        slots: Vec<Vec<String>>,
+        separator: String,
+    },
+    /// Exhaustive character-set combinations from `min_len..=max_len` with an optional `prefix`.
+    BruteForce {
+        charset: String,
+        min_len: usize,
+        max_len: usize,
+        prefix: String,
+    },
+}
+
+#[allow(dead_code)]
+impl PayloadGenerator {
+    pub fn generate(&self) -> Vec<String> {
+        match self {
+            PayloadGenerator::SimpleList(list) => list.clone(),
+            PayloadGenerator::NumberRange { from, to, step, pad_width, prefix } => {
+                if *step == 0 || (*step > 0 && from > to) || (*step < 0 && from < to) {
+                    return Vec::new();
+                }
+                let mut out = Vec::new();
+                let mut cur = *from;
+                while (*step > 0 && cur <= *to) || (*step < 0 && cur >= *to) {
+                    if *pad_width > 0 && cur >= 0 {
+                        out.push(format!("{prefix}{cur:0width$}", width = *pad_width));
+                    } else {
+                        out.push(format!("{prefix}{cur}"));
+                    }
+                    match cur.checked_add(*step) {
+                        Some(next) => cur = next,
+                        None => break,
+                    }
+                }
+                out
+            }
+            PayloadGenerator::CustomIterator { slots, separator } => {
+                if slots.is_empty() || slots.iter().any(Vec::is_empty) {
+                    return Vec::new();
+                }
+                let mut acc = vec![String::new()];
+                for (idx, slot) in slots.iter().enumerate() {
+                    let mut next = Vec::with_capacity(acc.len() * slot.len());
+                    for prefix in &acc {
+                        for item in slot {
+                            if idx == 0 {
+                                next.push(item.clone());
+                            } else {
+                                next.push(format!("{prefix}{separator}{item}"));
+                            }
+                        }
+                    }
+                    acc = next;
+                }
+                acc
+            }
+            PayloadGenerator::BruteForce { charset, min_len, max_len, prefix } => {
+                let chars: Vec<char> = charset.chars().collect();
+                if chars.is_empty() || min_len > max_len || *max_len == 0 {
+                    return Vec::new();
+                }
+                let mut out = Vec::new();
+                for len in (*min_len).max(1)..=*max_len {
+                    let mut level = vec![prefix.clone()];
+                    for _ in 0..len {
+                        let mut next = Vec::with_capacity(level.len() * chars.len());
+                        for p in &level {
+                            for &ch in &chars {
+                                let mut s = p.clone();
+                                s.push(ch);
+                                next.push(s);
+                            }
+                        }
+                        level = next;
+                    }
+                    out.extend(level);
+                }
+                out
+            }
+        }
+    }
 }
 
 /// The payloads a request used, in position order, for the results label.
@@ -402,107 +539,199 @@ pub fn requests(kind: AttackType, template: &str, set_a: &[String], set_b: &[Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|x| x.to_string()).collect() }
+    use crate::test_utils::assert_table;
 
-    #[test]
-    fn auto_marks_query_cookie_and_body() {
-        let t = "POST /a?x=1&y=2 HTTP/1.1\nCookie: s=abc; t=9\nHost: h\n\nu=me&p=pw";
-        let out = auto_positions(t);
-        assert_eq!(out, "POST /a?x=§1§&y=§2§ HTTP/1.1\nCookie: s=§abc§; t=§9§\nHost: h\n\nu=§me§&p=§pw§");
-        assert_eq!(count_positions(&out), 6);
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
     }
 
-    #[test]
-    fn auto_positions_stops_before_newlines_delimiters_and_whitespace() {
-        // CRLF request with trailing carriage returns, newlines, and blank lines in body
-        let crlf = "POST /login?a=1;b=2 HTTP/1.1\r\nHost: example.com\r\nCookie: sid=tok123\r\n\r\nuser=admin&pass=secret\r\n\r\n";
-        let marked = auto_positions(crlf);
-        assert_eq!(
-            marked,
-            "POST /login?a=§1§;b=§2§ HTTP/1.1\r\nHost: example.com\r\nCookie: sid=§tok123§\r\n\r\nuser=§admin§&pass=§secret§\r\n\r\n"
-        );
-        // Trailing whitespace after parameter value is kept outside §
-        let trailing_ws = "POST /api HTTP/1.1\nHost: example.com\n\nq=search_term   \n\n";
-        assert_eq!(
-            auto_positions(trailing_ws),
-            "POST /api HTTP/1.1\nHost: example.com\n\nq=§search_term§   \n\n"
-        );
+    struct AttackMatrixCase<'a> {
+        name: &'a str,
+        attack_type: AttackType,
+        template: &'a str,
+        payload_sets: Vec<Vec<String>>,
+        expected_request_count: usize,
+        expected_payload_combinations: Vec<(&'a str, &'a str)>,
     }
 
     #[test]
-    fn auto_positions_marks_json_values_without_consuming_quotes_or_commas() {
-        let json_req = "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"value\", \"count\": 123, \"active\": true}\r\n";
-        let marked = auto_positions(json_req);
-        assert_eq!(
-            marked,
-            "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"§value§\", \"count\": §123§, \"active\": §true§}\r\n"
-        );
-        assert_eq!(count_positions(&marked), 3);
-    }
+    fn attack_type_matrix() {
+        let cases = [
+            // 1 position
+            AttackMatrixCase {
+                name: "Sniper with 1 position and 3 payloads",
+                attack_type: AttackType::Sniper,
+                template: "GET /item?id=§1§ HTTP/1.1",
+                payload_sets: vec![v(&["10", "20", "30"])],
+                expected_request_count: 3,
+                expected_payload_combinations: vec![
+                    ("10", "GET /item?id=10 HTTP/1.1"),
+                    ("20", "GET /item?id=20 HTTP/1.1"),
+                    ("30", "GET /item?id=30 HTTP/1.1"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "BatteringRam with 1 position and 2 payloads",
+                attack_type: AttackType::BatteringRam,
+                template: "GET /item?id=§1§ HTTP/1.1",
+                payload_sets: vec![v(&["A", "B"])],
+                expected_request_count: 2,
+                expected_payload_combinations: vec![
+                    ("A", "GET /item?id=A HTTP/1.1"),
+                    ("B", "GET /item?id=B HTTP/1.1"),
+                ],
+            },
+            // 2 positions
+            AttackMatrixCase {
+                name: "Sniper with 2 positions keeps base value in non-targeted position",
+                attack_type: AttackType::Sniper,
+                template: "a=§x§&b=§y§",
+                payload_sets: vec![v(&["P", "Q"])],
+                expected_request_count: 4,
+                expected_payload_combinations: vec![
+                    ("P", "a=P&b=y"),
+                    ("P", "a=x&b=P"),
+                    ("Q", "a=Q&b=y"),
+                    ("Q", "a=x&b=Q"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "BatteringRam with 2 positions broadcasts same payload to all positions",
+                attack_type: AttackType::BatteringRam,
+                template: "a=§x§&b=§y§",
+                payload_sets: vec![v(&["P", "Q"])],
+                expected_request_count: 2,
+                expected_payload_combinations: vec![
+                    ("P, P", "a=P&b=P"),
+                    ("Q, Q", "a=Q&b=Q"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "Pitchfork with 2 positions zips in lockstep up to shortest list",
+                attack_type: AttackType::Pitchfork,
+                template: "u=§x§&p=§y§",
+                payload_sets: vec![v(&["a", "b", "c"]), v(&["1", "2"])],
+                expected_request_count: 2,
+                expected_payload_combinations: vec![
+                    ("a, 1", "u=a&p=1"),
+                    ("b, 2", "u=b&p=2"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "ClusterBomb with 2 positions produces Cartesian product (last position fastest)",
+                attack_type: AttackType::ClusterBomb,
+                template: "u=§x§&p=§y§",
+                payload_sets: vec![v(&["a", "b"]), v(&["1", "2", "3"])],
+                expected_request_count: 6,
+                expected_payload_combinations: vec![
+                    ("a, 1", "u=a&p=1"),
+                    ("a, 2", "u=a&p=2"),
+                    ("a, 3", "u=a&p=3"),
+                    ("b, 1", "u=b&p=1"),
+                    ("b, 2", "u=b&p=2"),
+                    ("b, 3", "u=b&p=3"),
+                ],
+            },
+            // 3 positions
+            AttackMatrixCase {
+                name: "Sniper with 3 positions and 2 payloads",
+                attack_type: AttackType::Sniper,
+                template: "§a§-§b§-§c§",
+                payload_sets: vec![v(&["1", "2"])],
+                expected_request_count: 6,
+                expected_payload_combinations: vec![
+                    ("1", "1-b-c"),
+                    ("1", "a-1-c"),
+                    ("1", "a-b-1"),
+                    ("2", "2-b-c"),
+                    ("2", "a-2-c"),
+                    ("2", "a-b-2"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "BatteringRam with 3 positions broadcasts one value everywhere",
+                attack_type: AttackType::BatteringRam,
+                template: "a=§x§&b=§y§&c=§z§",
+                payload_sets: vec![v(&["P", "Q"])],
+                expected_request_count: 2,
+                expected_payload_combinations: vec![
+                    ("P, P, P", "a=P&b=P&c=P"),
+                    ("Q, Q, Q", "a=Q&b=Q&c=Q"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "Pitchfork with 3 positions and 3 payload sets",
+                attack_type: AttackType::Pitchfork,
+                template: "§p§-§q§-§r§",
+                payload_sets: vec![v(&["a", "b"]), v(&["1", "2", "3"]), v(&["x", "y"])],
+                expected_request_count: 2,
+                expected_payload_combinations: vec![
+                    ("a, 1, x", "a-1-x"),
+                    ("b, 2, y", "b-2-y"),
+                ],
+            },
+            AttackMatrixCase {
+                name: "ClusterBomb with 3 positions and 3 payload sets (2x3x2 = 12)",
+                attack_type: AttackType::ClusterBomb,
+                template: "§p§-§q§-§r§",
+                payload_sets: vec![v(&["a", "b"]), v(&["1", "2", "3"]), v(&["x", "y"])],
+                expected_request_count: 12,
+                expected_payload_combinations: vec![
+                    ("a, 1, x", "a-1-x"),
+                    ("a, 1, y", "a-1-y"),
+                    ("a, 2, x", "a-2-x"),
+                    ("a, 2, y", "a-2-y"),
+                    ("a, 3, x", "a-3-x"),
+                    ("a, 3, y", "a-3-y"),
+                    ("b, 1, x", "b-1-x"),
+                    ("b, 1, y", "b-1-y"),
+                    ("b, 2, x", "b-2-x"),
+                    ("b, 2, y", "b-2-y"),
+                    ("b, 3, x", "b-3-x"),
+                    ("b, 3, y", "b-3-y"),
+                ],
+            },
+            // Edge cases: unclosed final marker, zero markers, empty primary set
+            AttackMatrixCase {
+                name: "unclosed final marker is ignored without panic",
+                attack_type: AttackType::Sniper,
+                template: "a§b§c§d",
+                payload_sets: vec![v(&["P"])],
+                expected_request_count: 1,
+                expected_payload_combinations: vec![("P", "aPc")],
+            },
+            AttackMatrixCase {
+                name: "template without markers produces 0 requests",
+                attack_type: AttackType::BatteringRam,
+                template: "no markers here",
+                payload_sets: vec![v(&["P"])],
+                expected_request_count: 0,
+                expected_payload_combinations: vec![],
+            },
+            AttackMatrixCase {
+                name: "empty primary payload set produces 0 requests",
+                attack_type: AttackType::ClusterBomb,
+                template: "a=§x§&b=§y§",
+                payload_sets: vec![vec![], v(&["p"])],
+                expected_request_count: 0,
+                expected_payload_combinations: vec![],
+            },
+        ];
 
-    #[test]
-    fn dispatch_headers_respects_update_host() {
-        let raw = "GET /a HTTP/1.1\nHost: §x§.internal\nCookie: c=1\n\n";
-        let filled = &requests(AttackType::Sniper, raw, &v(&["evil"]), &[])[0].1;
-        let has_host = |h: &[(String, String)]| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone());
-        // on: no Host header of ours, so the client uses the target's
-        assert_eq!(has_host(&dispatch_headers(filled, true)), None);
-        // off: the template's Host, with its payload filled in
-        let off = dispatch_headers(filled, false);
-        assert_eq!(has_host(&off).as_deref(), Some("evil.internal"));
-        assert!(off.iter().any(|(k, v)| k == "Cookie" && v == "c=1"));
-        // off, but the template has no Host header: nothing to keep, target host it is
-        assert_eq!(has_host(&dispatch_headers("GET / HTTP/1.1\nAccept: */*\n\n", false)), None);
-    }
+        assert_table!(cases, |idx, case| {
+            let plan = AttackPlan::new(case.attack_type, case.template, &case.payload_sets);
+            assert_eq!(plan.len(), case.expected_request_count, "case #{idx} ({}) count", case.name);
+            assert_eq!(plan.is_empty(), case.expected_request_count == 0, "case #{idx} ({}) is_empty", case.name);
+            let generated: Vec<(String, String)> = (0..plan.len()).map(|i| plan.request(i)).collect();
+            let expected: Vec<(String, String)> = case
+                .expected_payload_combinations
+                .iter()
+                .map(|(l, r)| (l.to_string(), r.to_string()))
+                .collect();
+            assert_eq!(generated, expected, "case #{idx} ({}) combinations", case.name);
+        });
 
-    #[test]
-    fn request_count_matches_requests() {
-        let t = "a=§x§&b=§y§";
-        for kind in AttackType::ALL {
-            for (a, b) in [(v(&["1", "2", "3"]), v(&["p", "q"])), (v(&["1"]), vec![]), (vec![], v(&["p"]))] {
-                assert_eq!(request_count(kind, count_positions(t), a.len(), b.len()), requests(kind, t, &a, &b).len(), "{}", kind.label());
-            }
-        }
-    }
-
-    #[test]
-    fn sniper_keeps_base_value_elsewhere() {
-        let r = requests(AttackType::Sniper, "a=§x§&b=§y§", &v(&["P"]), &[]);
-        let filled: Vec<_> = r.iter().map(|(_, f)| f.as_str()).collect();
-        assert_eq!(filled, ["a=P&b=y", "a=x&b=P"]);
-    }
-    #[test]
-    fn battering_ram_same_everywhere() {
-        let r = requests(AttackType::BatteringRam, "a=§x§&b=§y§", &v(&["P", "Q"]), &[]);
-        assert_eq!(r[1].1, "a=Q&b=Q");
-    }
-    #[test]
-    fn pitchfork_lockstep() {
-        let r = requests(AttackType::Pitchfork, "u=§x§&p=§y§", &v(&["a", "b", "c"]), &v(&["1", "2"]));
-        assert_eq!(r.len(), 2);
-        assert_eq!(r[1].1, "u=b&p=2");
-    }
-    #[test]
-    fn cluster_bomb_all_combinations() {
-        let r = requests(AttackType::ClusterBomb, "u=§x§&p=§y§", &v(&["a", "b"]), &v(&["1", "2", "3"]));
-        assert_eq!(r.len(), 6);
-        assert_eq!(r[5].0, "b, 3");
-    }
-
-    // ---- lazy AttackPlan ----
-
-    /// Every index the plan reports produces the same (label, request) as the eager list.
-    fn plan_matches_eager(kind: AttackType, template: &str, a: &[String], b: &[String]) {
-        let plan = AttackPlan::from_two(kind, template, a, b);
-        let eager = requests(kind, template, a, b);
-        assert_eq!(plan.len(), eager.len(), "{} count", kind.label());
-        for (i, expected) in eager.iter().enumerate() {
-            assert_eq!(&plan.request(i), expected, "{} request {i}", kind.label());
-        }
-    }
-
-    #[test]
-    fn plan_reproduces_each_mode_lazily() {
+        // Verify lazy AttackPlan::from_two matches eager requests() and request_count() across all modes
         let t = "u=§x§&p=§y§&z=§q§";
         for kind in AttackType::ALL {
             for (a, b) in [
@@ -511,91 +740,201 @@ mod tests {
                 (vec![], v(&["p"])),
                 (v(&["a", "b", "c", "d"]), v(&["x", "y", "z"])),
             ] {
-                plan_matches_eager(kind, t, &a, &b);
+                let plan = AttackPlan::from_two(kind, t, &a, &b);
+                let eager = requests(kind, t, &a, &b);
+                assert_eq!(plan.len(), eager.len(), "{} count", kind.label());
+                assert_eq!(request_count(kind, count_positions(t), a.len(), b.len()), eager.len(), "{} request_count", kind.label());
+                for (i, expected) in eager.iter().enumerate() {
+                    assert_eq!(&plan.request(i), expected, "{} request {i}", kind.label());
+                }
             }
         }
-    }
-
-    #[test]
-    fn template_splits_into_parts_and_defaults() {
-        let (parts, defaults) = split_template("a=§x§&b=§y§");
-        assert_eq!(parts, ["a=", "&b=", ""]);
-        assert_eq!(defaults, ["x", "y"]);
-        // no markers: one part, no positions
         assert_eq!(split_template("plain"), (vec!["plain".to_string()], Vec::<String>::new()));
     }
 
     #[test]
-    fn marker_edge_cases_do_not_panic() {
-        // unclosed final marker: the dangling text is ignored, like count_positions
-        assert_eq!(count_positions("a§b§c§d"), 1);
-        let plan = AttackPlan::from_two(AttackType::Sniper, "a§b§c§d", &v(&["P"]), &[]);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan.request(0).1, "aPc");
-        // no markers at all: nothing to attack
-        let none = AttackPlan::from_two(AttackType::BatteringRam, "no markers here", &v(&["P"]), &[]);
-        assert!(none.is_empty());
-        // empty primary set: every mode produces nothing
-        for kind in AttackType::ALL {
-            assert!(AttackPlan::from_two(kind, "a=§x§", &[], &v(&["p"])).is_empty(), "{}", kind.label());
-        }
+    fn auto_positions_delimiter_matrix() {
+        let cases: [(&str, &str, &str, usize); 6] = [
+            (
+                "marks query, Cookie header, and form body simultaneously",
+                "POST /a?x=1&y=2 HTTP/1.1\nCookie: s=abc; t=9\nHost: h\n\nu=me&p=pw",
+                "POST /a?x=§1§&y=§2§ HTTP/1.1\nCookie: s=§abc§; t=§9§\nHost: h\n\nu=§me§&p=§pw§",
+                6,
+            ),
+            (
+                "stops before CRLF, semicolon, ampersand, and trailing blank lines",
+                "POST /login?a=1;b=2 HTTP/1.1\r\nHost: example.com\r\nCookie: sid=tok123\r\n\r\nuser=admin&pass=secret\r\n\r\n",
+                "POST /login?a=§1§;b=§2§ HTTP/1.1\r\nHost: example.com\r\nCookie: sid=§tok123§\r\n\r\nuser=§admin§&pass=§secret§\r\n\r\n",
+                5,
+            ),
+            (
+                "stops before trailing spaces and newlines in form body",
+                "POST /api HTTP/1.1\nHost: example.com\n\nq=search_term   \n\n",
+                "POST /api HTTP/1.1\nHost: example.com\n\nq=§search_term§   \n\n",
+                1,
+            ),
+            (
+                "marks JSON string, number, and boolean values without consuming quotes or commas",
+                "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"value\", \"count\": 123, \"active\": true}\r\n",
+                "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\": \"§value§\", \"count\": §123§, \"active\": §true§}\r\n",
+                3,
+            ),
+            (
+                "handles JSON escaped quotes inside string values",
+                "POST /api HTTP/1.1\nHost: h\n\n{\"msg\":\"he said \\\"hi\\\"\",\"n\":-42}",
+                "POST /api HTTP/1.1\nHost: h\n\n{\"msg\":\"§he said \\\"hi\\\"§\",\"n\":§-42§}",
+                2,
+            ),
+            (
+                "clears pre-existing § markers before re-marking",
+                "GET /p?x=§old§ HTTP/1.1\nHost: §h§\n\n",
+                "GET /p?x=§old§ HTTP/1.1\nHost: h\n\n",
+                1,
+            ),
+        ];
+
+        assert_table!(cases, |idx, (name, input, expected_marked, expected_count)| {
+            let marked = auto_positions(input);
+            assert_eq!(marked, expected_marked, "case #{idx} ({name}) marked output");
+            assert_eq!(count_positions(&marked), expected_count, "case #{idx} ({name}) position count");
+        });
     }
 
     #[test]
-    fn sniper_index_walks_payload_then_marker() {
-        let plan = AttackPlan::from_two(AttackType::Sniper, "a=§x§&b=§y§", &v(&["P", "Q"]), &[]);
-        assert_eq!(plan.len(), 4); // 2 payloads × 2 markers
-        let filled: Vec<String> = (0..plan.len()).map(|i| plan.request(i).1).collect();
-        assert_eq!(filled, ["a=P&b=y", "a=x&b=P", "a=Q&b=y", "a=x&b=Q"]);
+    fn content_length_and_header_recalculation_matrix() {
+        let cl_cases: [(&str, &str, &[&str], &[&str]); 3] = [
+            (
+                "LF request updates Content-Length across varying payload sizes",
+                "POST /login HTTP/1.1\nHost: example.com\nContent-Length: 9\n\nuser=§root§",
+                &["a", "administrator", ""],
+                &[
+                    "POST /login HTTP/1.1\nHost: example.com\nContent-Length: 6\n\nuser=a",
+                    "POST /login HTTP/1.1\nHost: example.com\nContent-Length: 18\n\nuser=administrator",
+                    "POST /login HTTP/1.1\nHost: example.com\nContent-Length: 5\n\nuser=",
+                ],
+            ),
+            (
+                "CRLF request preserves CRLF and updates case-insensitive content-length",
+                "POST /api HTTP/1.1\r\nHost: example.com\r\ncontent-length: 12\r\n\r\n{\"k\":\"§val§\"}",
+                &["x", "longer_payload_value"],
+                &[
+                    "POST /api HTTP/1.1\r\nHost: example.com\r\ncontent-length: 9\r\n\r\n{\"k\":\"x\"}",
+                    "POST /api HTTP/1.1\r\nHost: example.com\r\ncontent-length: 28\r\n\r\n{\"k\":\"longer_payload_value\"}",
+                ],
+            ),
+            (
+                "request without Content-Length header leaves headers untouched",
+                "POST /api HTTP/1.1\nHost: example.com\n\nbody=§x§",
+                &["short", "much_longer"],
+                &[
+                    "POST /api HTTP/1.1\nHost: example.com\n\nbody=short",
+                    "POST /api HTTP/1.1\nHost: example.com\n\nbody=much_longer",
+                ],
+            ),
+        ];
+
+        assert_table!(cl_cases, |idx, (name, template, payloads, expected_requests)| {
+            let plan = AttackPlan::from_two(AttackType::Sniper, template, &v(payloads), &[]);
+            let got: Vec<String> = (0..plan.len()).map(|i| plan.request(i).1).collect();
+            let expected: Vec<String> = expected_requests.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, expected, "case #{idx} ({name})");
+        });
+
+        // Host header recalculation / preservation in dispatch_headers
+        let raw = "GET /a HTTP/1.1\nHost: §x§.internal\nCookie: c=1\n\n";
+        let filled = &requests(AttackType::Sniper, raw, &v(&["evil"]), &[])[0].1;
+        let has_host = |h: &[(String, String)]| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone());
+        assert_eq!(has_host(&dispatch_headers(filled, true)), None);
+        let off = dispatch_headers(filled, false);
+        assert_eq!(has_host(&off).as_deref(), Some("evil.internal"));
+        assert!(off.iter().any(|(k, v)| k == "Cookie" && v == "c=1"));
+        assert_eq!(has_host(&dispatch_headers("GET / HTTP/1.1\nAccept: */*\n\n", false)), None);
     }
 
     #[test]
-    fn battering_ram_broadcasts_one_value() {
-        let plan = AttackPlan::from_two(AttackType::BatteringRam, "a=§x§&b=§y§&c=§z§", &v(&["P", "Q"]), &[]);
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan.request(1), ("Q, Q, Q".to_string(), "a=Q&b=Q&c=Q".to_string()));
-    }
+    fn payload_generators_matrix() {
+        let cases: Vec<(&str, PayloadGenerator, Vec<&str>)> = vec![
+            (
+                "SimpleList preserves exact items",
+                PayloadGenerator::SimpleList(v(&["admin", "guest", "root"])),
+                vec!["admin", "guest", "root"],
+            ),
+            (
+                "NumberRange ascending with step 5 and prefix",
+                PayloadGenerator::NumberRange {
+                    from: 10,
+                    to: 25,
+                    step: 5,
+                    pad_width: 0,
+                    prefix: "id_".into(),
+                },
+                vec!["id_10", "id_15", "id_20", "id_25"],
+            ),
+            (
+                "NumberRange with zero-padding width 3",
+                PayloadGenerator::NumberRange {
+                    from: 1,
+                    to: 3,
+                    step: 1,
+                    pad_width: 3,
+                    prefix: "u".into(),
+                },
+                vec!["u001", "u002", "u003"],
+            ),
+            (
+                "NumberRange descending with negative step",
+                PayloadGenerator::NumberRange {
+                    from: 3,
+                    to: 1,
+                    step: -1,
+                    pad_width: 0,
+                    prefix: String::new(),
+                },
+                vec!["3", "2", "1"],
+            ),
+            (
+                "NumberRange invalid step 0 returns empty",
+                PayloadGenerator::NumberRange {
+                    from: 1,
+                    to: 5,
+                    step: 0,
+                    pad_width: 0,
+                    prefix: String::new(),
+                },
+                vec![],
+            ),
+            (
+                "CustomIterator joins 2 slots with separator",
+                PayloadGenerator::CustomIterator {
+                    slots: vec![v(&["admin", "dev"]), v(&["1", "2"])],
+                    separator: ":".into(),
+                },
+                vec!["admin:1", "admin:2", "dev:1", "dev:2"],
+            ),
+            (
+                "BruteForce charset 'ab' length 1..=2 with prefix 'p_'",
+                PayloadGenerator::BruteForce {
+                    charset: "ab".into(),
+                    min_len: 1,
+                    max_len: 2,
+                    prefix: "p_".into(),
+                },
+                vec!["p_a", "p_b", "p_aa", "p_ab", "p_ba", "p_bb"],
+            ),
+        ];
 
-    #[test]
-    fn pitchfork_zips_up_to_the_shortest_list() {
-        let plan = AttackPlan::from_two(AttackType::Pitchfork, "u=§x§&p=§y§", &v(&["a", "b", "c"]), &v(&["1", "2"]));
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan.request(0).1, "u=a&p=1");
-        assert_eq!(plan.request(1).1, "u=b&p=2");
-    }
+        assert_table!(cases, |idx, (name, gen, expected)| {
+            let expected_owned: Vec<String> = expected.into_iter().map(String::from).collect();
+            assert_eq!(gen.generate(), expected_owned, "case #{idx} ({name})");
+        });
 
-    #[test]
-    fn cluster_bomb_decomposes_the_index_into_strides() {
-        let plan = AttackPlan::from_two(AttackType::ClusterBomb, "u=§x§&p=§y§", &v(&["a", "b"]), &v(&["1", "2", "3"]));
-        assert_eq!(plan.len(), 6);
-        // last marker varies fastest: index 0..6 → (a,1)(a,2)(a,3)(b,1)(b,2)(b,3)
-        let filled: Vec<String> = (0..6).map(|i| plan.request(i).1).collect();
-        assert_eq!(filled, ["u=a&p=1", "u=a&p=2", "u=a&p=3", "u=b&p=1", "u=b&p=2", "u=b&p=3"]);
-    }
-
-    #[test]
-    fn presets_are_available_as_lines() {
+        // Built-in PRESETS table
         assert_eq!(preset_lines("HTTP verbs").unwrap().lines().next(), Some("GET"));
         assert_eq!(preset_lines("Parameter names").unwrap().lines().count(), 7);
         assert!(preset_lines("API routes").unwrap().contains("/metrics"));
         assert_eq!(preset_lines("Nonexistent"), None);
-        // every preset is non-empty
         for (name, lines) in PRESETS {
             assert!(!lines.is_empty(), "{name}");
         }
-    }
-
-    #[test]
-    fn plan_supports_more_than_two_sets() {
-        // three markers, three lists in lock-step
-        let sets = [v(&["a", "b"]), v(&["1", "2", "3"]), v(&["x", "y"])];
-        let plan = AttackPlan::new(AttackType::Pitchfork, "§p§-§q§-§r§", &sets);
-        assert_eq!(plan.len(), 2); // shortest list
-        assert_eq!(plan.request(1).1, "b-2-y");
-        // cluster bomb over three lists: 2 × 3 × 2 = 12
-        let plan = AttackPlan::new(AttackType::ClusterBomb, "§p§-§q§-§r§", &sets);
-        assert_eq!(plan.len(), 12);
-        assert_eq!(plan.request(0).1, "a-1-x");
-        assert_eq!(plan.request(11).1, "b-3-y");
     }
 }

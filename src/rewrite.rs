@@ -9,7 +9,7 @@
 
 use regex::Regex;
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuleType {
     RequestHeader,
     RequestBody,
@@ -36,7 +36,7 @@ impl RuleType {
     }
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rule {
     pub enabled: bool,
     pub kind: RuleType,
@@ -67,7 +67,12 @@ fn apply_headers(rule: &Rule, headers: &str) -> String {
     for line in headers.lines() {
         if re.is_match(line) {
             if !rule.replace_text.is_empty() {
-                out.push(re.replace_all(line, regex::NoExpand(&rule.replace_text)).into_owned());
+                let replaced = if rule.regex {
+                    re.replace_all(line, rule.replace_text.as_str()).into_owned()
+                } else {
+                    re.replace_all(line, regex::NoExpand(&rule.replace_text)).into_owned()
+                };
+                out.push(replaced);
             } // blank replacement: the header is removed
         } else {
             out.push(line.to_string());
@@ -81,7 +86,13 @@ fn apply_body(rule: &Rule, body: &str) -> String {
         return body.to_string();
     }
     match matcher(rule) {
-        Some(re) => re.replace_all(body, regex::NoExpand(&rule.replace_text)).into_owned(),
+        Some(re) => {
+            if rule.regex {
+                re.replace_all(body, rule.replace_text.as_str()).into_owned()
+            } else {
+                re.replace_all(body, regex::NoExpand(&rule.replace_text)).into_owned()
+            }
+        }
         None => body.to_string(),
     }
 }
@@ -130,32 +141,222 @@ pub fn defaults() -> Vec<Rule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
+
     fn r(kind: RuleType, regex: bool, m: &str, rep: &str) -> Rule {
         Rule { enabled: true, kind, regex, match_text: m.into(), replace_text: rep.into(), comment: String::new() }
     }
+
     #[test]
-    fn blank_match_adds_header() {
-        let (h, _) = apply(&[r(RuleType::RequestHeader, false, "", "X-Test: 1")], true, "Accept: */*", "");
-        assert_eq!(h, "Accept: */*\nX-Test: 1");
+    fn request_response_rewrite_matrix() {
+        struct RewriteCase<'a> {
+            name: &'a str,
+            rules: Vec<Rule>,
+            is_request: bool,
+            headers_in: &'a str,
+            body_in: &'a str,
+            expected_headers: &'a str,
+            expected_body: &'a str,
+        }
+
+        let cases = [
+            RewriteCase {
+                name: "blank match on RequestHeader appends new header",
+                rules: vec![r(RuleType::RequestHeader, false, "", "X-Test: 1")],
+                is_request: true,
+                headers_in: "Accept: */*",
+                body_in: "",
+                expected_headers: "Accept: */*\nX-Test: 1",
+                expected_body: "",
+            },
+            RewriteCase {
+                name: "blank replace on RequestHeader removes matching header line",
+                rules: vec![r(RuleType::RequestHeader, true, "^Referer.*$", "")],
+                is_request: true,
+                headers_in: "Referer: https://old.test\nAccept: */*",
+                body_in: "",
+                expected_headers: "Accept: */*",
+                expected_body: "",
+            },
+            RewriteCase {
+                name: "regex RequestHeader rewrites User-Agent line",
+                rules: vec![r(RuleType::RequestHeader, true, "^User-Agent.*$", "User-Agent: Custom/2.0")],
+                is_request: true,
+                headers_in: "User-Agent: Mozilla/5.0\nAccept: */*",
+                body_in: "",
+                expected_headers: "User-Agent: Custom/2.0\nAccept: */*",
+                expected_body: "",
+            },
+            RewriteCase {
+                name: "request-line URL path rewrite via RequestHeader rule",
+                rules: vec![r(RuleType::RequestHeader, false, "/v1/legacy", "/v2/modern")],
+                is_request: true,
+                headers_in: "GET /v1/legacy?id=1 HTTP/1.1\nHost: api.example.com",
+                body_in: "",
+                expected_headers: "GET /v2/modern?id=1 HTTP/1.1\nHost: api.example.com",
+                expected_body: "",
+            },
+            RewriteCase {
+                name: "ResponseHeader rule is skipped when evaluating a request",
+                rules: vec![r(RuleType::ResponseHeader, true, "^Set-Cookie.*$", "")],
+                is_request: true,
+                headers_in: "Set-Cookie: a=b",
+                body_in: "",
+                expected_headers: "Set-Cookie: a=b",
+                expected_body: "",
+            },
+            RewriteCase {
+                name: "ResponseHeader rule removes HSTS and appends X-XSS-Protection on response",
+                rules: vec![
+                    r(RuleType::ResponseHeader, true, r"^Strict-Transport-Security.*$", ""),
+                    r(RuleType::ResponseHeader, false, "", "X-XSS-Protection: 0"),
+                ],
+                is_request: false,
+                headers_in: "Content-Type: text/html\nStrict-Transport-Security: max-age=31536000",
+                body_in: "ok",
+                expected_headers: "Content-Type: text/html\nX-XSS-Protection: 0",
+                expected_body: "ok",
+            },
+            RewriteCase {
+                name: "literal RequestBody replacement escapes regex metacharacters",
+                rules: vec![r(RuleType::RequestBody, false, "a.b", "X")],
+                is_request: true,
+                headers_in: "",
+                body_in: "a.b axb",
+                expected_headers: "",
+                expected_body: "X axb",
+            },
+            RewriteCase {
+                name: "regex ResponseBody replacement updates matching tokens",
+                rules: vec![r(RuleType::ResponseBody, true, r#""role"\s*:\s*"user""#, r#""role":"admin""#)],
+                is_request: false,
+                headers_in: "Content-Type: application/json",
+                body_in: r#"{"user":"alice","role": "user"}"#,
+                expected_headers: "Content-Type: application/json",
+                expected_body: r#"{"user":"alice","role":"admin"}"#,
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let (got_h, got_b) = apply(&case.rules, case.is_request, case.headers_in, case.body_in);
+            assert_eq!(got_h, case.expected_headers, "case #{idx} ({}) headers", case.name);
+            assert_eq!(got_b, case.expected_body, "case #{idx} ({}) body", case.name);
+        });
     }
+
     #[test]
-    fn blank_replace_removes_header() {
-        let (h, _) = apply(&[r(RuleType::RequestHeader, true, "^Referer.*$", "")], true, "Referer: x\nAccept: */*", "");
-        assert_eq!(h, "Accept: */*");
-    }
-    #[test]
-    fn regex_rewrites_user_agent() {
-        let (h, _) = apply(&[r(RuleType::RequestHeader, true, "^User-Agent.*$", "User-Agent: X")], true, "User-Agent: abc", "");
-        assert_eq!(h, "User-Agent: X");
-    }
-    #[test]
-    fn response_rules_skip_requests() {
-        let (h, _) = apply(&[r(RuleType::ResponseHeader, true, "^Set-Cookie.*$", "")], true, "Set-Cookie: a=b", "");
-        assert_eq!(h, "Set-Cookie: a=b");
-    }
-    #[test]
-    fn literal_body_replace() {
-        let (_, b) = apply(&[r(RuleType::RequestBody, false, "a.b", "X")], true, "", "a.b axb");
-        assert_eq!(b, "X axb");
+    fn rewrite_edge_cases_matrix() {
+        let mut disabled_rule = r(RuleType::RequestHeader, false, "Host: a", "Host: b");
+        disabled_rule.enabled = false;
+
+        let binary_lossy = String::from_utf8_lossy(b"\x1f\x8b\x08\x00binary_payload_token\xff").into_owned();
+        let binary_expected = binary_lossy.replace("binary_payload_token", "patched_token");
+
+        let cases: Vec<(&str, Vec<Rule>, bool, String, String, String, String)> = vec![
+            (
+                "regex capture group references ($1, $2) in header rewrite",
+                vec![r(RuleType::RequestHeader, true, r"^X-Env:\s*(\w+)-(\d+)$", "X-Env: $2/$1")],
+                true,
+                "X-Env: prod-42\nAccept: */*".into(),
+                "".into(),
+                "X-Env: 42/prod\nAccept: */*".into(),
+                "".into(),
+            ),
+            (
+                "regex capture group references ($1, $2) in body rewrite",
+                vec![r(RuleType::RequestBody, true, r"(\w+)=(\d+)", "$1:[$2]")],
+                true,
+                "".into(),
+                "a=10&b=20".into(),
+                "".into(),
+                "a:[10]&b:[20]".into(),
+            ),
+            (
+                "literal mode preserves '$1' verbatim without capture expansion",
+                vec![r(RuleType::RequestBody, false, "PRICE", "$100")],
+                true,
+                "".into(),
+                "cost is PRICE".into(),
+                "".into(),
+                "cost is $100".into(),
+            ),
+            (
+                "empty match and empty replace on header is a no-op",
+                vec![r(RuleType::RequestHeader, false, "", "")],
+                true,
+                "Host: example.com".into(),
+                "body".into(),
+                "Host: example.com".into(),
+                "body".into(),
+            ),
+            (
+                "empty match on body is a no-op (never inserts between every char)",
+                vec![r(RuleType::RequestBody, false, "", "INJECT")],
+                true,
+                "".into(),
+                "body".into(),
+                "".into(),
+                "body".into(),
+            ),
+            (
+                "empty replace on body deletes matched substring",
+                vec![r(RuleType::RequestBody, false, "SECRET", "")],
+                true,
+                "".into(),
+                "a=SECRET&b=1".into(),
+                "".into(),
+                "a=&b=1".into(),
+            ),
+            (
+                "missing target header leaves existing headers unchanged",
+                vec![r(RuleType::RequestHeader, true, "^X-NonExistent:.*$", "X-NonExistent: 1")],
+                true,
+                "Host: example.com\nAccept: */*".into(),
+                "".into(),
+                "Host: example.com\nAccept: */*".into(),
+                "".into(),
+            ),
+            (
+                "invalid regex pattern is safely ignored without panic",
+                vec![r(RuleType::RequestBody, true, "(unclosed_group", "X")],
+                true,
+                "".into(),
+                "original body".into(),
+                "".into(),
+                "original body".into(),
+            ),
+            (
+                "disabled rule is skipped",
+                vec![disabled_rule],
+                true,
+                "Host: a".into(),
+                "".into(),
+                "Host: a".into(),
+                "".into(),
+            ),
+            (
+                "non-UTF8 / binary lossy payload rewrites ASCII marker without panicking",
+                vec![r(RuleType::RequestBody, false, "binary_payload_token", "patched_token")],
+                true,
+                "".into(),
+                binary_lossy,
+                "".into(),
+                binary_expected,
+            ),
+        ];
+
+        assert_table!(cases, |idx, (name, rules, is_req, h_in, b_in, exp_h, exp_b)| {
+            let (got_h, got_b) = apply(&rules, is_req, &h_in, &b_in);
+            assert_eq!(got_h, exp_h, "case #{idx} ({name}) headers");
+            assert_eq!(got_b, exp_b, "case #{idx} ({name}) body");
+        });
+
+        // Verify shipped defaults() count and labels
+        let defs = defaults();
+        assert_eq!(defs.len(), 12);
+        assert!(defs.iter().all(|d| !d.enabled));
+        for kind in RuleType::ALL {
+            assert!(!kind.label().is_empty());
+        }
     }
 }
