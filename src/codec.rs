@@ -93,7 +93,7 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 // the encoder supports every mode; the Decoder currently offers only AllHex
 #[allow(dead_code)]
 pub enum HtmlMode {
@@ -491,47 +491,341 @@ pub fn normalize_response(mut res: HttpResponse) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
-    #[test]
-    fn base64_round_trip() {
-        let e = base64_encode(b"hello?", true, false);
-        assert_eq!(String::from_utf8(base64_decode(&e)).unwrap(), "hello?");
+    #[derive(Clone, Copy, Debug)]
+    enum TestCodec {
+        Base64StdPadded,
+        Base64StdUnpadded,
+        Base64UrlPadded,
+        Base64UrlUnpadded,
+        Hex,
+        AsciiHex,
+        UrlStandard,
+        UrlFull,
+        Html(HtmlMode),
+    }
+
+    struct CodecCase<'a> {
+        name: &'a str,
+        input: &'a [u8],
+        codec: TestCodec,
+        expected_encoded: &'a str,
+        expected_decoded: &'a [u8],
     }
 
     #[test]
-    fn codec_round_trips() {
-        let samples: [&[u8]; 4] = [b"", b"a", b"hello world?&=/", "üñí <tag> \"q\"".as_bytes()];
-        for s in samples {
-            let text = String::from_utf8(s.to_vec()).unwrap();
-            assert_eq!(url_decode(&url_encode(&text, false)), text);
-            assert_eq!(url_decode(&url_encode(&text, true)), text);
-            assert_eq!(base64_decode(&base64_encode(s, false, true)), s);
-            assert_eq!(base64url_decode(&base64url_encode(s)).unwrap(), s);
-            assert_eq!(hex_decode(&hex_encode(s)), s);
-            for mode in [HtmlMode::Standard, HtmlMode::AllCharacters, HtmlMode::AllDecimal, HtmlMode::AllHex] {
-                assert_eq!(html_decode(&html_encode(&text, mode)), text);
+    fn codec_encoding_decoding_matrix() {
+        let cases = [
+            CodecCase {
+                name: "Base64 standard padded ('hello?')",
+                input: b"hello?",
+                codec: TestCodec::Base64StdPadded,
+                expected_encoded: "aGVsbG8/",
+                expected_decoded: b"hello?",
+            },
+            CodecCase {
+                name: "Base64 standard padded with '=' ('Hi')",
+                input: b"Hi",
+                codec: TestCodec::Base64StdPadded,
+                expected_encoded: "SGk=",
+                expected_decoded: b"Hi",
+            },
+            CodecCase {
+                name: "Base64 standard unpadded ('Hi')",
+                input: b"Hi",
+                codec: TestCodec::Base64StdUnpadded,
+                expected_encoded: "SGk",
+                expected_decoded: b"Hi",
+            },
+            CodecCase {
+                name: "Base64 URL-safe unpadded ('hello?')",
+                input: b"hello?",
+                codec: TestCodec::Base64UrlUnpadded,
+                expected_encoded: "aGVsbG8_",
+                expected_decoded: b"hello?",
+            },
+            CodecCase {
+                name: "Base64 URL-safe unpadded high bytes ([0xfb, 0xff])",
+                input: &[0xfb, 0xff],
+                codec: TestCodec::Base64UrlUnpadded,
+                expected_encoded: "-_8",
+                expected_decoded: &[0xfb, 0xff],
+            },
+            CodecCase {
+                name: "Base64 URL-safe padded ([0xfb, 0xff])",
+                input: &[0xfb, 0xff],
+                codec: TestCodec::Base64UrlPadded,
+                expected_encoded: "-_8=",
+                expected_decoded: &[0xfb, 0xff],
+            },
+            CodecCase {
+                name: "Hex lower-case ('Hi')",
+                input: b"Hi",
+                codec: TestCodec::Hex,
+                expected_encoded: "4869",
+                expected_decoded: b"Hi",
+            },
+            CodecCase {
+                name: "ASCII hex via decoder_ops ('Hi!')",
+                input: b"Hi!",
+                codec: TestCodec::AsciiHex,
+                expected_encoded: "486921",
+                expected_decoded: b"Hi!",
+            },
+            CodecCase {
+                name: "URL standard leaves unreserved chars intact",
+                input: b"a-b_c.d~1?x=2&y=3",
+                codec: TestCodec::UrlStandard,
+                expected_encoded: "a-b_c.d~1%3fx%3d2%26y%3d3",
+                expected_decoded: b"a-b_c.d~1?x=2&y=3",
+            },
+            CodecCase {
+                name: "URL full percent-encodes every byte",
+                input: b"Hi!",
+                codec: TestCodec::UrlFull,
+                expected_encoded: "%48%69%21",
+                expected_decoded: b"Hi!",
+            },
+            CodecCase {
+                name: "HTML Standard mode encodes only special chars",
+                input: b"<a href=\"x\" title='y'>&</a>",
+                codec: TestCodec::Html(HtmlMode::Standard),
+                expected_encoded: "&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;",
+                expected_decoded: b"<a href=\"x\" title='y'>&</a>",
+            },
+            CodecCase {
+                name: "HTML AllCharacters mode encodes specials by name and others as decimal",
+                input: b"<A>",
+                codec: TestCodec::Html(HtmlMode::AllCharacters),
+                expected_encoded: "&lt;&#65;&gt;",
+                expected_decoded: b"<A>",
+            },
+            CodecCase {
+                name: "HTML AllDecimal mode encodes every character as decimal entity",
+                input: b"A&",
+                codec: TestCodec::Html(HtmlMode::AllDecimal),
+                expected_encoded: "&#65;&#38;",
+                expected_decoded: b"A&",
+            },
+            CodecCase {
+                name: "HTML AllHex mode encodes every character as hex entity",
+                input: b"A&",
+                codec: TestCodec::Html(HtmlMode::AllHex),
+                expected_encoded: "&#x41;&#x26;",
+                expected_decoded: b"A&",
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let (encoded, decoded) = match case.codec {
+                TestCodec::Base64StdPadded => {
+                    let enc = base64_encode(case.input, false, true);
+                    let dec = base64_decode(&enc);
+                    (enc, dec)
+                }
+                TestCodec::Base64StdUnpadded => {
+                    let enc = base64_encode(case.input, false, false);
+                    let dec = base64_decode(&enc);
+                    (enc, dec)
+                }
+                TestCodec::Base64UrlPadded => {
+                    let enc = base64_encode(case.input, true, true);
+                    let dec = base64url_decode(&enc).expect("valid padded base64url");
+                    (enc, dec)
+                }
+                TestCodec::Base64UrlUnpadded => {
+                    let enc = base64url_encode(case.input);
+                    let dec = base64url_decode(&enc).expect("valid unpadded base64url");
+                    (enc, dec)
+                }
+                TestCodec::Hex => {
+                    let enc = hex_encode(case.input);
+                    let dec = hex_decode(&enc);
+                    (enc, dec)
+                }
+                TestCodec::AsciiHex => {
+                    let enc_bytes = crate::decoder_ops::encode(crate::decoder_ops::Codec::AsciiHex, case.input);
+                    let enc = String::from_utf8(enc_bytes.clone()).unwrap();
+                    let dec = crate::decoder_ops::decode(crate::decoder_ops::Codec::AsciiHex, &enc_bytes).unwrap();
+                    (enc, dec)
+                }
+                TestCodec::UrlStandard => {
+                    let text = std::str::from_utf8(case.input).unwrap();
+                    let enc = url_encode(text, false);
+                    let dec = url_decode(&enc).into_bytes();
+                    (enc, dec)
+                }
+                TestCodec::UrlFull => {
+                    let text = std::str::from_utf8(case.input).unwrap();
+                    let enc = url_encode(text, true);
+                    let dec = url_decode(&enc).into_bytes();
+                    (enc, dec)
+                }
+                TestCodec::Html(mode) => {
+                    let text = std::str::from_utf8(case.input).unwrap();
+                    let enc = html_encode(text, mode);
+                    let dec = html_decode(&enc).into_bytes();
+                    (enc, dec)
+                }
+            };
+            assert_eq!(encoded, case.expected_encoded, "case #{idx} ({}) encoded mismatch", case.name);
+            assert_eq!(decoded, case.expected_decoded, "case #{idx} ({}) decoded mismatch", case.name);
+        });
+
+        // Additional decode-only entity variants (&apos;, uppercase &#X41;, plus-to-space in URL)
+        assert_eq!(html_decode("&apos;&#X41;&#66;&unknown;"), "'AB&unknown;");
+        assert_eq!(url_decode("hello+world%21"), "hello world!");
+    }
+
+    #[test]
+    fn codec_round_trip_invariant_matrix() {
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let payloads: [(&str, &[u8], bool); 7] = [
+            ("empty slice", b"", true),
+            ("single ASCII byte", b"a", true),
+            ("two ASCII bytes", b"ab", true),
+            ("three ASCII bytes", b"abc", true),
+            ("ASCII query & special chars", b"hello world?&=/'\"<>\\", true),
+            ("multibyte UTF-8 text", "üñí <tag> \"q\" ✓ 🚀".as_bytes(), true),
+            ("arbitrary binary 0x00..=0xFF", &all_bytes, false),
+        ];
+
+        assert_table!(payloads, |idx, (name, bytes, is_utf8)| {
+            // Byte-safe codecs must round-trip all binary and text payloads
+            assert_eq!(base64_decode(&base64_encode(bytes, false, true)), bytes, "case #{idx} ({name}) base64 std padded");
+            assert_eq!(base64_decode(&base64_encode(bytes, false, false)), bytes, "case #{idx} ({name}) base64 std unpadded");
+            assert_eq!(base64_decode(&base64_encode(bytes, true, true)), bytes, "case #{idx} ({name}) base64 url padded");
+            assert_eq!(base64url_decode(&base64url_encode(bytes)).unwrap(), bytes, "case #{idx} ({name}) base64url");
+            assert_eq!(hex_decode(&hex_encode(bytes)), bytes, "case #{idx} ({name}) hex");
+
+            // Text-based codecs round-trip all valid UTF-8 strings
+            if is_utf8 {
+                let text = std::str::from_utf8(bytes).unwrap();
+                assert_eq!(url_decode(&url_encode(text, false)), text, "case #{idx} ({name}) url standard");
+                assert_eq!(url_decode(&url_encode(text, true)), text, "case #{idx} ({name}) url full");
+                for mode in [HtmlMode::Standard, HtmlMode::AllCharacters, HtmlMode::AllDecimal, HtmlMode::AllHex] {
+                    assert_eq!(html_decode(&html_encode(text, mode)), text, "case #{idx} ({name}) html {mode:?}");
+                }
             }
-        }
-        assert_eq!(hex_encode(b"Hi"), "4869");
-        assert_eq!(base64url_encode(&[0xfb, 0xff]), "-_8");
+        });
+
+        // Header bytes round-trip matrix (UTF-8 vs Latin-1 and mixed Intercept edits)
+        let header_cases: [(&str, &[u8], bool); 3] = [
+            ("valid UTF-8 header", "X-Name: café".as_bytes(), false),
+            ("full 0..=255 Latin-1 header bytes", &all_bytes, true),
+            (
+                "non-UTF-8 HTTP response header",
+                b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=r\xe9sum\xe9.pdf\r\n\r\n",
+                true,
+            ),
+        ];
+        assert_table!(header_cases, |idx, (name, raw, expected_latin1)| {
+            let (text, latin1) = decode_header_bytes(raw);
+            assert_eq!(latin1, expected_latin1, "case #{idx} ({name}) latin1 flag");
+            assert_eq!(encode_header_text(&text, latin1), raw, "case #{idx} ({name}) header round-trip");
+        });
+
+        // A char past U+00FF added to Latin-1 text (an Intercept edit) is written as UTF-8
+        assert_eq!(
+            encode_header_text("a\u{e9}\u{263a}", true),
+            [&b"a\xe9"[..], "\u{263a}".as_bytes()].concat()
+        );
+        let res = HttpResponse::parse(b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=r\xe9sum\xe9.pdf\r\n\r\nbody");
+        assert!(res.latin1);
+        assert_eq!(
+            res.head_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=r\xe9sum\xe9.pdf\r\n\r\n"
+        );
     }
 
     #[test]
-    fn strict_base64url() {
-        assert_eq!(base64url_decode("SGk").unwrap(), b"Hi"); // unpadded
-        assert_eq!(base64url_decode("SGk=").unwrap(), b"Hi"); // padded
-        assert_eq!(base64url_decode("-_8").unwrap(), [0xfb, 0xff]);
-        assert!(base64url_decode("SGk+").is_none()); // standard alphabet
-        assert!(base64url_decode("S").is_none()); // impossible length
-        assert!(base64url_decode("SG k").is_none());
-        assert!(base64url_decode("SGk===").is_none());
+    fn codec_error_and_malformed_input_matrix() {
+        // 1. Strict Base64URL rejection & acceptance matrix
+        let b64url_cases: [(&str, &str, Option<&[u8]>); 9] = [
+            ("valid unpadded", "SGk", Some(b"Hi")),
+            ("valid single '=' pad", "SGk=", Some(b"Hi")),
+            ("valid URL-safe chars '-_'", "-_8", Some(&[0xfb, 0xff])),
+            ("rejects '+' from standard alphabet", "SGk+", None),
+            ("rejects '/' from standard alphabet", "SGk/", None),
+            ("rejects impossible mod-4 length 1", "S", None),
+            ("rejects internal whitespace", "SG k", None),
+            ("rejects excessive padding '==='", "SGk===", None),
+            ("rejects non-ASCII characters", "SGk\u{e9}", None),
+        ];
+        assert_table!(b64url_cases, |idx, (name, input, expected)| {
+            assert_eq!(base64url_decode(input).as_deref(), expected, "case #{idx} ({name})");
+        });
+
+        // 2. Malformed hex & lenient base64 fallback matrix
+        let lenient_cases: [(&str, &str, &[u8], Option<&[u8]>); 5] = [
+            ("odd-length hex drops trailing nibble in hex_decode, None in AsciiHex", "4869a", b"Hi", None),
+            ("non-hex chars skipped in hex_decode, None in AsciiHex", "48-69-zz", b"Hi", None),
+            ("spaced hex decodes in both hex_decode and AsciiHex", "48 69", b"Hi", Some(b"Hi")),
+            ("empty hex string", "", b"", Some(b"")),
+            ("single nibble hex", "f", b"", None),
+        ];
+        assert_table!(lenient_cases, |idx, (name, input, expected_lenient, expected_strict)| {
+            assert_eq!(hex_decode(input), expected_lenient, "case #{idx} ({name}) hex_decode");
+            assert_eq!(
+                crate::decoder_ops::decode(crate::decoder_ops::Codec::AsciiHex, input.as_bytes()).as_deref(),
+                expected_strict,
+                "case #{idx} ({name}) AsciiHex"
+            );
+        });
+
+        // 3. Malformed JWT token matrix
+        let h = base64url_encode(br#"{"alg":"HS256"}"#);
+        let p = base64url_encode(br#"{"sub":"x"}"#);
+        let bad_jwt_cases: Vec<(&str, String, &str)> = vec![
+            ("1 segment", "abc".into(), "this has 1"),
+            ("2 segments", format!("{h}.{p}"), "this has 2"),
+            ("5 segments (JWE)", format!("{h}.{p}.s.e.t"), "JWE"),
+            ("empty header", format!(".{p}.sig"), "header is empty"),
+            ("invalid Base64URL payload", format!("{h}.{p}+.sig"), "payload isn't valid Base64URL"),
+            ("non-JSON header", format!("{}.{p}.sig", base64url_encode(b"not json")), "header isn't JSON"),
+            ("JSON array header", format!("{}.{p}.sig", base64url_encode(b"[1,2]")), "JSON object"),
+            ("JSON string payload", format!("{h}.{}.sig", base64url_encode(b"\"just a string\"")), "JSON object"),
+            ("invalid Base64URL signature", format!("{h}.{p}.si+g"), "signature"),
+        ];
+        assert_table!(bad_jwt_cases, |idx, (name, token, expected_substr)| {
+            let err = parse_jwt_detailed(&token).expect_err(&format!("case #{idx} ({name}) should fail"));
+            assert!(
+                err.contains(expected_substr),
+                "case #{idx} ({name}): expected {expected_substr:?} in {err:?}"
+            );
+            assert!(!is_jwt(&token), "case #{idx} ({name}) is_jwt should be false");
+        });
+        assert!(!is_jwt("not.a.jwt"));
+
+        // 4. Malformed HTTP chunked body matrix
+        let bad_chunk_cases: [(&str, &[u8], CodecError); 11] = [
+            ("non-hex chunk size", b"zz\r\nabc\r\n0\r\n\r\n", CodecError::BadChunkSize("zz".into())),
+            ("empty chunk size line", b"\r\n", CodecError::BadChunkSize("".into())),
+            ("negative chunk size", b"-1\r\nx\r\n", CodecError::BadChunkSize("-1".into())),
+            (
+                "overflow (>16 hex digits) chunk size",
+                b"ffffffffffffffffff\r\n",
+                CodecError::BadChunkSize("ffffffffffffffffff".into()),
+            ),
+            ("u64::MAX size with short payload", b"ffffffffffffffff\r\nab", CodecError::Truncated),
+            ("declared 5 bytes, only 2 present", b"5\r\nab", CodecError::Truncated),
+            ("declared 2 bytes, missing trailing CRLF", b"2\r\nab", CodecError::Truncated),
+            ("missing terminating 0 chunk", b"4\r\nWiki\r\n", CodecError::Truncated),
+            ("missing final blank line after 0 chunk", b"0\r\n", CodecError::Truncated),
+            ("empty input", b"", CodecError::Truncated),
+            ("chunk data not followed by CRLF", b"2\r\nabXY", CodecError::MissingCrlf),
+        ];
+        assert_table!(bad_chunk_cases, |idx, (name, raw, expected_err)| {
+            assert_eq!(decode_chunked_body(raw), Err(expected_err), "case #{idx} ({name})");
+        });
     }
 
     // header {"alg":"HS256","typ":"JWT"}, payload {"sub":"1234567890","name":"John Doe","iat":1516239022}
     const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
 
     #[test]
-    fn decodes_a_standard_jwt() {
+    fn jwt_and_timestamp_matrix() {
         let j = parse_jwt(JWT).unwrap();
         assert_eq!(j.alg.as_deref(), Some("HS256"));
         assert_eq!(j.typ.as_deref(), Some("JWT"));
@@ -541,131 +835,103 @@ mod tests {
         assert_eq!(j.signature_len, 32);
         assert_eq!(j.header_json, "{\n  \"alg\": \"HS256\",\n  \"typ\": \"JWT\"\n}");
         assert!(j.payload_json.contains("\n  \"name\": \"John Doe\""));
-        // keys stay in the token's order (serde_json preserve_order), not sorted
         let keys: Vec<&str> = j.payload_json.lines().filter_map(|l| l.trim().strip_prefix('"')?.split('"').next()).collect();
         assert_eq!(keys, ["sub", "name", "iat"]);
         assert_eq!(format!("{}.{}.{}", j.header_raw, j.payload_raw, j.signature_raw), JWT);
-        // "Bearer " and whitespace are accepted
         assert_eq!(parse_jwt(&format!("  Bearer {JWT}\n")).unwrap(), j);
         assert!(is_jwt(JWT));
-    }
 
-    #[test]
-    fn unpadded_segments_of_every_length() {
-        // payload lengths that leave 0, 1 and 2 bytes over: unpadded segments of every shape
-        for payload in [r#"{"a":1}"#, r#"{"ab":1}"#, r#"{"abc":1}"#] {
+        // Unpadded and padded segments of every mod-3 byte length
+        let segment_payloads = [r#"{"a":1}"#, r#"{"ab":1}"#, r#"{"abc":1}"#];
+        assert_table!(segment_payloads, |idx, payload| {
             let tok = format!("{}.{}.", base64url_encode(br#"{"alg":"none"}"#), base64url_encode(payload.as_bytes()));
-            let j = parse_jwt(&tok).unwrap_or_else(|| panic!("{tok}"));
-            assert_eq!(j.alg.as_deref(), Some("none"));
-            assert_eq!(j.signature_len, 0, "unsigned token");
-            // and with padding added back
+            let parsed = parse_jwt(&tok).unwrap_or_else(|| panic!("case #{idx}: {tok}"));
+            assert_eq!(parsed.alg.as_deref(), Some("none"));
+            assert_eq!(parsed.signature_len, 0, "case #{idx}: unsigned token");
             let padded = format!("{}=.{}.", base64url_encode(br#"{"alg":"none"}"#), base64url_encode(payload.as_bytes()));
             if base64url_encode(br#"{"alg":"none"}"#).len() % 4 != 0 {
-                assert!(parse_jwt(&padded).is_some());
+                assert!(parse_jwt(&padded).is_some(), "case #{idx}: padded segment accepted");
             }
-        }
-    }
+        });
 
-    #[test]
-    fn timestamps_and_claims() {
+        // Claims and timestamps
         let payload = r#"{"iss":"https://idp.test","aud":["api","web"],"exp":1700003600,"iat":1700000000,"nbf":1699999990.5,"jti":7}"#;
         let tok = format!("{}.{}.c2ln", base64url_encode(br#"{"alg":"RS256","kid":"k1"}"#), base64url_encode(payload.as_bytes()));
         let j = parse_jwt(&tok).unwrap();
         assert_eq!((j.exp, j.iat, j.nbf), (Some(1_700_003_600), Some(1_700_000_000), Some(1_699_999_990)));
         assert_eq!(j.kid.as_deref(), Some("k1"));
-        assert_eq!(j.claims, vec![("iss", "https://idp.test".to_string()), ("aud", "api, web".to_string()), ("jti", "7".to_string())]);
-        assert_eq!(format_unix_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
-        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(format_unix_utc(951_782_400), "2000-02-29 00:00:00 UTC"); // leap day
+        assert_eq!(
+            j.claims,
+            vec![("iss", "https://idp.test".to_string()), ("aud", "api, web".to_string()), ("jti", "7".to_string())]
+        );
+
+        let utc_cases = [
+            (1_700_000_000i64, "2023-11-14 22:13:20 UTC"),
+            (0, "1970-01-01 00:00:00 UTC"),
+            (951_782_400, "2000-02-29 00:00:00 UTC"),
+        ];
+        assert_table!(utc_cases, |idx, (ts, expected)| {
+            assert_eq!(format_unix_utc(ts), expected, "utc case #{idx}");
+        });
+
+        let duration_cases = [
+            (1i64, "1 second"),
+            (45, "45 seconds"),
+            (120, "2 minutes"),
+            (3600, "1 hour"),
+            (86_400 * 3, "3 days"),
+        ];
+        assert_table!(duration_cases, |idx, (secs, expected)| {
+            assert_eq!(duration_words(secs), expected, "duration case #{idx}");
+        });
+
         assert_eq!(expiry_status(1_700_003_600, 1_700_004_320), "Expired 12 minutes ago");
         assert_eq!(expiry_status(1_700_003_600, 1_699_996_400), "Valid for 2 hours");
-        assert_eq!(duration_words(1), "1 second");
-        assert_eq!(duration_words(86_400 * 3), "3 days");
     }
 
     #[test]
-    fn rejects_malformed_tokens() {
-        let h = base64url_encode(br#"{"alg":"HS256"}"#);
-        let p = base64url_encode(br#"{"sub":"x"}"#);
-        let err = |t: &str| parse_jwt_detailed(t).unwrap_err();
-        assert!(err("abc").contains("this has 1"));
-        assert!(err(&format!("{h}.{p}")).contains("this has 2"));
-        assert!(err(&format!("{h}.{p}.s.e.t")).contains("JWE"));
-        assert!(err(&format!(".{p}.sig")).contains("header is empty"));
-        assert!(err(&format!("{h}.{p}+.sig")).contains("payload isn't valid Base64URL"));
-        assert!(err(&format!("{}.{p}.sig", base64url_encode(b"not json"))).contains("header isn't JSON"));
-        assert!(err(&format!("{}.{p}.sig", base64url_encode(b"[1,2]"))).contains("JSON object"));
-        assert!(err(&format!("{h}.{}.sig", base64url_encode(b"\"just a string\""))).contains("JSON object"));
-        assert!(err(&format!("{h}.{p}.si+g")).contains("signature"));
-        assert!(!is_jwt("not.a.jwt"));
-    }
+    fn chunked_transfer_encoding_matrix() {
+        let valid_chunks: [(&str, &[u8], &[u8]); 5] = [
+            ("standard two-chunk body", b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", b"Wikipedia"),
+            (
+                "upper/lower hex, leading zeros, embedded CRLF",
+                b"0A\r\n0123456789\r\n004\r\na\r\nb\r\n0\r\n\r\n",
+                b"0123456789a\r\nb",
+            ),
+            ("empty zero-chunk body", b"0\r\n\r\n", b""),
+            ("trailing bytes after terminating chunk are ignored", b"1\r\nx\r\n0\r\n\r\nHTTP/1.1 200 OK", b"x"),
+            (
+                "chunk extensions and trailers are dropped",
+                b"1a;name=val\r\nabcdefghijklmnopqrstuvwxyz\r\n0;last\r\nX-Checksum: 9f\r\nX-Other: 1\r\n\r\n",
+                b"abcdefghijklmnopqrstuvwxyz",
+            ),
+        ];
+        assert_table!(valid_chunks, |idx, (name, raw, expected)| {
+            assert_eq!(decode_chunked_body(raw).unwrap(), expected, "case #{idx} ({name})");
+        });
 
-    #[test]
-    fn dechunks_standard_bodies() {
-        assert_eq!(decode_chunked_body(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(), b"Wikipedia");
-        // upper/lower-case hex, leading zeros, binary data containing CRLF
-        assert_eq!(decode_chunked_body(b"0A\r\n0123456789\r\n004\r\na\r\nb\r\n0\r\n\r\n").unwrap(), b"0123456789a\r\nb");
-        assert_eq!(decode_chunked_body(b"0\r\n\r\n").unwrap(), b"");
-        // anything after the terminating chunk isn't part of the body
-        assert_eq!(decode_chunked_body(b"1\r\nx\r\n0\r\n\r\nHTTP/1.1 200 OK").unwrap(), b"x");
-    }
-
-    #[test]
-    fn chunk_extensions_and_trailers_are_dropped() {
-        let body = "abcdefghijklmnopqrstuvwxyz";
-        let raw = format!("1a;name=val\r\n{body}\r\n0;last\r\nX-Checksum: 9f\r\nX-Other: 1\r\n\r\n");
-        assert_eq!(decode_chunked_body(raw.as_bytes()).unwrap(), body.as_bytes());
-    }
-
-    #[test]
-    fn bad_chunked_bodies_are_errors() {
-        assert!(matches!(decode_chunked_body(b"zz\r\nabc\r\n0\r\n\r\n"), Err(CodecError::BadChunkSize(_))));
-        assert!(matches!(decode_chunked_body(b"\r\n"), Err(CodecError::BadChunkSize(_))));
-        assert!(matches!(decode_chunked_body(b"-1\r\nx\r\n"), Err(CodecError::BadChunkSize(_))));
-        assert!(matches!(decode_chunked_body(b"ffffffffffffffffff\r\n"), Err(CodecError::BadChunkSize(_))));
-        // size larger than what's there
-        assert_eq!(decode_chunked_body(b"ffffffffffffffff\r\nab"), Err(CodecError::Truncated));
-        assert_eq!(decode_chunked_body(b"5\r\nab"), Err(CodecError::Truncated));
-        assert_eq!(decode_chunked_body(b"2\r\nab"), Err(CodecError::Truncated));
-        assert_eq!(decode_chunked_body(b"4\r\nWiki\r\n"), Err(CodecError::Truncated), "no terminating chunk");
-        assert_eq!(decode_chunked_body(b"0\r\n"), Err(CodecError::Truncated), "no final blank line");
-        assert_eq!(decode_chunked_body(b""), Err(CodecError::Truncated));
-        assert_eq!(decode_chunked_body(b"2\r\nabXY"), Err(CodecError::MissingCrlf));
-    }
-
-    #[test]
-    fn normalizes_chunked_responses() {
+        // Response normalization matrix
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: Chunked\r\nContent-Length: 999\r\nX-A: 1\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         let res = normalize_response(HttpResponse::parse(raw));
         assert_eq!(res.body, b"Wikipedia");
         assert_eq!(res.header("transfer-encoding"), None);
         assert_eq!(res.header("content-length"), Some("9"));
         assert_eq!(res.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).count(), 1);
-        assert_eq!(res.header("x-a"), Some("1"), "other headers kept");
+        assert_eq!(res.header("x-a"), Some("1"));
         assert_eq!(res.head_text(), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-A: 1\r\nContent-Length: 9\r\n\r\n");
-        // not chunked, other codings, or a body that doesn't decode: unchanged
-        for raw in [&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"[..], b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"] {
-            let parsed = HttpResponse::parse(raw);
-            assert_eq!(normalize_response(parsed.clone()), parsed);
-        }
-    }
 
-    #[test]
-    fn header_bytes_round_trip() {
-        // UTF-8 stays UTF-8
-        assert_eq!(decode_header_bytes("X-Name: café".as_bytes()), ("X-Name: café".to_string(), false));
-        // anything else: every byte maps to one char and back
-        let raw: Vec<u8> = (0u8..=255).collect();
-        let (text, latin1) = decode_header_bytes(&raw);
-        assert!(latin1);
-        assert_eq!(text.chars().count(), 256);
-        assert_eq!(encode_header_text(&text, true), raw);
-        // a char past U+00FF added to Latin-1 text (an Intercept edit) is written as UTF-8
-        assert_eq!(encode_header_text("a\u{e9}\u{263a}", true), [&b"a\xe9"[..], "\u{263a}".as_bytes()].concat());
-        // responses keep non-UTF-8 header bytes exactly
-        let res = HttpResponse::parse(b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=r\xe9sum\xe9.pdf\r\n\r\nbody");
-        assert!(res.latin1);
-        assert_eq!(res.head_bytes(), b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=r\xe9sum\xe9.pdf\r\n\r\n");
+        let unchanged_responses: [(&str, &[u8]); 4] = [
+            ("non-chunked Content-Length response", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),
+            (
+                "multiple transfer-encodings (gzip, chunked)",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+            ),
+            ("truncated chunked body", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"),
+            ("empty chunked body", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        ];
+        assert_table!(unchanged_responses, |idx, (name, raw_resp)| {
+            let parsed = HttpResponse::parse(raw_resp);
+            assert_eq!(normalize_response(parsed.clone()), parsed, "case #{idx} ({name})");
+        });
     }
 }

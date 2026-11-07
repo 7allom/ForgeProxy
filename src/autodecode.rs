@@ -140,43 +140,124 @@ fn readable(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     fn titles(s: &str) -> Vec<&'static str> {
         decode_cards(s).into_iter().map(|c| c.title).collect()
     }
 
-    #[test]
-    fn url_escapes() {
-        assert_eq!(url_decoded("a%20b%2Fc").unwrap().text, "a b/c");
-        assert_eq!(url_decoded("%E2%9C%93").unwrap().text, "✓");
-        assert!(url_decoded("plain+text").is_none(), "a plus alone isn't an escape");
-        assert!(url_decoded("100%").is_none());
+    /// Iteratively peel the highest-priority detected card from `decode_cards` until only the
+    /// raw `"Hex"` dump card remains (or a terminal card such as JWT / Unix timestamp is reached).
+    fn peel_autodecode_layers(input: &str) -> (Vec<&'static str>, String) {
+        let mut layers = Vec::new();
+        let mut cur = input.to_string();
+        for _ in 0..8 {
+            let cards = decode_cards(&cur);
+            let Some(top) = cards.first() else {
+                return (layers, String::new());
+            };
+            if top.title == "Hex" {
+                break;
+            }
+            layers.push(top.title);
+            cur = top.text.clone();
+            if top.title == "JWT" || top.title.starts_with("Unix timestamp") {
+                break;
+            }
+        }
+        (layers, cur)
     }
 
     #[test]
-    fn base64_variants() {
-        assert_eq!(base64("aGVsbG8gd29ybGQ=").unwrap(), Card { title: "Base64 decoded", text: "hello world".into() });
-        assert_eq!(base64("aGVsbG8gd29ybGQ").unwrap().text, "hello world", "unpadded");
-        // "??>" encodes to "Pz8-" in Base64URL
-        assert_eq!(base64("Pz8-Pz8-").unwrap(), Card { title: "Base64URL decoded", text: "??>??>".into() });
-        assert!(base64("password").is_none(), "decodes to binary, not text");
-        assert!(base64("deadbeefcafe").is_none(), "hex strings aren't treated as Base64");
-        assert!(base64("abc").is_none(), "too short");
-        assert!(base64("aGVsbG8=d29y").is_none(), "padding in the middle");
-        assert!(base64("a+b-cdefgh").is_none(), "mixed alphabets");
+    fn autodecode_detection_and_multilayer_matrix() {
+        // Multi-layer chain: "hello world" -> Base64 ("aGVsbG8gd29ybGQ=") -> Hex -> URL-encoded
+        let b64_hello = "aGVsbG8gd29ybGQ=";
+        let hex_of_b64 = crate::codec::hex_encode(b64_hello.as_bytes());
+        let url_of_hex_of_b64 = crate::codec::url_encode(&hex_of_b64, true);
+
+        // Multi-layer chain: "a b/c" -> URL ("a%20b%2Fc") -> Base64
+        let b64_of_url = crate::codec::base64_encode(b"a%20b%2Fc", false, true);
+
+        let cases: Vec<(&str, String, Vec<&str>, &str)> = vec![
+            // Single-layer encodings
+            ("URL-escaped spaces and slash", "a%20b%2Fc".into(), vec!["URL decoded"], "a b/c"),
+            ("URL-escaped UTF-8 checkmark", "%E2%9C%93".into(), vec!["URL decoded"], "✓"),
+            ("URL-escaped key=value", "a%3Db".into(), vec!["URL decoded"], "a=b"),
+            ("Base64 padded", "aGVsbG8gd29ybGQ=".into(), vec!["Base64 decoded"], "hello world"),
+            ("Base64 unpadded", "aGVsbG8gd29ybGQ".into(), vec!["Base64 decoded"], "hello world"),
+            ("Base64URL ('??>??>')", "Pz8-Pz8-".into(), vec!["Base64URL decoded"], "??>??>"),
+            ("Hex lower-case", "68656c6c6f".into(), vec!["Hex decoded"], "hello"),
+            ("Hex with 0x prefix and space", "0x6869 6869".into(), vec!["Hex decoded"], "hihi"),
+            (
+                "Unix timestamp (10-digit seconds)",
+                "1700000000".into(),
+                vec!["Unix timestamp (seconds)"],
+                "2023-11-14 22:13:20 UTC",
+            ),
+            (
+                "Unix timestamp (13-digit milliseconds)",
+                "1700000000123".into(),
+                vec!["Unix timestamp (milliseconds)"],
+                "2023-11-14 22:13:20.123 UTC",
+            ),
+            // Nested multi-layer chains
+            (
+                "3-layer chain: URL -> Hex -> Base64",
+                url_of_hex_of_b64,
+                vec!["URL decoded", "Hex decoded", "Base64 decoded"],
+                "hello world",
+            ),
+            (
+                "2-layer chain: Base64 -> URL",
+                b64_of_url,
+                vec!["Base64 decoded", "URL decoded"],
+                "a b/c",
+            ),
+            // Un-encoded plain text & binary fallbacks
+            ("plain text word 'admin'", "admin".into(), vec![], "admin"),
+            ("plain 5-digit number '12345'", "12345".into(), vec![], "12345"),
+            ("plain text with literal plus", "plain+text".into(), vec![], "plain+text"),
+            ("empty string", "".into(), vec![], ""),
+            ("whitespace-only string", "   ".into(), vec![], ""),
+            ("binary control characters", "\u{0}\u{1}\u{fffd}".into(), vec![], "\u{0}\u{1}\u{fffd}"),
+        ];
+
+        assert_table!(cases, |idx, (name, encoded_input, expected_detected_layers, expected_final_plaintext)| {
+            let (detected_layers, final_plaintext) = peel_autodecode_layers(&encoded_input);
+            assert_eq!(
+                detected_layers, expected_detected_layers,
+                "case #{idx} ({name}) detected layers mismatch"
+            );
+            assert_eq!(
+                final_plaintext, expected_final_plaintext,
+                "case #{idx} ({name}) final plaintext mismatch"
+            );
+        });
     }
 
     #[test]
-    fn timestamps() {
-        assert_eq!(timestamp("1700000000").unwrap().text, "2023-11-14 22:13:20 UTC");
-        assert_eq!(timestamp("1700000000123").unwrap().text, "2023-11-14 22:13:20.123 UTC");
-        assert!(timestamp("170000000").is_none());
-        assert!(timestamp("17000000001").is_none());
-        assert!(timestamp("17000000x0").is_none());
-    }
+    fn autodecode_rejection_and_edge_case_matrix() {
+        // Negative / rejection cases across individual detectors so ordinary tokens never produce noise
+        let rejection_cases: [(&str, &str, Vec<&str>); 12] = [
+            ("plus alone is not a URL escape", "plain+text", vec!["Hex"]),
+            ("trailing percent is not a URL escape", "100%", vec!["Hex"]),
+            ("8-char word decoding to binary is not Base64", "password", vec!["Hex"]),
+            ("pure hex string is not treated as Base64", "deadbeefcafe", vec!["Hex"]),
+            ("short (<8 chars) token is not Base64", "abc", vec!["Hex"]),
+            ("Base64 with padding in the middle is rejected", "aGVsbG8=d29y", vec!["Hex"]),
+            ("Base64 with mixed + and - alphabets is rejected", "a+b-cdefgh", vec!["Hex"]),
+            ("9-digit number is not a timestamp", "170000000", vec!["Hex"]),
+            ("11-digit number is not a timestamp", "17000000001", vec!["Hex"]),
+            ("10-char alphanumeric is not a timestamp", "17000000x0", vec!["Hex"]),
+            ("non-JSON 3-part dot string is not a JWT", "a.b.c", vec!["Hex"]),
+            ("non-printable hex bytes (00ff00ff) are not Hex decoded", "00ff00ff", vec!["Hex"]),
+        ];
 
-    #[test]
-    fn jwts() {
+        assert_table!(rejection_cases, |idx, (name, input, expected_titles)| {
+            assert_eq!(titles(input), expected_titles, "case #{idx} ({name})");
+        });
+
+        // JWT card formatting (including Bearer prefix) and Hex dump truncation
         let h = crate::codec::base64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let c = crate::codec::base64url_encode(br#"{"sub":"42","exp":1700000000}"#);
         let token = format!("{h}.{c}.c2ln");
@@ -184,29 +265,9 @@ mod tests {
         assert!(card.text.contains("\"alg\": \"HS256\""), "{}", card.text);
         assert!(card.text.contains("\"sub\": \"42\""));
         assert!(card.text.contains("exp: 2023-11-14 22:13:20 UTC"));
-        assert!(jwt("a.b.c").is_none());
         assert_eq!(titles(&token)[0], "JWT");
-    }
 
-    #[test]
-    fn hex() {
-        assert_eq!(hex_decoded("68656c6c6f").unwrap().text, "hello");
-        assert_eq!(hex_decoded("0x6869 6869").unwrap().text, "hihi");
-        assert!(hex_decoded("abc").is_none());
-        assert!(hex_decoded("00ff00ff").is_none(), "not readable");
         assert_eq!(hex_of("Hi").text, "48 69");
         assert!(hex_of(&"x".repeat(300)).text.ends_with("… (300 bytes)"));
-    }
-
-    #[test]
-    fn plain_values_only_get_hex() {
-        assert_eq!(titles("admin"), ["Hex"]);
-        assert_eq!(titles("12345"), ["Hex"]);
-        assert!(decode_cards("").is_empty());
-        assert!(decode_cards("   ").is_empty());
-        // binary-looking text never panics
-        assert_eq!(titles("\u{0}\u{1}\u{fffd}"), ["Hex"]);
-        assert_eq!(titles("1700000000"), ["Unix timestamp (seconds)", "Hex"]);
-        assert_eq!(titles("a%3Db"), ["URL decoded", "Hex"]);
     }
 }

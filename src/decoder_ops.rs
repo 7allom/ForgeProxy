@@ -193,23 +193,191 @@ pub fn smart_decode(data: &[u8]) -> Vec<(Codec, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
+
     #[test]
-    fn round_trips() {
-        for c in Codec::ALL {
-            let e = encode(c, b"Hi there <&>");
-            assert_eq!(decode(c, &e).unwrap(), b"Hi there <&>", "{c:?}");
-        }
+    fn hash_algorithms_matrix() {
+        let cases: [(&str, &[u8], Hash, &str); 12] = [
+            // "abc" standard test vectors
+            ("MD5('abc')", b"abc", Hash::Md5, "900150983cd24fb0d6963f7d28e17f72"),
+            ("SHA-1('abc')", b"abc", Hash::Sha1, "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "SHA-224('abc')",
+                b"abc",
+                Hash::Sha224,
+                "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7",
+            ),
+            (
+                "SHA-256('abc')",
+                b"abc",
+                Hash::Sha256,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "SHA-384('abc')",
+                b"abc",
+                Hash::Sha384,
+                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+            ),
+            (
+                "SHA-512('abc')",
+                b"abc",
+                Hash::Sha512,
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            ),
+            // Empty input standard test vectors
+            ("MD5('')", b"", Hash::Md5, "d41d8cd98f00b204e9800998ecf8427e"),
+            ("SHA-1('')", b"", Hash::Sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            (
+                "SHA-224('')",
+                b"",
+                Hash::Sha224,
+                "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f",
+            ),
+            (
+                "SHA-256('')",
+                b"",
+                Hash::Sha256,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "SHA-384('')",
+                b"",
+                Hash::Sha384,
+                "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+            ),
+            (
+                "SHA-512('')",
+                b"",
+                Hash::Sha512,
+                "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+            ),
+        ];
+
+        assert_table!(cases, |idx, (name, input, algo, expected_hex_digest)| {
+            let got = String::from_utf8(hash(algo, input)).unwrap();
+            assert_eq!(got, expected_hex_digest, "case #{idx} ({name})");
+            assert!(!algo.label().is_empty(), "case #{idx} ({name}) label");
+        });
     }
+
     #[test]
-    fn hashes() {
-        assert_eq!(String::from_utf8(hash(Hash::Md5, b"abc")).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(String::from_utf8(hash(Hash::Sha1, b"abc")).unwrap(), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    fn decoder_ops_round_trips_and_text_byte_operations_matrix() {
+        let payloads: [(&str, &[u8]); 3] = [
+            ("ASCII with HTML/URL specials", b"Hi there <&>"),
+            ("credentials with punctuation", b"admin:p@ssw0rd!#?"),
+            ("UTF-8 multibyte text", "üñí ✓".as_bytes()),
+        ];
+
+        assert_table!(payloads, |idx, (name, payload)| {
+            for c in Codec::ALL {
+                let encoded = encode(c, payload);
+                let decoded = decode(c, &encoded).unwrap_or_else(|| panic!("case #{idx} ({name}) decode {c:?}"));
+                assert_eq!(decoded, payload, "case #{idx} ({name}) round-trip {c:?}");
+                assert!(!c.label().is_empty());
+            }
+        });
+
+        // Text & byte operation matrix: case switching, whitespace manipulation, prefix/offset handling, and malformed rejection
+        let op_cases: [(&str, Codec, &[u8], Option<&[u8]>); 15] = [
+            ("AsciiHex uppercase hex", Codec::AsciiHex, b"48454C4C4F", Some(b"HELLO")),
+            ("AsciiHex mixed-case with spaces and newlines", Codec::AsciiHex, b"  48 65\n6c 6C 6f\t", Some(b"Hello")),
+            ("AsciiHex odd nibble count rejected", Codec::AsciiHex, b"486", None),
+            ("AsciiHex non-hex character rejected", Codec::AsciiHex, b"48zz", None),
+            ("Hex with \\x prefix and mixed case", Codec::Hex, b"\\x48\\x69\\x2A", Some(b"Hi*")),
+            ("Hex with 0x prefix and spaces", Codec::Hex, b"0x48 0x69", Some(b"Hi")),
+            ("Octal escape sequence with whitespace", Codec::Octal, b" \\110\\151\\041 ", Some(b"Hi!")),
+            ("Octal out-of-u8-range rejected", Codec::Octal, b"\\777", None),
+            ("Binary space-separated 8-bit groups", Codec::Binary, b"01001000 01101001", Some(b"Hi")),
+            ("Binary contiguous bit stream", Codec::Binary, b"0100100001101001", Some(b"Hi")),
+            ("Binary non-byte-aligned length rejected", Codec::Binary, b"0100100", None),
+            ("Binary empty input rejected", Codec::Binary, b"   ", None),
+            ("Base64 with surrounding whitespace", Codec::Base64, b"  SGk= \n", Some(b"Hi")),
+            ("Base64Url unpadded", Codec::Base64Url, b"SGk", Some(b"Hi")),
+            ("Base64Url rejects standard '+' char", Codec::Base64Url, b"SGk+", None),
+        ];
+
+        assert_table!(op_cases, |idx, (name, codec, input, expected)| {
+            assert_eq!(decode(codec, input).as_deref(), expected, "case #{idx} ({name})");
+        });
     }
+
     #[test]
-    fn smart_decodes_layers() {
-        // base64 of the URL-encoded text "a b"
-        let layers = smart_decode(b"YSUyMGI=");
-        assert_eq!(layers.last().unwrap().1, b"a b");
-        assert_eq!(layers.len(), 2);
+    fn smart_decode_multilayer_matrix() {
+        // Build nested multi-layer fixtures
+        // 1. URL -> AsciiHex -> Base64 ("secret: 1")
+        let b64_secret = encode(Codec::Base64, b"secret: 1");
+        let hex_b64_secret = encode(Codec::AsciiHex, &b64_secret);
+        let url_hex_b64_secret = encode(Codec::Url, &hex_b64_secret);
+
+        // 2. Gzip -> Base64 -> Url ("a b")
+        let url_ab = encode(Codec::Url, b"a b");
+        let b64_url_ab = encode(Codec::Base64, &url_ab);
+        let gzip_b64_url_ab = encode(Codec::Gzip, &b64_url_ab);
+
+        let cases: Vec<(&str, Vec<u8>, Vec<Codec>, &[u8])> = vec![
+            (
+                "2-layer Base64 -> URL ('a b')",
+                b"YSUyMGI=".to_vec(),
+                vec![Codec::Base64, Codec::Url],
+                b"a b",
+            ),
+            (
+                "3-layer URL -> AsciiHex -> Base64 ('secret: 1')",
+                url_hex_b64_secret,
+                vec![Codec::Url, Codec::AsciiHex, Codec::Base64],
+                b"secret: 1",
+            ),
+            (
+                "3-layer Gzip -> Base64 -> URL ('a b')",
+                gzip_b64_url_ab,
+                vec![Codec::Gzip, Codec::Base64, Codec::Url],
+                b"a b",
+            ),
+            (
+                "single-layer HTML entities",
+                b"&lt;script&gt;".to_vec(),
+                vec![Codec::Html],
+                b"<script>",
+            ),
+            (
+                "single-layer \\x Hex escapes",
+                b"\\x6f\\x6b".to_vec(),
+                vec![Codec::Hex],
+                b"ok",
+            ),
+            (
+                "single-layer Binary bits",
+                b"0100111101001011".to_vec(),
+                vec![Codec::Binary],
+                b"OK",
+            ),
+            (
+                "un-encoded plain text produces 0 layers",
+                b"hello plain world".to_vec(),
+                vec![],
+                b"hello plain world",
+            ),
+            (
+                "empty input produces 0 layers",
+                b"".to_vec(),
+                vec![],
+                b"",
+            ),
+        ];
+
+        assert_table!(cases, |idx, (name, encoded_input, expected_detected_layers, expected_final_plaintext)| {
+            let layers = smart_decode(&encoded_input);
+            let detected_codecs: Vec<Codec> = layers.iter().map(|(c, _)| *c).collect();
+            let final_bytes = layers.last().map(|(_, b)| b.as_slice()).unwrap_or(encoded_input.as_slice());
+            assert_eq!(
+                detected_codecs, expected_detected_layers,
+                "case #{idx} ({name}) detected layers mismatch"
+            );
+            assert_eq!(
+                final_bytes, expected_final_plaintext,
+                "case #{idx} ({name}) final plaintext mismatch"
+            );
+        });
     }
 }
