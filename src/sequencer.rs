@@ -495,172 +495,386 @@ pub fn analyse_with_format(raw: &[String], format: TokenFormat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn extracts_cookie_field_and_regex() {
-        let r = "HTTP/1.1 200 OK\nSet-Cookie: sid=abc123; Path=/\n\n<input name=\"csrf\" value=\"tok9\">";
-        assert_eq!(extract(r, 0, "sid"), Some("abc123".into()));
-        assert_eq!(extract(r, 1, "csrf"), Some("tok9".into()));
-        assert_eq!(extract(r, 2, r#"value="(\w+)""#), Some("tok9".into()));
-    }
-    #[test]
-    fn extract_token_from_each_location() {
-        let r = "HTTP/1.1 200 OK\nSet-Cookie: sid=abc123; Path=/\nX-Token: hdr-value\n\nbody tok=zzz9";
-        assert_eq!(extract_token(&TokenLocation::Cookie("sid".into()), r), Some("abc123".into()));
-        assert_eq!(extract_token(&TokenLocation::Header("X-Token".into()), r), Some("hdr-value".into()));
-        assert_eq!(extract_token(&TokenLocation::Regex(r"tok=(\w+)".into()), r), Some("zzz9".into()));
-        // a header name that isn't there, and the status line isn't treated as a header
-        assert_eq!(extract_token(&TokenLocation::Header("Missing".into()), r), None);
-        assert_eq!(extract_token(&TokenLocation::Header("HTTP/1.1".into()), r), None);
-    }
+    use crate::test_utils::assert_table;
 
-    #[test]
-    fn repeated_tokens_have_no_entropy() {
-        let t: Vec<String> = (0..50).map(|_| "AAAA".to_string()).collect();
-        let a = analyze_tokens(&t).unwrap();
-        assert_eq!(a.sample_count, 50);
-        assert_eq!((a.min_len, a.max_len), (4, 4));
-        assert!(a.overall_entropy < 1e-9, "entropy {}", a.overall_entropy);
-        assert!(a.per_char_entropy.iter().all(|&e| e < 1e-9));
-        assert_eq!(a.char_distribution.get(&'A'), Some(&200));
-        // "AAAA" is hex, decoding to 0xAA = 10101010 (balanced), so monobit passes even though
-        // the tokens are identical — monobit alone cannot detect the absence of entropy
-        assert!(a.fips_monobit_passed);
-    }
-
-    #[test]
-    fn hex_tokens_are_decoded_for_monobit() {
-        // raw ASCII hex is bit-biased and would falsely fail monobit; decoding to bytes fixes it.
-        // "a5" -> 0xA5 = 10100101 (balanced) -> passes
-        let balanced: Vec<String> = (0..20).map(|_| "a5a5".to_string()).collect();
-        let a = analyze_tokens(&balanced).unwrap();
-        assert!((a.monobit_ratio - 0.5).abs() < 1e-9, "ratio {}", a.monobit_ratio);
-        assert!(a.fips_monobit_passed);
-        // "ff" -> 0xFF = 11111111 (all ones) -> fails
-        let skewed: Vec<String> = (0..20).map(|_| "ffff".to_string()).collect();
-        let a = analyze_tokens(&skewed).unwrap();
-        assert!((a.monobit_ratio - 1.0).abs() < 1e-9, "ratio {}", a.monobit_ratio);
-        assert!(!a.fips_monobit_passed);
-    }
-
-    #[test]
-    fn base64_tokens_are_decoded_for_monobit() {
-        // "qg==" decodes to a single 0xAA byte (balanced); not all hex, so the Base64 path runs
-        let t: Vec<String> = (0..40).map(|_| "qg==".to_string()).collect();
-        let a = analyze_tokens(&t).unwrap();
-        assert!((a.monobit_ratio - 0.5).abs() < 1e-9, "ratio {}", a.monobit_ratio);
-        assert!(a.fips_monobit_passed);
-    }
-
-    #[test]
-    fn urlsafe_unpadded_base64_tokens_are_decoded() {
-        // Google AEC-style tokens: ~99 chars, URL-safe alphabet ('-' and '_'), no '=' padding,
-        // length not a multiple of 4. These must be decoded, not read as raw ASCII (which is
-        // bit-biased and would falsely fail monobit around 0.46).
-        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut x: u64 = 0x9E3779B97F4A7C15;
-        let t: Vec<String> = (0..300)
-            .map(|_| (0..99).map(|_| {
-                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-                ALPHA[(x as usize) % ALPHA.len()] as char
-            }).collect())
-            .collect();
-        assert_eq!(t[0].len(), 99, "unpadded, not a multiple of 4");
-        assert!(t.iter().any(|s| s.contains('-') || s.contains('_')), "corpus exercises URL-safe chars");
-        let a = analyze_tokens(&t).unwrap();
-        assert!(a.fips_monobit_passed, "decoded random bytes should pass monobit: ratio {}", a.monobit_ratio);
-    }
-
-    #[test]
-    fn random_hex_approaches_full_entropy() {
-        let mut x: u64 = 0x2545F4914F6CDD1D;
-        let t: Vec<String> = (0..2000)
-            .map(|_| (0..16).map(|_| {
-                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-                b"0123456789abcdef"[(x % 16) as usize] as char
-            }).collect())
-            .collect();
-        let a = analyze_tokens(&t).unwrap();
-        assert!((a.max_possible_entropy - 4.0).abs() < 1e-9, "alphabet {}", a.max_possible_entropy);
-        assert!(a.overall_entropy > 3.9, "entropy {}", a.overall_entropy);
-        assert_eq!(entropy_rating(a.overall_entropy, a.max_possible_entropy), "Excellent");
-        // decoded to random bytes, the bitstream is balanced and passes monobit (raw ASCII hex
-        // would have come in around 0.44 and failed)
-        assert!(a.fips_monobit_passed, "ratio {}", a.monobit_ratio);
-    }
-
-    #[test]
-    fn sequential_tokens_have_low_leading_entropy() {
-        let t: Vec<String> = (0..1000).map(|i| format!("{i:08}")).collect();
-        let a = analyze_tokens(&t).unwrap();
-        // the leading digits are almost always '0'; the last digit cycles 0-9
-        assert!(a.per_char_entropy[0] < a.per_char_entropy[7], "{:?}", a.per_char_entropy);
-        assert_eq!(entropy_rating(a.overall_entropy, a.max_possible_entropy), "Poor");
-    }
-
-    #[test]
-    fn repeated_tokens_are_poor() {
-        let t: Vec<String> = (0..150).map(|_| "aaaa".to_string()).collect();
-        assert!(analyse(&t).contains("poor"));
-    }
-    #[test]
-    fn needs_100_tokens() {
-        let t: Vec<String> = (0..99).map(|i| format!("{i:04x}")).collect();
-        assert!(analyse(&t).starts_with("At least 100 tokens"));
-    }
-    #[test]
-    fn random_tokens_score_well() {
-        let mut x: u64 = 0x2545F4914F6CDD1D;
-        let t: Vec<String> = (0..5000).map(|_| {
-            (0..16).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"0123456789abcdef"[(x % 16) as usize] as char }).collect()
-        }).collect();
-        let r = analyse(&t);
-        assert!(r.contains("excellent"), "{r}");
-    }
-    #[test]
-    fn counter_tokens_score_poorly() {
-        let t: Vec<String> = (0..2000).map(|i| format!("{i:08}")).collect();
-        let r = analyse(&t);
-        assert!(!r.contains("excellent") && !r.contains("good"), "{r}");
-    }
-
-    #[test]
-    fn token_format_auto_and_ascii_avoid_fips_monobit_false_negative() {
-        // 62-char alphanumeric tokens (A-Za-z0-9, max entropy log2(62) = 5.95 bits)
-        const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let mut x: u64 = 0x517CC1B727220A95;
-        let t: Vec<String> = (0..300)
+    fn prng_tokens(count: usize, len: usize, alphabet: &[u8], seed: u64) -> Vec<String> {
+        let mut x = seed;
+        (0..count)
             .map(|_| {
-                (0..24)
+                (0..len)
                     .map(|_| {
                         x ^= x << 13;
                         x ^= x >> 7;
                         x ^= x << 17;
-                        ALPHANUM[(x as usize) % ALPHANUM.len()] as char
+                        alphabet[(x as usize) % alphabet.len()] as char
                     })
                     .collect()
             })
+            .collect()
+    }
+
+    #[test]
+    fn token_format_and_preprocessing_matrix() {
+        const ALPHANUM_62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        const B64_URL_64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let base62_sample = prng_tokens(300, 24, ALPHANUM_62, 0x517CC1B727220A95);
+        let urlsafe_b64_sample = prng_tokens(300, 99, B64_URL_64, 0x9E3779B97F4A7C15);
+        let hex_balanced: Vec<String> = (0..120).map(|_| "a5a5".to_string()).collect();
+        let std_b64_padded: Vec<String> = (0..120).map(|_| "qg==".to_string()).collect();
+        let invalid_hex: Vec<String> = (0..120).map(|_| "a5g".to_string()).collect();
+        let invalid_b64: Vec<String> = (0..120).map(|_| "tok!@#".to_string()).collect();
+
+        struct FormatCase<'a> {
+            name: &'a str,
+            tokens: &'a [String],
+            setting: TokenFormat,
+            expected_resolved: TokenFormat,
+            expected_fips_applicable: bool,
+            expected_monobit_pass: bool,
+        }
+
+        let cases = [
+            FormatCase {
+                name: "Auto on 62-char alphanumeric resolves to Ascii and marks FIPS N/A",
+                tokens: &base62_sample,
+                setting: TokenFormat::Auto,
+                expected_resolved: TokenFormat::Ascii,
+                expected_fips_applicable: false,
+                expected_monobit_pass: false,
+            },
+            FormatCase {
+                name: "Auto on even-length hex resolves to Hex and runs FIPS",
+                tokens: &hex_balanced,
+                setting: TokenFormat::Auto,
+                expected_resolved: TokenFormat::Hex,
+                expected_fips_applicable: true,
+                expected_monobit_pass: true,
+            },
+            FormatCase {
+                name: "Explicit Ascii on hex tokens overrides to Ascii and skips FIPS",
+                tokens: &hex_balanced,
+                setting: TokenFormat::Ascii,
+                expected_resolved: TokenFormat::Ascii,
+                expected_fips_applicable: false,
+                expected_monobit_pass: false,
+            },
+            FormatCase {
+                name: "Explicit Hex on hex tokens resolves to Hex and runs FIPS",
+                tokens: &hex_balanced,
+                setting: TokenFormat::Hex,
+                expected_resolved: TokenFormat::Hex,
+                expected_fips_applicable: true,
+                expected_monobit_pass: true,
+            },
+            FormatCase {
+                name: "Auto on standard padded Base64 ('qg==') resolves to Base64",
+                tokens: &std_b64_padded,
+                setting: TokenFormat::Auto,
+                expected_resolved: TokenFormat::Base64,
+                expected_fips_applicable: true,
+                expected_monobit_pass: true,
+            },
+            FormatCase {
+                name: "Auto on 99-char unpadded URL-safe Base64 resolves to Base64 and passes monobit",
+                tokens: &urlsafe_b64_sample,
+                setting: TokenFormat::Auto,
+                expected_resolved: TokenFormat::Base64,
+                expected_fips_applicable: true,
+                expected_monobit_pass: true,
+            },
+            FormatCase {
+                name: "Explicit Hex on odd/non-hex tokens falls back to Ascii",
+                tokens: &invalid_hex,
+                setting: TokenFormat::Hex,
+                expected_resolved: TokenFormat::Ascii,
+                expected_fips_applicable: false,
+                expected_monobit_pass: false,
+            },
+            FormatCase {
+                name: "Explicit Base64 on punctuation tokens falls back to Ascii",
+                tokens: &invalid_b64,
+                setting: TokenFormat::Base64,
+                expected_resolved: TokenFormat::Ascii,
+                expected_fips_applicable: false,
+                expected_monobit_pass: false,
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let a = analyze_tokens_with_format(case.tokens, case.setting).unwrap();
+            assert_eq!(a.detected_format, case.expected_resolved, "case #{idx} ({}) format", case.name);
+            assert_eq!(a.fips_applicable, case.expected_fips_applicable, "case #{idx} ({}) fips_applicable", case.name);
+            assert_eq!(a.fips_monobit_passed, case.expected_monobit_pass, "case #{idx} ({}) monobit pass", case.name);
+            let report = analyse_with_format(case.tokens, case.setting);
+            if case.expected_fips_applicable {
+                assert!(report.contains("Bit-level FIPS tests, bit positions passing"), "case #{idx} ({}) report", case.name);
+            } else {
+                assert!(
+                    report.contains("N/A (ASCII text - rely on Shannon entropy)"),
+                    "case #{idx} ({}) N/A report: {report}",
+                    case.name
+                );
+            }
+        });
+
+        // Token extraction matrix (Cookie, Header, Form/JSON field, Regex)
+        let resp = "HTTP/1.1 200 OK\nSet-Cookie: sid=abc123; Path=/\nX-Token: hdr-value\n\n<input name=\"csrf\" value=\"tok9\"> body tok=zzz9";
+        let extract_cases: [(&str, Option<String>, Option<&str>); 7] = [
+            ("extract location 0 (Set-Cookie)", extract(resp, 0, "sid"), Some("abc123")),
+            ("extract location 1 (HTML input field)", extract(resp, 1, "csrf"), Some("tok9")),
+            ("extract location 2 (Regex capture)", extract(resp, 2, r#"value="(\w+)""#), Some("tok9")),
+            ("TokenLocation::Cookie", extract_token(&TokenLocation::Cookie("sid".into()), resp), Some("abc123")),
+            ("TokenLocation::Header", extract_token(&TokenLocation::Header("X-Token".into()), resp), Some("hdr-value")),
+            ("TokenLocation::Regex", extract_token(&TokenLocation::Regex(r"tok=(\w+)".into()), resp), Some("zzz9")),
+            ("TokenLocation::Header ignores missing and status line", extract_token(&TokenLocation::Header("HTTP/1.1".into()), resp), None),
+        ];
+        assert_table!(extract_cases, |idx, (name, got, expected)| {
+            assert_eq!(got.as_deref(), expected, "extract case #{idx} ({name})");
+        });
+    }
+
+    #[test]
+    fn entropy_verification_matrix() {
+        const HEX_16: &[u8] = b"0123456789abcdef";
+        const ALPHANUM_62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+        let static_tokens: Vec<String> = (0..150).map(|_| "AAAA".to_string()).collect();
+        let binary_alt: Vec<String> = (0..200).map(|i| if i % 2 == 0 { "01010101".into() } else { "10101010".into() }).collect();
+        let random_hex = prng_tokens(2000, 16, HEX_16, 0x2545F4914F6CDD1D);
+        let random_base62 = prng_tokens(1000, 24, ALPHANUM_62, 0x517CC1B727220A95);
+        // 256 distinct Unicode characters appearing uniformly -> 8.0 bits/char
+        let uniform_256: Vec<String> = (0..256)
+            .map(|b| std::iter::repeat(char::from_u32(0x0100 + b).unwrap()).take(8).collect())
             .collect();
 
-        // In Auto mode, pure alphanumeric text resolves to Ascii and skips flat byte-level FIPS monobit
-        let a = analyze_tokens_with_format(&t, TokenFormat::Auto).unwrap();
-        assert_eq!(a.detected_format, TokenFormat::Ascii);
-        assert!(!a.fips_applicable);
-        assert_eq!(format!("{:.2}", a.max_possible_entropy), "5.95");
-        assert_eq!(entropy_rating(a.overall_entropy, a.max_possible_entropy), "Excellent");
+        struct EntropyCase<'a> {
+            name: &'a str,
+            tokens: &'a [String],
+            expected_min_entropy: f64,
+            expected_max_entropy: f64,
+            expected_theoretical_max: f64,
+            expected_rating: &'a str,
+        }
 
-        let report = analyse_with_format(&t, TokenFormat::Auto);
-        assert!(report.contains("N/A (ASCII text - rely on Shannon entropy)"), "{report}");
+        let cases = [
+            EntropyCase {
+                name: "static repeated tokens have 0.0 bits entropy",
+                tokens: &static_tokens,
+                expected_min_entropy: 0.0,
+                expected_max_entropy: 1e-9,
+                expected_theoretical_max: 0.0,
+                expected_rating: "Poor",
+            },
+            EntropyCase {
+                name: "binary alternation has 1.0 bit entropy",
+                tokens: &binary_alt,
+                expected_min_entropy: 0.999,
+                expected_max_entropy: 1.001,
+                expected_theoretical_max: 1.0,
+                expected_rating: "Excellent",
+            },
+            EntropyCase {
+                name: "uniform 16-symbol hex approaches 4.0 bits",
+                tokens: &random_hex,
+                expected_min_entropy: 3.95,
+                expected_max_entropy: 4.001,
+                expected_theoretical_max: 4.0,
+                expected_rating: "Excellent",
+            },
+            EntropyCase {
+                name: "uniform 62-symbol Base62 approaches ~5.95 bits",
+                tokens: &random_base62,
+                expected_min_entropy: 5.90,
+                expected_max_entropy: 5.96,
+                expected_theoretical_max: 62.0_f64.log2(),
+                expected_rating: "Excellent",
+            },
+            EntropyCase {
+                name: "uniform 256-symbol distribution has exact 8.0 bits",
+                tokens: &uniform_256,
+                expected_min_entropy: 7.999,
+                expected_max_entropy: 8.001,
+                expected_theoretical_max: 8.0,
+                expected_rating: "Excellent",
+            },
+        ];
 
-        // Explicit Ascii on hex tokens also marks FIPS as N/A
-        let hex_toks: Vec<String> = (0..20).map(|_| "a5a5".to_string()).collect();
-        let ascii_override = analyze_tokens_with_format(&hex_toks, TokenFormat::Ascii).unwrap();
-        assert_eq!(ascii_override.detected_format, TokenFormat::Ascii);
-        assert!(!ascii_override.fips_applicable);
+        assert_table!(cases, |idx, case| {
+            let a = analyze_tokens(case.tokens).unwrap();
+            assert!(
+                a.overall_entropy >= case.expected_min_entropy && a.overall_entropy <= case.expected_max_entropy,
+                "case #{idx} ({}) entropy {} not in [{}..={}]",
+                case.name,
+                a.overall_entropy,
+                case.expected_min_entropy,
+                case.expected_max_entropy
+            );
+            assert!(
+                (a.max_possible_entropy - case.expected_theoretical_max).abs() < 1e-6,
+                "case #{idx} ({}) theoretical max {} != {}",
+                case.name,
+                a.max_possible_entropy,
+                case.expected_theoretical_max
+            );
+            assert_eq!(
+                entropy_rating(a.overall_entropy, a.max_possible_entropy),
+                case.expected_rating,
+                "case #{idx} ({}) rating",
+                case.name
+            );
+        });
 
-        // Explicit Hex on hex tokens decodes and runs FIPS
-        let hex_explicit = analyze_tokens_with_format(&hex_toks, TokenFormat::Hex).unwrap();
-        assert_eq!(hex_explicit.detected_format, TokenFormat::Hex);
-        assert!(hex_explicit.fips_applicable);
-        assert!(hex_explicit.fips_monobit_passed);
+        // Summary report quality checks
+        let short_99: Vec<String> = (0..99).map(|i| format!("{i:04x}")).collect();
+        assert!(analyse(&short_99).starts_with("At least 100 tokens"));
+        assert!(analyse(&static_tokens).contains("poor"));
+        let counter_2000: Vec<String> = (0..2000).map(|i| format!("{i:08}")).collect();
+        let counter_rep = analyse(&counter_2000);
+        assert!(!counter_rep.contains("excellent") && !counter_rep.contains("good"));
+        let random_5000 = prng_tokens(5000, 16, HEX_16, 0x2545F4914F6CDD1D);
+        assert!(analyse(&random_5000).contains("excellent"));
+    }
+
+    #[test]
+    fn fips_140_2_statistical_matrix() {
+        // Generate deterministic 20,000-bit streams for FIPS 140-2 (monobit, poker, runs, long run)
+        let mut x: u64 = 0x2545F4914F6CDD1D;
+        let prng_bits: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 1) as u8
+            })
+            .collect();
+        let all_ones = vec![1u8; 20_000];
+        let all_zeros = vec![0u8; 20_000];
+        let alternating: Vec<u8> = (0..20_000).map(|i| (i % 2) as u8).collect();
+        let mut long_run_bits = prng_bits.clone();
+        for b in &mut long_run_bits[100..126] {
+            *b = 1;
+        }
+
+        let bit_cases: [(&str, &[u8], (bool, bool, bool, bool)); 5] = [
+            ("PRNG 20,000-bit stream passes all 4 FIPS tests", &prng_bits, (true, true, true, true)),
+            ("all-1s stream fails Monobit, Poker, Runs, and Long Run", &all_ones, (false, false, false, false)),
+            ("all-0s stream fails Monobit, Poker, Runs, and Long Run", &all_zeros, (false, false, false, false)),
+            (
+                "alternating 0101... passes Monobit & Long Run, fails Poker & Runs",
+                &alternating,
+                (true, false, false, true),
+            ),
+            (
+                "PRNG stream with injected 26-bit run fails only Long Run",
+                &long_run_bits,
+                (true, true, true, false),
+            ),
+        ];
+
+        assert_table!(bit_cases, |idx, (name, seq, expected)| {
+            assert_eq!(fips(seq), expected, "FIPS bit case #{idx} ({name})");
+        });
+
+        // Token-level Monobit ratio table on decoded bytes
+        let monobit_token_cases: [(&str, &str, f64, bool); 4] = [
+            ("hex 'a5a5' (0xA5 = 10100101) has 0.50 monobit ratio and passes", "a5a5", 0.5, true),
+            ("hex 'AAAA' (0xAA = 10101010) has 0.50 monobit ratio and passes", "AAAA", 0.5, true),
+            ("hex 'ffff' (0xFF = 11111111) has 1.00 monobit ratio and fails", "ffff", 1.0, false),
+            ("base64 'qg==' (0xAA = 10101010) has 0.50 monobit ratio and passes", "qg==", 0.5, true),
+        ];
+        assert_table!(monobit_token_cases, |idx, (name, tok, expected_ratio, expected_pass)| {
+            let sample: Vec<String> = (0..40).map(|_| tok.to_string()).collect();
+            let a = analyze_tokens(&sample).unwrap();
+            assert!((a.monobit_ratio - expected_ratio).abs() < 1e-9, "case #{idx} ({name}) ratio {}", a.monobit_ratio);
+            assert_eq!(a.fips_monobit_passed, expected_pass, "case #{idx} ({name}) monobit pass");
+        });
+    }
+
+    #[test]
+    fn per_position_entropy_matrix() {
+        const HEX_16: &[u8] = b"0123456789abcdef";
+
+        // 1. Static prefix "TOKEN_" + 8 random hex chars
+        let random_suffixes = prng_tokens(1000, 8, HEX_16, 0x9E3779B97F4A7C15);
+        let prefixed: Vec<String> = random_suffixes.iter().map(|s| format!("TOKEN_{s}")).collect();
+
+        // 2. Sequential zero-padded 8-digit counters ("00000000".."00000999")
+        let sequential: Vec<String> = (0..1000).map(|i| format!("{i:08}")).collect();
+
+        // 3. Variable-length tokens ("TOKEN_" + 4..=8 random hex chars)
+        let variable_len: Vec<String> = random_suffixes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("TOKEN_{}", &s[..4 + (i % 5)]))
+            .collect();
+
+        struct PosCase<'a> {
+            name: &'a str,
+            tokens: &'a [String],
+            expected_min_len: usize,
+            expected_max_len: usize,
+            zero_entropy_positions: &'a [usize],
+            high_entropy_positions: &'a [usize],
+            min_high_entropy: f64,
+        }
+
+        let cases = [
+            PosCase {
+                name: "static 'TOKEN_' prefix has 0 entropy at 0..6 and ~4 bits at 6..14",
+                tokens: &prefixed,
+                expected_min_len: 14,
+                expected_max_len: 14,
+                zero_entropy_positions: &[0, 1, 2, 3, 4, 5],
+                high_entropy_positions: &[6, 7, 8, 9, 10, 11, 12, 13],
+                min_high_entropy: 3.9,
+            },
+            PosCase {
+                name: "sequential 8-digit counter has 0 entropy at 0..5 and ~3.32 bits at 5..8",
+                tokens: &sequential,
+                expected_min_len: 8,
+                expected_max_len: 8,
+                zero_entropy_positions: &[0, 1, 2, 3, 4],
+                high_entropy_positions: &[5, 6, 7],
+                min_high_entropy: 3.3,
+            },
+            PosCase {
+                name: "variable-length tokens (10..=14 chars) track min/max length and per-position entropy",
+                tokens: &variable_len,
+                expected_min_len: 10,
+                expected_max_len: 14,
+                zero_entropy_positions: &[0, 1, 2, 3, 4, 5],
+                high_entropy_positions: &[6, 7, 8, 9, 10, 11, 12, 13],
+                min_high_entropy: 3.8,
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let a = analyze_tokens(case.tokens).unwrap();
+            assert_eq!(
+                (a.min_len, a.max_len),
+                (case.expected_min_len, case.expected_max_len),
+                "case #{idx} ({}) min/max len",
+                case.name
+            );
+            assert_eq!(a.per_char_entropy.len(), case.expected_max_len, "case #{idx} ({}) position count", case.name);
+            for &pos in case.zero_entropy_positions {
+                assert!(
+                    a.per_char_entropy[pos] < 1e-9,
+                    "case #{idx} ({}) pos {pos} expected 0 entropy, got {}",
+                    case.name,
+                    a.per_char_entropy[pos]
+                );
+            }
+            for &pos in case.high_entropy_positions {
+                assert!(
+                    a.per_char_entropy[pos] >= case.min_high_entropy,
+                    "case #{idx} ({}) pos {pos} expected >= {}, got {}",
+                    case.name,
+                    case.min_high_entropy,
+                    a.per_char_entropy[pos]
+                );
+            }
+        });
     }
 }

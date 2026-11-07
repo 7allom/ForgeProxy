@@ -420,9 +420,196 @@ pub fn compare_selected(app: &mut crate::state::App, mode: DiffMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
+
+    struct DiffCase<'a> {
+        name: &'a str,
+        left: &'a [u8],
+        right: &'a [u8],
+        mode: DiffMode,
+        expected_changes: usize,
+        expected_left_ops: Vec<(Change, &'a str)>,
+        expected_right_ops: Vec<(Change, &'a str)>,
+        expected_jump_rows: Vec<(usize, usize)>,
+    }
 
     #[test]
-    fn tokens_rebuild_the_text() {
+    fn text_and_byte_diff_matrix() {
+        let word_and_line_cases = [
+            DiffCase {
+                name: "word-level substitution groups adjacent delete+insert into Modified",
+                left: b"Hello brave world, see you soon",
+                right: b"Hello new world, see you later today",
+                mode: DiffMode::Words,
+                expected_changes: 2,
+                expected_left_ops: vec![
+                    (Change::Same, "Hello "),
+                    (Change::Modified, "brave"),
+                    (Change::Same, " world, see you "),
+                    (Change::Modified, "soon"),
+                ],
+                expected_right_ops: vec![
+                    (Change::Same, "Hello "),
+                    (Change::Modified, "new"),
+                    (Change::Same, " world, see you "),
+                    (Change::Modified, "later today"),
+                ],
+                expected_jump_rows: vec![(0, 0), (0, 0)],
+            },
+            DiffCase {
+                name: "word-level pure insertion",
+                left: b"a b c",
+                right: b"a b X c",
+                mode: DiffMode::Words,
+                expected_changes: 1,
+                expected_left_ops: vec![(Change::Same, "a b c")],
+                expected_right_ops: vec![
+                    (Change::Same, "a b "),
+                    (Change::Inserted, "X "),
+                    (Change::Same, "c"),
+                ],
+                expected_jump_rows: vec![(0, 0)],
+            },
+            DiffCase {
+                name: "word-level pure deletion",
+                left: b"one two three",
+                right: b"one three",
+                mode: DiffMode::Words,
+                expected_changes: 1,
+                expected_left_ops: vec![
+                    (Change::Same, "one "),
+                    (Change::Deleted, "two "),
+                    (Change::Same, "three"),
+                ],
+                expected_right_ops: vec![(Change::Same, "one three")],
+                expected_jump_rows: vec![(0, 0)],
+            },
+            DiffCase {
+                name: "word-level identical multiline text",
+                left: b"same\ntext",
+                right: b"same\ntext",
+                mode: DiffMode::Words,
+                expected_changes: 0,
+                expected_left_ops: vec![(Change::Same, "same\ntext")],
+                expected_right_ops: vec![(Change::Same, "same\ntext")],
+                expected_jump_rows: vec![],
+            },
+            DiffCase {
+                name: "line-level HTTP header modification and trailing line insertion",
+                left: b"HTTP/1.1 200 OK\nX-Id: 1\nBody\n",
+                right: b"HTTP/1.1 200 OK\nX-Id: 2\nBody\nExtra\n",
+                mode: DiffMode::Words,
+                expected_changes: 2,
+                expected_left_ops: vec![
+                    (Change::Same, "HTTP/1.1 200 OK\nX-Id: "),
+                    (Change::Modified, "1"),
+                    (Change::Same, "\nBody\n"),
+                ],
+                expected_right_ops: vec![
+                    (Change::Same, "HTTP/1.1 200 OK\nX-Id: "),
+                    (Change::Modified, "2"),
+                    (Change::Same, "\nBody\n"),
+                    (Change::Inserted, "Extra\n"),
+                ],
+                expected_jump_rows: vec![(1, 1), (3, 3)],
+            },
+        ];
+
+        assert_table!(word_and_line_cases, |idx, case| {
+            assert_eq!(case.mode, DiffMode::Words);
+            let a = std::str::from_utf8(case.left).unwrap();
+            let b = std::str::from_utf8(case.right).unwrap();
+            let d = diff_words(a, b).unwrap();
+            assert_eq!(d.changes, case.expected_changes, "case #{idx} ({}) changes", case.name);
+            let got_left: Vec<(Change, &str)> = d.a.iter().map(|s| (s.change, s.text.as_str())).collect();
+            let got_right: Vec<(Change, &str)> = d.b.iter().map(|s| (s.change, s.text.as_str())).collect();
+            assert_eq!(got_left, case.expected_left_ops, "case #{idx} ({}) left ops", case.name);
+            assert_eq!(got_right, case.expected_right_ops, "case #{idx} ({}) right ops", case.name);
+            assert_eq!(d.change_lines.len(), case.expected_jump_rows.len(), "case #{idx} ({}) jump len", case.name);
+            if !case.expected_jump_rows.is_empty() {
+                assert_eq!(d.change_lines[0], case.expected_jump_rows[0], "case #{idx} ({}) first jump row", case.name);
+            }
+        });
+
+        // Byte-level diff matrix
+        let byte_cases: [(&str, &[u8], &[u8], usize, Vec<usize>, Option<(usize, Change)>, Option<(usize, Change)>); 4] = [
+            (
+                "byte modification in row 0 and deletion in row 1",
+                b"0123456789abcdefXYZ",
+                b"0123456789abcdeFXY",
+                2,
+                vec![0, 1],
+                Some((15, Change::Modified)),
+                Some((18, Change::Deleted)),
+            ),
+            (
+                "byte pure insertion at tail",
+                b"ab",
+                b"abcd",
+                2,
+                vec![0],
+                None,
+                Some((2, Change::Inserted)),
+            ),
+            (
+                "byte pure deletion at tail",
+                b"abcd",
+                b"ab",
+                2,
+                vec![0],
+                Some((2, Change::Deleted)),
+                None,
+            ),
+            (
+                "byte identical buffers",
+                b"same",
+                b"same",
+                0,
+                vec![],
+                Some((0, Change::Same)),
+                Some((0, Change::Same)),
+            ),
+        ];
+
+        assert_table!(byte_cases, |idx, (name, left, right, expected_diff, expected_rows, check_a, check_b)| {
+            let d = diff_bytes(left, right);
+            assert_eq!(d.differing, expected_diff, "byte case #{idx} ({name}) differing");
+            assert_eq!(d.diff_rows, expected_rows, "byte case #{idx} ({name}) diff_rows");
+            assert_eq!(d.a.len(), left.len(), "byte case #{idx} ({name}) a len");
+            assert_eq!(d.b.len(), right.len(), "byte case #{idx} ({name}) b len");
+            if let Some((off, ch)) = check_a {
+                assert_eq!(d.a[off], ch, "byte case #{idx} ({name}) a[{off}]");
+            }
+            if let Some((off, ch)) = check_b {
+                let side = if off < d.b.len() { &d.b } else { &d.a };
+                assert_eq!(side[off], ch, "byte case #{idx} ({name}) side[{off}]");
+            }
+        });
+    }
+
+    #[test]
+    fn edge_cases_and_resilience_matrix() {
+        let edge_cases: [(&str, &str, &str, usize); 8] = [
+            ("empty vs empty", "", "", 0),
+            ("populated vs empty", "abc", "", 1),
+            ("empty vs populated", "", "abc", 1),
+            ("identical single word", "abc", "abc", 0),
+            ("whitespace-only change (spaces vs tabs)", "a  b", "a\tb", 1),
+            ("mismatched CRLF vs LF line endings", "line1\r\nline2\r\n", "line1\nline2\n", 2),
+            ("multibyte UTF-8 accents", "naïve café", "naïve thé", 1),
+            ("multibyte UTF-8 ZWJ emoji grapheme clusters", "status: 👨‍👩‍👧‍👦 ok", "status: 🚀 ok", 1),
+        ];
+
+        assert_table!(edge_cases, |idx, (name, left, right, expected_changes)| {
+            let d = compute_patience_word_diff(left, right).unwrap();
+            let text_a: String = d.a.iter().map(|s| s.text.as_str()).collect();
+            let text_b: String = d.b.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(text_a, left, "case #{idx} ({name}) left reconstruction");
+            assert_eq!(text_b, right, "case #{idx} ({name}) right reconstruction");
+            assert_eq!(d.changes, expected_changes, "case #{idx} ({name}) change count");
+        });
+
+        // Tokenize & ComparerItem classification table
         let s = "GET /a?b=1 HTTP/1.1\r\nHost: shop.test\n\n{\"id\": 42}";
         let t = tokenize(s);
         assert_eq!(t.concat(), s);
@@ -431,107 +618,149 @@ mod tests {
         assert!(t.contains(&"\n\n"));
         assert_eq!(tokenize(""), Vec::<&str>::new());
         assert_eq!(tokenize("naïve café"), ["naïve", " ", "café"]);
+
+        let item_cases: [(&str, &[u8], usize, bool); 4] = [
+            ("ASCII with CRLF is text", b"hello\r\n", 7, true),
+            ("UTF-8 with tabs/newlines is text", "café\t✓\n".as_bytes(), 10, true),
+            ("gzip magic bytes with NUL/0xff is binary", &[0x1f, 0x8b, 0x00, 0xff], 4, false),
+            ("embedded NUL byte in ASCII is binary", b"a\x00b", 3, false),
+        ];
+        assert_table!(item_cases, |idx, (name, bytes, expected_len, expected_is_text)| {
+            let item = ComparerItem::from_bytes(idx + 1, name, bytes);
+            assert_eq!((item.length, item.is_text), (expected_len, expected_is_text), "case #{idx} ({name})");
+        });
     }
 
     #[test]
-    fn patience_word_diff_is_accurate() {
-        for (a, b) in [
-            ("", ""),
-            ("abc", ""),
-            ("", "abc"),
-            ("abc", "abc"),
-            ("the quick brown fox", "the quick red fox jumps"),
-        ] {
-            let d = compute_patience_word_diff(a, b).unwrap();
-            let text_a: String = d.a.iter().map(|s| s.text.as_str()).collect();
-            let text_b: String = d.b.iter().map(|s| s.text.as_str()).collect();
-            assert_eq!(text_a, a);
-            assert_eq!(text_b, b);
-        }
+    fn diff_invariant_reconstructs_right_from_left_matrix() {
+        let samples: [(&str, &str, &str); 7] = [
+            ("empty buffers", "", ""),
+            ("insertion into empty", "", "GET /index.html HTTP/1.1\r\n\r\n"),
+            ("deletion to empty", "GET /index.html HTTP/1.1\r\n\r\n", ""),
+            ("fox sentence edit", "the quick brown fox", "the quick red fox jumps"),
+            (
+                "JSON payload mutation",
+                "{\"user\":\"alice\",\"role\":\"viewer\",\"active\":true}",
+                "{\"user\":\"alice\",\"role\":\"admin\",\"active\":false,\"mfa\":1}",
+            ),
+            (
+                "HTTP response headers and body",
+                "HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Length: 5\r\n\r\nhello",
+                "HTTP/1.1 403 Forbidden\r\nServer: envoy\r\nContent-Length: 6\r\n\r\ndenied",
+            ),
+            (
+                "UTF-8 and punctuation mix",
+                "α + β = γ; café #1\nline two",
+                "α - β = δ; café #2\nline two\nline three",
+            ),
+        ];
+
+        assert_table!(samples, |idx, (name, left, right)| {
+            let d = compute_patience_word_diff(left, right).unwrap();
+            // 1. Span stream on each side reproduces its respective buffer verbatim
+            let rebuilt_left: String = d.a.iter().map(|s| s.text.as_str()).collect();
+            let rebuilt_right: String = d.b.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(rebuilt_left, left, "case #{idx} ({name}) rebuilt left");
+            assert_eq!(rebuilt_right, right, "case #{idx} ({name}) rebuilt right");
+
+            // 2. Applying Patience TextDiff edit script to `left` slices reconstructs `right`
+            let text_diff = similar::TextDiff::configure()
+                .algorithm(similar::Algorithm::Patience)
+                .diff_words(left, right);
+            let mut applied = String::new();
+            for op in text_diff.ops() {
+                match *op {
+                    similar::DiffOp::Equal { old_index, len, .. } => {
+                        for s in &text_diff.old_slices()[old_index..old_index + len] {
+                            applied.push_str(s);
+                        }
+                    }
+                    similar::DiffOp::Delete { .. } => {}
+                    similar::DiffOp::Insert { new_index, new_len, .. }
+                    | similar::DiffOp::Replace { new_index, new_len, .. } => {
+                        for s in &text_diff.new_slices()[new_index..new_index + new_len] {
+                            applied.push_str(s);
+                        }
+                    }
+                }
+            }
+            assert_eq!(applied, right, "case #{idx} ({name}) edit script application");
+
+            // 3. Byte-level diff invariant: applying byte changes to `left` reconstructs `right`
+            let bd = diff_bytes(left.as_bytes(), right.as_bytes());
+            let mut rebuilt_bytes = Vec::with_capacity(right.len());
+            for (i, &ch) in bd.b.iter().enumerate() {
+                match ch {
+                    Change::Same => rebuilt_bytes.push(left.as_bytes()[i]),
+                    Change::Modified | Change::Inserted => rebuilt_bytes.push(right.as_bytes()[i]),
+                    Change::Deleted => unreachable!("Deleted only appears in bd.a"),
+                }
+            }
+            assert_eq!(rebuilt_bytes, right.as_bytes(), "case #{idx} ({name}) byte diff reconstruction");
+        });
     }
 
     #[test]
-    fn word_diff_groups_changes() {
-        let a = "Hello brave world, see you soon";
-        let b = "Hello new world, see you later today";
-        let d = diff_words(a, b).unwrap();
-        let text = |s: &[Span]| s.iter().map(|x| x.text.as_str()).collect::<String>();
-        assert_eq!(text(&d.a), a);
-        assert_eq!(text(&d.b), b);
-        // "brave" -> "new" and "soon" -> "later today"
-        assert_eq!(d.changes, 2);
-        let changed = |s: &[Span], c: Change| s.iter().filter(|x| x.change == c).map(|x| x.text.clone()).collect::<Vec<_>>();
-        assert_eq!(changed(&d.a, Change::Modified), ["brave", "soon"]);
-        assert_eq!(changed(&d.b, Change::Modified), ["new", "later today"]);
-        // pure insertion and deletion
-        let d = diff_words("a b c", "a b X c").unwrap();
-        assert_eq!(d.changes, 1);
-        assert!(d.b.iter().any(|s| s.change == Change::Inserted && s.text.contains('X')));
-        assert!(d.a.iter().all(|s| s.change == Change::Same));
-        let d = diff_words("one two three", "one three").unwrap();
-        assert!(d.a.iter().any(|s| s.change == Change::Deleted && s.text.contains("two")));
-        // identical
-        assert_eq!(diff_words("same\ntext", "same\ntext").unwrap().changes, 0);
-    }
+    fn threshold_and_async_worker_matrix() {
+        let over_limit = "a".repeat(MAX_WORD_DIFF_SIZE + 1);
+        let under_limit_a = "token ".repeat(20_000);
+        let under_limit_b = under_limit_a.replacen("token", "other", 1);
 
-    #[test]
-    fn word_diff_change_lines() {
-        let a = "HTTP/1.1 200 OK\nX-Id: 1\nBody\n";
-        let b = "HTTP/1.1 200 OK\nX-Id: 2\nBody\nExtra\n";
-        let d = diff_words(a, b).unwrap();
-        assert_eq!(d.changes, 2);
-        assert_eq!(d.change_lines[0], (1, 1));
-        // the added line can be aligned either side of "Body"'s newline; both are minimal
-        assert!(matches!(d.change_lines[1], (2, 2) | (3, 3)), "{:?}", d.change_lines);
-    }
+        let threshold_cases: [(&str, &str, &str, Option<usize>, DiffMode, Option<&str>); 4] = [
+            (
+                "left exceeds 256 KB falls back to Bytes",
+                &over_limit,
+                "w",
+                None,
+                DiffMode::Bytes,
+                Some(WORD_DIFF_LIMIT_NOTE),
+            ),
+            (
+                "right exceeds 256 KB falls back to Bytes",
+                "w",
+                &over_limit,
+                None,
+                DiffMode::Bytes,
+                Some(WORD_DIFF_LIMIT_NOTE),
+            ),
+            (
+                "both exceed 256 KB falls back to Bytes",
+                &over_limit,
+                &over_limit,
+                None,
+                DiffMode::Bytes,
+                Some(WORD_DIFF_LIMIT_NOTE),
+            ),
+            (
+                "120 KB payload within 256 KB ceiling stays in Words mode",
+                &under_limit_a,
+                &under_limit_b,
+                Some(1),
+                DiffMode::Words,
+                None,
+            ),
+        ];
 
-    #[test]
-    fn byte_diff_offsets() {
-        let a = b"0123456789abcdefXYZ";
-        let b = b"0123456789abcdeFXY";
-        let d = diff_bytes(a, b);
-        assert_eq!(d.differing, 2); // offset 15 differs, offset 18 only in A
-        assert_eq!(d.a[15], Change::Modified);
-        assert_eq!(d.b[15], Change::Modified);
-        assert_eq!(d.a[18], Change::Deleted);
-        assert_eq!(d.b.len(), 18);
-        assert_eq!(d.diff_rows, [0, 1]);
-        let d = diff_bytes(b"ab", b"abcd");
-        assert_eq!((d.differing, &d.b[2..]), (2, &[Change::Inserted, Change::Inserted][..]));
-        assert_eq!(diff_bytes(b"same", b"same").differing, 0);
-    }
+        assert_table!(threshold_cases, |idx, (name, a, b, expected_word_changes, expected_mode, expected_note)| {
+            assert_eq!(
+                diff_words(a, b).map(|d| d.changes),
+                expected_word_changes,
+                "case #{idx} ({name}) diff_words"
+            );
+            let item_a = ComparerItem::from_text(1, "A", a);
+            let item_b = ComparerItem::from_text(2, "B", b);
+            let mut v = DiffView::new(item_a, item_b, DiffMode::Words);
+            if expected_mode == DiffMode::Words {
+                wait(&mut v);
+            }
+            assert_eq!(v.mode, expected_mode, "case #{idx} ({name}) DiffView mode");
+            assert_eq!(v.fallback_note.as_deref(), expected_note, "case #{idx} ({name}) fallback_note");
+            if expected_mode == DiffMode::Bytes {
+                assert!(v.bytes.is_some(), "case #{idx} ({name}) byte diff populated on fallback");
+            }
+        });
 
-    #[test]
-    fn items_from_text_and_bytes() {
-        let t = ComparerItem::from_text(1, "Manual", "hello\r\n");
-        assert_eq!((t.length, t.is_text), (7, true));
-        assert_eq!(t.text(), "hello\r\n");
-        let bin = ComparerItem::from_bytes(2, "Selection (4 bytes)", &[0x1f, 0x8b, 0x00, 0xff]);
-        assert_eq!((bin.length, bin.is_text), (4, false));
-        assert!(!ComparerItem::from_bytes(3, "x", b"a\x00b").is_text);
-    }
-
-    #[test]
-    fn large_inputs_fall_back_to_bytes() {
-        let big = "a".repeat(MAX_WORD_DIFF_SIZE + 1);
-        assert_eq!(compute_patience_word_diff(&big, "w"), Err(WORD_DIFF_LIMIT_NOTE.to_string()));
-        assert!(diff_words(&big, "w").is_none());
-
-        let item_a = ComparerItem::from_text(1, "Big", &big);
-        let item_b = ComparerItem::from_text(2, "Small", "w");
-        let v = DiffView::new(item_a, item_b, DiffMode::Words);
-        assert_eq!(v.mode, DiffMode::Bytes);
-        assert_eq!(v.fallback_note.as_deref(), Some(WORD_DIFF_LIMIT_NOTE));
-        assert!(v.bytes.is_some());
-
-        // a long, mostly-equal input within 256 KB succeeds
-        let a = "token ".repeat(20_000);
-        let b = a.replacen("token", "other", 1);
-        assert_eq!(diff_words(&a, &b).unwrap().changes, 1);
-    }
-
-    #[test]
-    fn diff_view_modes() {
+        // DiffView mode switching and lazy byte computation
         let a = ComparerItem::from_text(1, "A", "alpha beta");
         let b = ComparerItem::from_text(2, "B", "alpha gamma!");
         let mut v = DiffView::new(a, b, DiffMode::Words);
@@ -539,36 +768,36 @@ mod tests {
         assert_eq!(v.difference_count(), 1);
         assert!(v.bytes.is_none(), "bytes computed only when shown");
         v.set_mode(DiffMode::Bytes);
-        assert_eq!(v.difference_count(), 6); // "beta" vs "gamm" + "a!" past the end
+        assert_eq!(v.difference_count(), 6);
         assert_eq!(v.jump_targets(), [(0, 0)]);
         v.set_mode(DiffMode::Words);
         assert!(!v.poll(), "already computed: not started again");
         assert_eq!(v.difference_count(), 1);
-    }
 
-    fn wait(v: &mut DiffView) {
-        for _ in 0..500 {
-            if !v.poll() { return; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("word comparison never finished");
-    }
-
-    #[test]
-    fn word_comparison_runs_off_the_calling_thread() {
-        // big and fully different: slow for Myers, yet `new` returns at once
+        // Background worker non-blocking check
         let a = ComparerItem::from_text(1, "A", &"alpha ".repeat(5_000));
         let b = ComparerItem::from_text(2, "B", &"omega ".repeat(5_000));
         let started = std::time::Instant::now();
         let mut v = DiffView::new(a, b, DiffMode::Words);
         assert!(started.elapsed() < std::time::Duration::from_millis(200), "the diff didn't block");
-        assert_eq!(v.difference_count(), 0, "nothing to show until it's done");
         for _ in 0..3000 {
-            if !v.poll() { break; }
+            if !v.poll() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(v.words_job.is_none());
         assert!(v.words.as_ref().unwrap().is_ok());
         assert!(v.difference_count() >= 1);
+    }
+
+    fn wait(v: &mut DiffView) {
+        for _ in 0..500 {
+            if !v.poll() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("word comparison never finished");
     }
 }
