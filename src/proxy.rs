@@ -840,6 +840,8 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{assert_table, MockAppBuilder};
+
     fn shared() -> Shared {
         Shared {
             history: Arc::new(Mutex::new(Vec::new())),
@@ -864,6 +866,155 @@ mod tests {
             tls: Arc::new(Mutex::new(None)),
             upstream_tls: upstream_client_config(),
         }
+    }
+
+    #[test]
+    fn interception_decision_matrix() {
+        let app = MockAppBuilder::new().with_tab(crate::state::Tab::Proxy).build();
+        assert_eq!(app.tab, crate::state::Tab::Proxy);
+
+        struct HoldCase {
+            name: &'static str,
+            intercept: bool,
+            use_rules: bool,
+            skip_ext: Vec<&'static str>,
+            only_in_scope: bool,
+            scope_include: Vec<&'static str>,
+            path: &'static str,
+            url: &'static str,
+            expected_hold: bool,
+        }
+
+        let default_skip: Vec<&'static str> = vec!["png", "js", "css"];
+        let cases = [
+            HoldCase {
+                name: "master intercept off never holds",
+                intercept: false,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/api/login",
+                url: "http://shop.test/api/login",
+                expected_hold: false,
+            },
+            HoldCase {
+                name: "intercept on holds standard API endpoint",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/api/login",
+                url: "http://shop.test/api/login",
+                expected_hold: true,
+            },
+            HoldCase {
+                name: "intercept on with use_rules true skips static .png extension",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/logo.png",
+                url: "http://shop.test/logo.png",
+                expected_hold: false,
+            },
+            HoldCase {
+                name: "intercept on with use_rules false holds static .png extension",
+                intercept: true,
+                use_rules: false,
+                skip_ext: default_skip.clone(),
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/logo.png",
+                url: "http://shop.test/logo.png",
+                expected_hold: true,
+            },
+            HoldCase {
+                name: "custom skip list skips .json and holds .png",
+                intercept: true,
+                use_rules: true,
+                skip_ext: vec!["json"],
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/data.json",
+                url: "http://shop.test/data.json",
+                expected_hold: false,
+            },
+            HoldCase {
+                name: "custom skip list without png holds .png",
+                intercept: true,
+                use_rules: true,
+                skip_ext: vec!["json"],
+                only_in_scope: false,
+                scope_include: vec![],
+                path: "/logo.png",
+                url: "http://shop.test/logo.png",
+                expected_hold: true,
+            },
+            HoldCase {
+                name: "only_in_scope holds matching in-scope URL",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: true,
+                scope_include: vec!["http://shop.test/in"],
+                path: "/in/page",
+                url: "http://shop.test/in/page",
+                expected_hold: true,
+            },
+            HoldCase {
+                name: "only_in_scope forwards out-of-scope URL without holding",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: true,
+                scope_include: vec!["http://shop.test/in"],
+                path: "/out",
+                url: "http://shop.test/out",
+                expected_hold: false,
+            },
+            HoldCase {
+                name: "only_in_scope disabled holds out-of-scope URL",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: false,
+                scope_include: vec!["http://shop.test/in"],
+                path: "/out",
+                url: "http://shop.test/out",
+                expected_hold: true,
+            },
+            HoldCase {
+                name: "only_in_scope with empty scope holds everything",
+                intercept: true,
+                use_rules: true,
+                skip_ext: default_skip.clone(),
+                only_in_scope: true,
+                scope_include: vec![],
+                path: "/anything",
+                url: "http://shop.test/anything",
+                expected_hold: true,
+            },
+        ];
+
+        assert_table!(cases, |case| {
+            let sh = shared();
+            sh.intercept.store(case.intercept, Ordering::SeqCst);
+            sh.use_rules.store(case.use_rules, Ordering::SeqCst);
+            *sh.skip_extensions.lock().unwrap() = case.skip_ext.iter().map(|s| s.to_string()).collect();
+            sh.intercept_only_in_scope.store(case.only_in_scope, Ordering::SeqCst);
+            for rule in &case.scope_include {
+                sh.scope.lock().unwrap().include.push(crate::scope::ScopeRule::new(*rule));
+            }
+            assert_eq!(
+                should_hold(&sh, case.path, case.url),
+                case.expected_hold,
+                "case '{}'",
+                case.name
+            );
+        });
     }
 
     /// One-shot upstream server that echoes the request line back in the body.
@@ -1474,20 +1625,123 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_matching() {
-        let rules: Vec<String> = ["api.example.com", "*.pinned.test", ".bank.test", "  Mixed.Case.Test "].iter().map(|s| s.to_string()).collect();
-        let yes = |h: &str| should_passthrough_tls(h, &rules);
-        // exact, case-insensitive, trailing dot
-        assert!(yes("api.example.com") && yes("API.Example.COM") && yes("api.example.com.") && yes("mixed.case.test"));
-        assert!(!yes("www.example.com") && !yes("example.com") && !yes("xapi.example.com"));
-        // wildcards: any depth of subdomain, but not the domain itself or look-alikes
-        assert!(yes("a.pinned.test") && yes("deep.a.pinned.test") && yes("x.bank.test"));
-        assert!(!yes("pinned.test") && !yes("bank.test") && !yes("evilpinned.test") && !yes("pinned.test.evil"));
-        // IPv6 hosts, and empty rules/hosts never match
-        assert!(should_passthrough_tls("[::1]", &["::1".to_string()]));
-        assert!(!should_passthrough_tls("a.test", &["".to_string(), "*.".to_string(), ".".to_string()]));
-        assert!(!should_passthrough_tls("", &rules));
-        assert!(!should_passthrough_tls("a.test", &[]));
+    fn connect_and_tunneling_matrix() {
+        // 1. CONNECT Authority Extraction & Target URL Formatting Matrix
+        struct AuthorityCase {
+            name: &'static str,
+            raw_authority: &'static str,
+            https: bool,
+            path: &'static str,
+            expected_host: &'static str,
+            expected_port: u16,
+            expected_url: &'static str,
+        }
+
+        let auth_cases = [
+            AuthorityCase {
+                name: "explicit non-standard HTTPS port",
+                raw_authority: "shop.test:8443",
+                https: true,
+                path: "/",
+                expected_host: "shop.test",
+                expected_port: 8443,
+                expected_url: "https://shop.test:8443/",
+            },
+            AuthorityCase {
+                name: "implicit default HTTPS port 443 omitted in URL",
+                raw_authority: "shop.test",
+                https: true,
+                path: "/cart",
+                expected_host: "shop.test",
+                expected_port: 443,
+                expected_url: "https://shop.test/cart",
+            },
+            AuthorityCase {
+                name: "IPv6 authority with explicit port",
+                raw_authority: "[::1]:9000",
+                https: true,
+                path: "/a",
+                expected_host: "::1",
+                expected_port: 9000,
+                expected_url: "https://[::1]:9000/a",
+            },
+            AuthorityCase {
+                name: "IPv6 authority on default HTTPS port 443",
+                raw_authority: "[::1]:443",
+                https: true,
+                path: "/a",
+                expected_host: "::1",
+                expected_port: 443,
+                expected_url: "https://[::1]/a",
+            },
+        ];
+
+        assert_table!(auth_cases, |case| {
+            let (host, port) = split_authority(case.raw_authority);
+            assert_eq!(host, case.expected_host, "case '{}' host", case.name);
+            assert_eq!(port, case.expected_port, "case '{}' port", case.name);
+            let target = Target { https: case.https, host, port };
+            assert_eq!(target.url(case.path), case.expected_url, "case '{}' url", case.name);
+        });
+
+        // 2. Absolute HTTP Target Splitting & Upstream Absolute-Form Rewriting Matrix
+        let split_cases = [
+            ("explicit port and query", "http://a.test:8000/x?y=1", Some(("a.test".into(), 8000u16, "/x?y=1".into()))),
+            ("default port 80 and bare host", "http://a.test", Some(("a.test".into(), 80u16, "/".into()))),
+            ("relative origin-form path returns None", "/relative", None),
+        ];
+        assert_table!(split_cases, |(name, input, expected)| {
+            assert_eq!(split_target(input), expected, "{name}");
+        });
+
+        let abs_cases = [
+            (
+                "IPv4 target rewrites origin-form GET into absolute-form for upstream proxy",
+                Target { https: false, host: "a.test".into(), port: 8081 },
+                &b"GET /x?y=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
+                &b"GET http://a.test:8081/x?y=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
+            ),
+            (
+                "IPv6 target wraps host in brackets in absolute-form request line",
+                Target { https: false, host: "::1".into(), port: 80 },
+                &b"POST / HTTP/1.1\r\n\r\nbody"[..],
+                &b"POST http://[::1]:80/ HTTP/1.1\r\n\r\nbody"[..],
+            ),
+        ];
+        assert_table!(abs_cases, |(name, target, wire, expected)| {
+            assert_eq!(absolute_form(wire, &target), expected, "{name}");
+        });
+
+        // 3. TLS Passthrough Host Matching Matrix
+        let std_rules: Vec<String> = ["api.example.com", "*.pinned.test", ".bank.test", "  Mixed.Case.Test "]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let passthrough_cases = [
+            ("exact host match", "api.example.com", std_rules.clone(), true),
+            ("case-insensitive host match", "API.Example.COM", std_rules.clone(), true),
+            ("trailing DNS dot normalized", "api.example.com.", std_rules.clone(), true),
+            ("trimmed mixed-case rule match", "mixed.case.test", std_rules.clone(), true),
+            ("unlisted sibling subdomain does not match exact rule", "www.example.com", std_rules.clone(), false),
+            ("parent apex domain does not match subdomain rule", "example.com", std_rules.clone(), false),
+            ("prefix lookalike host does not match", "xapi.example.com", std_rules.clone(), false),
+            ("single-level subdomain matches *.wildcard", "a.pinned.test", std_rules.clone(), true),
+            ("multi-level nested subdomain matches *.wildcard", "deep.a.pinned.test", std_rules.clone(), true),
+            ("subdomain matches leading-dot .bank.test rule", "x.bank.test", std_rules.clone(), true),
+            ("bare domain does not match *.pinned.test", "pinned.test", std_rules.clone(), false),
+            ("bare domain does not match .bank.test", "bank.test", std_rules.clone(), false),
+            ("prefix lookalike does not match wildcard", "evilpinned.test", std_rules.clone(), false),
+            ("suffix lookalike does not match wildcard", "pinned.test.evil", std_rules.clone(), false),
+            ("IPv6 bracketed host matches unbracketed rule", "[::1]", vec!["::1".to_string()], true),
+            ("degenerate empty or bare-wildcard rules never match", "a.test", vec!["".into(), "*.".into(), ".".into()], false),
+            ("empty host never matches", "", std_rules.clone(), false),
+            ("empty rule list never matches", "a.test", vec![], false),
+        ];
+
+        assert_table!(passthrough_cases, |(name, host, rules, expected)| {
+            assert_eq!(should_passthrough_tls(host, &rules), expected, "{name}");
+        });
     }
 
     /// A plain TCP server that echoes the first bytes it receives.
@@ -1539,22 +1793,6 @@ mod tests {
         *sh.tls_passthrough.lock().unwrap() = vec!["*.example.com".to_string(), "other.test".to_string()];
         assert!(https_client(pp, "127.0.0.1:9", "127.0.0.1", &proxy_ca).is_ok(), "127.0.0.1 isn't listed: the proxy completes TLS itself");
         sh.stop.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn authorities() {
-        assert_eq!(split_authority("shop.test:8443"), ("shop.test".into(), 8443));
-        assert_eq!(split_authority("shop.test"), ("shop.test".into(), 443));
-        assert_eq!(split_authority("[::1]:9000"), ("::1".into(), 9000));
-        assert_eq!(Target { https: true, host: "::1".into(), port: 443 }.url("/a"), "https://[::1]/a");
-        assert_eq!(Target { https: true, host: "a.test".into(), port: 8443 }.url("/"), "https://a.test:8443/");
-    }
-
-    #[test]
-    fn splits_absolute_targets() {
-        assert_eq!(split_target("http://a.test:8000/x?y=1"), Some(("a.test".into(), 8000, "/x?y=1".into())));
-        assert_eq!(split_target("http://a.test"), Some(("a.test".into(), 80, "/".into())));
-        assert_eq!(split_target("/relative"), None);
     }
 
     // ---- Batch 2: request framing, byte-exact bodies, header checks ----
@@ -1682,19 +1920,136 @@ mod tests {
     }
 
     #[test]
-    fn request_framing_rules() {
-        let len = |h: &str| request_body_length(&format!("POST / HTTP/1.1\r\n{h}")).map_err(|e| e.0);
-        assert_eq!(len("Host: x\r\n"), Ok(0));
-        assert_eq!(len("Content-Length: 12\r\n"), Ok(12));
-        assert_eq!(len("content-length:  0 \r\n"), Ok(0));
-        for bad in ["+5", "-1", "5, 5", "0x10", "abc", "", "1 2", "99999999999999999999"] {
-            assert_eq!(len(&format!("Content-Length: {bad}\r\n")), Err(400), "{bad:?}");
+    fn proxy_framing_and_sanitization_matrix() {
+        // 1. Request Body Framing & Smuggling Guard Matrix
+        let framing_cases: Vec<(&str, String, Result<u64, u16>)> = vec![
+            ("no Content-Length defaults to 0", "Host: x\r\n".into(), Ok(0)),
+            ("valid Content-Length parsed", "Content-Length: 12\r\n".into(), Ok(12)),
+            ("case-insensitive trimmed Content-Length: 0", "content-length:  0 \r\n".into(), Ok(0)),
+            ("leading plus sign rejected with 400", "Content-Length: +5\r\n".into(), Err(400)),
+            ("negative Content-Length rejected with 400", "Content-Length: -1\r\n".into(), Err(400)),
+            ("comma-separated Content-Length rejected with 400", "Content-Length: 5, 5\r\n".into(), Err(400)),
+            ("hex Content-Length rejected with 400", "Content-Length: 0x10\r\n".into(), Err(400)),
+            ("alphabetic Content-Length rejected with 400", "Content-Length: abc\r\n".into(), Err(400)),
+            ("empty Content-Length rejected with 400", "Content-Length: \r\n".into(), Err(400)),
+            ("space-separated digits rejected with 400", "Content-Length: 1 2\r\n".into(), Err(400)),
+            ("u64 overflow Content-Length rejected with 400", "Content-Length: 99999999999999999999\r\n".into(), Err(400)),
+            ("duplicate Content-Length headers rejected with 400", "Content-Length: 3\r\nContent-Length: 3\r\n".into(), Err(400)),
+            ("CL + Transfer-Encoding smuggling attempt rejected with 400", "Content-Length: 3\r\nTransfer-Encoding: chunked\r\n".into(), Err(400)),
+            ("chunked request body without CL rejected with 411", "Transfer-Encoding: chunked\r\n".into(), Err(411)),
+            ("exact MAX_REQUEST_BODY boundary accepted", format!("Content-Length: {}\r\n", MAX_REQUEST_BODY), Ok(MAX_REQUEST_BODY)),
+            ("MAX_REQUEST_BODY + 1 rejected with 413", format!("Content-Length: {}\r\n", MAX_REQUEST_BODY + 1), Err(413)),
+        ];
+
+        assert_table!(framing_cases, |(name, headers, expected)| {
+            let actual = request_body_length(&format!("POST / HTTP/1.1\r\n{headers}")).map_err(|e| e.0);
+            assert_eq!(actual, expected, "{name}");
+        });
+
+        // 2. Head Reading Size & Line Limit Matrix
+        let mut endless = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        endless.extend(std::iter::repeat_n(b'a', 10 * 1024 * 1024));
+
+        let head_cases: Vec<(&str, Vec<u8>, Result<(), HeadError>)> = vec![
+            (
+                "200 KiB request-line URL within total head limit succeeds",
+                format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(200 * 1024)).into_bytes(),
+                Ok(()),
+            ),
+            (
+                "single header line exceeding 64 KiB MAX_HEADER_LINE returns TooLarge",
+                format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEADER_LINE)).into_bytes(),
+                Err(HeadError::TooLarge),
+            ),
+            (
+                "unterminated 10 MiB header line cuts off at limit with TooLarge",
+                endless,
+                Err(HeadError::TooLarge),
+            ),
+            (
+                "many valid lines exceeding total MAX_HEAD block limit returns TooLarge",
+                format!("GET / HTTP/1.1\r\n{}\r\n", format!("X: {}\r\n", "a".repeat(1000)).repeat(300)).into_bytes(),
+                Err(HeadError::TooLarge),
+            ),
+            (
+                "empty stream returns HeadError::Closed",
+                Vec::new(),
+                Err(HeadError::Closed),
+            ),
+        ];
+
+        assert_table!(head_cases, |(name, bytes, expected)| {
+            let res = read_head_bytes(&mut BufReader::new(std::io::Cursor::new(bytes))).map(|_| ());
+            assert_eq!(res, expected, "{name}");
+        });
+
+        // 3. Header Line Sanitization Matrix
+        let sanitize_cases: [(&str, &str, Option<&str>); 11] = [
+            ("tab in value preserved", "X-A: b\tc", Some("X-A: b\tc")),
+            ("bare CR in value stripped to prevent header injection", "X-A: b\rInjected: 1", Some("X-A: bInjected: 1")),
+            ("NUL and DEL control chars stripped from value", "X-A: \u{0}b\u{7f}", Some("X-A: b")),
+            ("non-ASCII obs-text in value preserved", "X-A: caf\u{e9}", Some("X-A: caf\u{e9}")),
+            ("line without colon rejected", "no colon", None),
+            ("empty header name rejected", ": empty name", None),
+            ("space inside header name rejected", "Bad Name: x", None),
+            ("trailing space after header name rejected", "X-A : x", None),
+            ("obs-fold leading space rejected", " folded: x", None),
+            ("CR inside header name rejected", "Na\rme: x", None),
+            ("non-ASCII character in header name rejected", "Ünï: x", None),
+        ];
+
+        assert_table!(sanitize_cases, |(name, line, expected)| {
+            assert_eq!(sanitize_header_line(line).as_deref(), expected, "{name}");
+        });
+
+        // 4. Loopback Interface Classification Matrix
+        let loopback_cases = [
+            ("IPv4 loopback 127.0.0.1", "127.0.0.1", true),
+            ("trimmed IPv4 loopback", " 127.0.0.1 ", true),
+            ("127.0.0.0/8 subnet address", "127.1.2.3", true),
+            ("IPv6 loopback ::1", "::1", true),
+            ("bracketed IPv6 loopback [::1]", "[::1]", true),
+            ("localhost lowercase", "localhost", true),
+            ("LOCALHOST uppercase", "LOCALHOST", true),
+            ("all-interfaces IPv4 0.0.0.0 is not loopback", "0.0.0.0", false),
+            ("unspecified IPv6 :: is not loopback", "::", false),
+            ("bracketed unspecified IPv6 [::] is not loopback", "[::]", false),
+            ("LAN IPv4 192.168.1.5 is not loopback", "192.168.1.5", false),
+            ("private IPv4 10.0.0.1 is not loopback", "10.0.0.1", false),
+            ("external hostname is not loopback", "example.com", false),
+            ("empty host is not loopback", "", false),
+            ("lookalike hostname 127.0.0.1.evil is not loopback", "127.0.0.1.evil", false),
+        ];
+
+        assert_table!(loopback_cases, |(name, host, expected)| {
+            assert_eq!(is_loopback_interface(host), expected, "{name}");
+        });
+
+        // 5. Event Log Ring Buffer & Poisoned Lock Resilience
+        let events: Events = Default::default();
+        for i in 0..(MAX_EVENTS + 25) {
+            log(&events, format!("event {i}"));
         }
-        assert_eq!(len("Content-Length: 3\r\nContent-Length: 3\r\n"), Err(400));
-        assert_eq!(len("Content-Length: 3\r\nTransfer-Encoding: chunked\r\n"), Err(400));
-        assert_eq!(len("Transfer-Encoding: chunked\r\n"), Err(411));
-        assert_eq!(len(&format!("Content-Length: {}\r\n", MAX_REQUEST_BODY)), Ok(MAX_REQUEST_BODY));
-        assert_eq!(len(&format!("Content-Length: {}\r\n", MAX_REQUEST_BODY + 1)), Err(413));
+        {
+            let guard = events.lock().unwrap();
+            assert_eq!(guard.len(), MAX_EVENTS);
+            assert_eq!(guard.front().unwrap().message, "event 25");
+            assert_eq!(guard.back().unwrap().message, format!("event {}", MAX_EVENTS + 24));
+        }
+
+        let poisoned: Events = Default::default();
+        let p2 = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = p2.lock().unwrap();
+            panic!("a thread dies holding the log");
+        })
+        .join();
+        assert!(poisoned.is_poisoned());
+        log(&poisoned, "still works");
+        assert_eq!(
+            poisoned.lock().unwrap_or_else(|e| e.into_inner()).back().unwrap().message,
+            "still works"
+        );
     }
 
     #[test]
@@ -1721,25 +2076,6 @@ mod tests {
     }
 
     #[test]
-    fn head_reading_limits() {
-        let read = |b: Vec<u8>| read_head_bytes(&mut BufReader::new(std::io::Cursor::new(b)));
-        // a long request line (URL) is fine up to the whole head limit
-        let long_url = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(200 * 1024));
-        assert!(read(long_url.into_bytes()).is_ok());
-        // one header line over 64 KiB is refused, without reading on
-        let long_header = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEADER_LINE));
-        assert_eq!(read(long_header.into_bytes()), Err(HeadError::TooLarge));
-        // a header line that never ends is cut off at the limit
-        let mut endless = b"GET / HTTP/1.1\r\nX: ".to_vec();
-        endless.extend(std::iter::repeat_n(b'a', 10 * 1024 * 1024));
-        assert_eq!(read(endless), Err(HeadError::TooLarge));
-        // many lines, each fine, still capped by the block limit
-        let many = format!("GET / HTTP/1.1\r\n{}\r\n", format!("X: {}\r\n", "a".repeat(1000)).repeat(300));
-        assert_eq!(read(many.into_bytes()), Err(HeadError::TooLarge));
-        assert_eq!(read(Vec::new()), Err(HeadError::Closed));
-    }
-
-    #[test]
     fn oversized_header_lines_get_431() {
         let sh = shared();
         let pp = running_proxy(&sh);
@@ -1747,17 +2083,6 @@ mod tests {
         let resp = String::from_utf8_lossy(&bytes_through(pp, req.as_bytes())).into_owned();
         assert!(resp.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"), "{resp}");
         sh.stop.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn header_line_sanitizing() {
-        assert_eq!(sanitize_header_line("X-A: b\tc").as_deref(), Some("X-A: b\tc"));
-        assert_eq!(sanitize_header_line("X-A: b\rInjected: 1").as_deref(), Some("X-A: bInjected: 1"));
-        assert_eq!(sanitize_header_line("X-A: \u{0}b\u{7f}").as_deref(), Some("X-A: b"));
-        assert_eq!(sanitize_header_line("X-A: caf\u{e9}").as_deref(), Some("X-A: caf\u{e9}"));
-        for bad in ["no colon", ": empty name", "Bad Name: x", "X-A : x", " folded: x", "Na\rme: x", "Ünï: x"] {
-            assert_eq!(sanitize_header_line(bad), None, "{bad:?}");
-        }
     }
 
     #[test]
@@ -1780,41 +2105,6 @@ mod tests {
         assert!(sent.contains("\r\nX-Ok: 3\r\n"), "{sent:?}");
         assert!(!sent.replace("\r\n", "").contains('\r'), "no bare CR: {sent:?}");
         sh.stop.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn loopback_interfaces() {
-        for h in ["127.0.0.1", " 127.0.0.1 ", "127.1.2.3", "::1", "[::1]", "localhost", "LOCALHOST"] {
-            assert!(is_loopback_interface(h), "{h:?}");
-        }
-        for h in ["0.0.0.0", "::", "[::]", "192.168.1.5", "10.0.0.1", "example.com", "", "127.0.0.1.evil"] {
-            assert!(!is_loopback_interface(h), "{h:?}");
-        }
-    }
-
-    #[test]
-    fn event_log_keeps_the_newest_entries() {
-        let events: Events = Default::default();
-        for i in 0..(MAX_EVENTS + 25) {
-            log(&events, format!("event {i}"));
-        }
-        let log = events.lock().unwrap();
-        assert_eq!(log.len(), MAX_EVENTS);
-        assert_eq!(log.front().unwrap().message, "event 25");
-        assert_eq!(log.back().unwrap().message, format!("event {}", MAX_EVENTS + 24));
-    }
-
-    #[test]
-    fn logging_survives_a_poisoned_lock() {
-        let events: Events = Default::default();
-        let e2 = events.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = e2.lock().unwrap();
-            panic!("a thread dies holding the log");
-        }).join();
-        assert!(events.is_poisoned());
-        log(&events, "still works");
-        assert_eq!(events.lock().unwrap_or_else(|e| e.into_inner()).back().unwrap().message, "still works");
     }
 
     #[test]
@@ -1919,13 +2209,5 @@ mod tests {
         assert!(resp.contains("no host"), "{resp}");
         assert!(got.recv_timeout(Duration::from_millis(300)).is_err(), "the target was never contacted");
         sh.stop.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn absolute_form_request_lines() {
-        let at = Target { https: false, host: "a.test".into(), port: 8081 };
-        assert_eq!(absolute_form(b"GET /x?y=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", &at), b"GET http://a.test:8081/x?y=1 HTTP/1.1\r\nHost: a.test\r\n\r\n");
-        let v6 = Target { https: false, host: "::1".into(), port: 80 };
-        assert_eq!(absolute_form(b"POST / HTTP/1.1\r\n\r\nbody", &v6), b"POST http://[::1]:80/ HTTP/1.1\r\n\r\nbody");
     }
 }

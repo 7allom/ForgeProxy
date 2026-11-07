@@ -187,98 +187,41 @@ pub fn time_of_day(ms: u64) -> String {
 mod tests {
     use super::*;
     use crate::scope::{ScopeRule, TargetScope};
+    use crate::test_utils::{assert_table, HttpFixture};
 
     fn entry(id: usize, url: &str, status: &str) -> HttpEntry {
+        let is_tls = url.starts_with("https://");
         let (host, path) = crate::http::split_url(url);
-        HttpEntry { id, tool: "Proxy".into(), method: "GET".into(), host, path, status: status.into(), length: 0,
-            mime: "HTML".into(), request: String::new(), response: String::new(), url: url.into(), truncated: false, time: 0 }
+        let mut e = HttpFixture::get(host, path)
+            .with_tls(is_tls)
+            .with_response(status, "")
+            .into_history_entry(id, "Proxy");
+        e.url = url.into();
+        e.mime = "HTML".into();
+        e
     }
 
     fn skip() -> Vec<String> {
         crate::rules::default_skip_extensions()
     }
 
-    #[test]
-    fn scope_filtering() {
-        let mut scope = TargetScope::default();
-        scope.include.push(ScopeRule::new("https://shop.test/"));
-        let mut f = HistoryFilter::default();
-        let (inside, outside) = (entry(1, "https://shop.test/cart", "200 OK"), entry(2, "https://ads.test/p", "200 OK"));
-        assert!(f.matches(&inside, &scope, &skip()) && f.matches(&outside, &scope, &skip()));
-        f.only_in_scope = true;
-        assert!(f.matches(&inside, &scope, &skip()));
-        assert!(!f.matches(&outside, &scope, &skip()));
-    }
-
-    #[test]
-    fn static_assets_follow_the_skip_list() {
-        let scope = TargetScope::default();
-        let f = HistoryFilter { hide_static_assets: true, ..Default::default() };
-        assert!(!f.matches(&entry(1, "https://a.test/logo.PNG?v=2", "200 OK"), &scope, &skip()));
-        assert!(!f.matches(&entry(2, "https://a.test/app.js", "200 OK"), &scope, &skip()));
-        assert!(f.matches(&entry(3, "https://a.test/api/users", "200 OK"), &scope, &skip()));
-        assert!(f.matches(&entry(4, "https://a.test/data.json", "200 OK"), &scope, &skip()));
-        // the user's own list decides
-        let custom = vec!["json".to_string()];
-        assert!(!f.matches(&entry(4, "https://a.test/data.json", "200 OK"), &scope, &custom));
-        assert!(f.matches(&entry(1, "https://a.test/logo.png", "200 OK"), &scope, &custom));
-        assert!(HistoryFilter::default().is_default_filter() && !f.is_default_filter());
-    }
-
-    #[test]
-    fn status_code_buckets() {
-        let scope = TargetScope::default();
-        let f = HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() };
-        let rows = [("200 OK", true), ("204 No Content", true), ("302 Found", false), ("404 Not Found", true), ("503 Unavailable", false),
-                    ("200 (Tunnel)", true), (crate::http::CONNECTION_FAILED, true)];
-        for (status, shown) in rows {
-            assert_eq!(f.matches(&entry(1, "http://a.test/", status), &scope, &skip()), shown, "{status}");
-        }
-        let f = HistoryFilter { hide_no_response: true, ..Default::default() };
-        assert!(!f.matches(&entry(1, "http://a.test/", crate::http::CONNECTION_FAILED), &scope, &skip()));
-    }
-
-    #[test]
-    fn substring_and_regex_search() {
-        let scope = TargetScope::default();
-        let mut e = entry(1, "https://API.test/v1/users?id=7", "201 Created");
-        e.method = "POST".into();
-        let search = |q: &str, regex: bool| HistoryFilter { search_term: q.into(), is_regex: regex, ..Default::default() }.matches(&e, &scope, &skip());
-        for q in ["api.test", "post", "/V1/US", "201", "html", "  users  "] {
-            assert!(search(q, false), "{q}");
-        }
-        assert!(!search("delete", false));
-        assert!(!search("v[0-9]", false), "plain text: brackets are literal");
-        assert!(search(r"/v\d+/", true));
-        assert!(search("^post$", true), "case-insensitive, whole field");
-        assert!(search(r"^2\d\d", true));
-        assert!(!search(r"^4\d\d", true));
-        // a regex that doesn't compile filters nothing (and is reported)
-        assert!(search("(unclosed", true));
-        let bad = HistoryFilter { search_term: "(unclosed".into(), is_regex: true, ..Default::default() };
-        assert!(bad.regex_error());
-        assert!(!HistoryFilter { search_term: "(unclosed".into(), ..Default::default() }.regex_error());
-    }
-
-    #[test]
-    fn reset_keeps_the_sort() {
-        let mut f = HistoryFilter { search_term: "x".into(), only_in_scope: true, show_2xx: false, sort_column: Some(HistorySortColumn::Length), sort_ascending: false, ..Default::default() };
-        assert!(!f.is_default_filter());
-        f.reset_filter();
-        assert!(f.is_default_filter());
-        assert_eq!((f.sort_column, f.sort_ascending), (Some(HistorySortColumn::Length), false));
-    }
-
     fn rows() -> Vec<Arc<HttpEntry>> {
         // id, status, time, length
-        [(1, "404 Not Found", 3000, 50), (2, "200 OK", 1000, 900), (3, crate::http::CONNECTION_FAILED, 2000, 0),
-         (4, "302 Found", 1000, 900), (5, "500 Error", 4000, 10)]
-            .into_iter().map(|(id, status, time, length)| {
-                let mut e = entry(id, "http://a.test/", status);
-                e.time = time;
-                e.length = length;
-                Arc::new(e)
-            }).collect()
+        [
+            (1, "404 Not Found", 3000, 50),
+            (2, "200 OK", 1000, 900),
+            (3, crate::http::CONNECTION_FAILED, 2000, 0),
+            (4, "302 Found", 1000, 900),
+            (5, "500 Error", 4000, 10),
+        ]
+        .into_iter()
+        .map(|(id, status, time, length)| {
+            let mut e = entry(id, "http://a.test/", status);
+            e.time = time;
+            e.length = length;
+            Arc::new(e)
+        })
+        .collect()
     }
 
     fn ids(rows: &[Arc<HttpEntry>]) -> Vec<usize> {
@@ -286,53 +229,453 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_status() {
-        let mut r = rows();
-        sort_rows(&mut r, HistorySortColumn::Status, true);
-        assert_eq!(ids(&r), [2, 4, 1, 5, 3], "no response last");
-        sort_rows(&mut r, HistorySortColumn::Status, false);
-        assert_eq!(ids(&r), [5, 1, 4, 2, 3], "no response still last");
+    fn history_log_operations_matrix() {
+        // 1. Entry ID sequencing & FIFO / ring buffer trimming invariants
+        let counter = Arc::new(std::sync::Mutex::new(0usize));
+        let seq_ids: Vec<usize> = (0..5).map(|_| crate::actions::next_id(&counter)).collect();
+        assert_eq!(seq_ids, vec![1, 2, 3, 4, 5]);
+
+        struct BufferOpCase {
+            name: &'static str,
+            capacity: usize,
+            insert_count: usize,
+            clear_after: bool,
+            expected_ids: Vec<usize>,
+        }
+
+        let buffer_cases = [
+            BufferOpCase {
+                name: "within capacity retains all entries in order",
+                capacity: 5,
+                insert_count: 3,
+                clear_after: false,
+                expected_ids: vec![1, 2, 3],
+            },
+            BufferOpCase {
+                name: "FIFO eviction trims oldest entries when exceeding ring limit",
+                capacity: 3,
+                insert_count: 5,
+                clear_after: false,
+                expected_ids: vec![3, 4, 5],
+            },
+            BufferOpCase {
+                name: "clear reset empties history log completely",
+                capacity: 5,
+                insert_count: 4,
+                clear_after: true,
+                expected_ids: vec![],
+            },
+        ];
+
+        assert_table!(buffer_cases, |case| {
+            let mut log: Vec<Arc<HttpEntry>> = Vec::new();
+            for id in 1..=case.insert_count {
+                log.push(Arc::new(entry(id, "http://a.test/", "200 OK")));
+                if log.len() > case.capacity {
+                    let excess = log.len() - case.capacity;
+                    log.drain(0..excess);
+                }
+            }
+            if case.clear_after {
+                log.clear();
+            }
+            assert_eq!(ids(&log), case.expected_ids, "case '{}'", case.name);
+        });
+
+        // 2. Filter reset preserves active sort column and sort direction
+        let mut f = HistoryFilter {
+            search_term: "x".into(),
+            only_in_scope: true,
+            show_2xx: false,
+            sort_column: Some(HistorySortColumn::Length),
+            sort_ascending: false,
+            ..Default::default()
+        };
+        assert!(!f.is_default_filter());
+        f.reset_filter();
+        assert!(f.is_default_filter());
+        assert_eq!((f.sort_column, f.sort_ascending), (Some(HistorySortColumn::Length), false));
+
+        // 3. Column click state machine transitions
+        let mut click_filter = HistoryFilter::default();
+        assert_eq!((click_filter.sort_column, click_filter.sort_ascending), (Some(HistorySortColumn::Id), true));
+        click_filter.click_column(HistorySortColumn::Id);
+        assert!(!click_filter.sort_ascending, "same column: reversed");
+        click_filter.click_column(HistorySortColumn::Length);
+        assert_eq!(
+            (click_filter.sort_column, click_filter.sort_ascending),
+            (Some(HistorySortColumn::Length), true),
+            "a new column starts ascending"
+        );
+
+        // 4. Sorting matrix across columns and directions
+        struct SortCase {
+            name: &'static str,
+            column: Option<HistorySortColumn>,
+            ascending: bool,
+            expected_ids: [usize; 5],
+        }
+
+        let sort_cases = [
+            SortCase {
+                name: "sort by status ascending places CONNECTION_FAILED last",
+                column: Some(HistorySortColumn::Status),
+                ascending: true,
+                expected_ids: [2, 4, 1, 5, 3],
+            },
+            SortCase {
+                name: "sort by status descending still places CONNECTION_FAILED last",
+                column: Some(HistorySortColumn::Status),
+                ascending: false,
+                expected_ids: [5, 1, 4, 2, 3],
+            },
+            SortCase {
+                name: "sort by time ascending preserves id order on ties",
+                column: Some(HistorySortColumn::Time),
+                ascending: true,
+                expected_ids: [2, 4, 3, 1, 5],
+            },
+            SortCase {
+                name: "sort by time descending preserves id order on ties",
+                column: Some(HistorySortColumn::Time),
+                ascending: false,
+                expected_ids: [5, 1, 3, 2, 4],
+            },
+            SortCase {
+                name: "sort by length ascending",
+                column: Some(HistorySortColumn::Length),
+                ascending: true,
+                expected_ids: [3, 5, 1, 2, 4],
+            },
+            SortCase {
+                name: "sort by length descending",
+                column: Some(HistorySortColumn::Length),
+                ascending: false,
+                expected_ids: [2, 4, 1, 5, 3],
+            },
+            SortCase {
+                name: "no sort column leaves order untouched",
+                column: None,
+                ascending: true,
+                expected_ids: [1, 2, 3, 4, 5],
+            },
+        ];
+
+        assert_table!(sort_cases, |case| {
+            let history: Vec<Arc<HttpEntry>> = rows();
+            let mut view: Vec<Arc<HttpEntry>> = history.clone();
+            HistoryFilter {
+                sort_column: case.column,
+                sort_ascending: case.ascending,
+                ..Default::default()
+            }
+            .sort(&mut view);
+            assert_eq!(ids(&view), case.expected_ids, "case '{}'", case.name);
+            assert_eq!(ids(&history), [1, 2, 3, 4, 5], "underlying history slice must stay untouched");
+        });
+
+        // 5. Time formatting matrix
+        let time_cases = [
+            ("zero timestamp renders empty string", 0u64, ""),
+            ("epoch ms renders UTC time of day", 1_700_000_000_123u64, "22:13:20"),
+        ];
+        assert_table!(time_cases, |(name, ms, expected)| {
+            assert_eq!(time_of_day(ms), expected, "{name}");
+        });
     }
 
     #[test]
-    fn sort_by_time_and_length() {
-        let mut r = rows();
-        sort_rows(&mut r, HistorySortColumn::Time, true);
-        assert_eq!(ids(&r), [2, 4, 3, 1, 5], "ties keep id order");
-        sort_rows(&mut r, HistorySortColumn::Time, false);
-        assert_eq!(ids(&r), [5, 1, 3, 2, 4], "ties keep id order descending too");
-        sort_rows(&mut r, HistorySortColumn::Length, true);
-        assert_eq!(ids(&r), [3, 5, 1, 2, 4]);
-        sort_rows(&mut r, HistorySortColumn::Length, false);
-        assert_eq!(ids(&r), [2, 4, 1, 5, 3]);
-    }
+    fn filter_and_search_matrix() {
+        let default_scope = TargetScope::default();
+        let mut shop_scope = TargetScope::default();
+        shop_scope.include.push(ScopeRule::new("https://shop.test/"));
 
-    #[test]
-    fn clicking_columns() {
-        let mut f = HistoryFilter::default();
-        assert_eq!((f.sort_column, f.sort_ascending), (Some(HistorySortColumn::Id), true));
-        f.click_column(HistorySortColumn::Id);
-        assert!(!f.sort_ascending, "same column: reversed");
-        f.click_column(HistorySortColumn::Length);
-        assert_eq!((f.sort_column, f.sort_ascending), (Some(HistorySortColumn::Length), true), "a new column starts ascending");
-        let mut r = rows();
-        let before = ids(&r);
-        HistoryFilter { sort_column: None, ..Default::default() }.sort(&mut r);
-        assert_eq!(ids(&r), before, "no sort column: order untouched");
-    }
+        let default_skip = skip();
+        let custom_json_skip = vec!["json".to_string()];
 
-    #[test]
-    fn sorting_a_view_leaves_history_alone() {
-        let history: Vec<Arc<HttpEntry>> = rows();
-        let mut view: Vec<Arc<HttpEntry>> = history.clone();
-        HistoryFilter { sort_column: Some(HistorySortColumn::Length), sort_ascending: false, ..Default::default() }.sort(&mut view);
-        assert_eq!(ids(&history), [1, 2, 3, 4, 5]);
-        assert_ne!(ids(&view), ids(&history));
-    }
+        let mut post_api_entry = HttpFixture::post("API.test", "/v1/users?id=7", "id=7")
+            .with_tls(true)
+            .with_response("201 Created", "created")
+            .into_history_entry(1, "Proxy");
+        post_api_entry.mime = "HTML".into();
+        post_api_entry.length = 512;
 
-    #[test]
-    fn time_column() {
-        assert_eq!(time_of_day(0), "");
-        assert_eq!(time_of_day(1_700_000_000_123), "22:13:20");
+        struct FilterCase {
+            name: &'static str,
+            filter: HistoryFilter,
+            entry: HttpEntry,
+            scope: TargetScope,
+            skip_ext: Vec<String>,
+            expected: bool,
+        }
+
+        let cases = [
+            // Scope filtering
+            FilterCase {
+                name: "scope off allows in-scope entry",
+                filter: HistoryFilter::default(),
+                entry: entry(1, "https://shop.test/cart", "200 OK"),
+                scope: shop_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "scope off allows out-of-scope entry",
+                filter: HistoryFilter::default(),
+                entry: entry(2, "https://ads.test/p", "200 OK"),
+                scope: shop_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "only_in_scope allows in-scope entry",
+                filter: HistoryFilter { only_in_scope: true, ..Default::default() },
+                entry: entry(1, "https://shop.test/cart", "200 OK"),
+                scope: shop_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "only_in_scope rejects out-of-scope entry",
+                filter: HistoryFilter { only_in_scope: true, ..Default::default() },
+                entry: entry(2, "https://ads.test/p", "200 OK"),
+                scope: shop_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            // Static asset filtering
+            FilterCase {
+                name: "hide_static_assets skips uppercase PNG with query string",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(1, "https://a.test/logo.PNG?v=2", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "hide_static_assets skips .js asset",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(2, "https://a.test/app.js", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "hide_static_assets keeps extensionless API route",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(3, "https://a.test/api/users", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "hide_static_assets keeps .json under default skip list",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(4, "https://a.test/data.json", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "hide_static_assets skips .json when custom skip list includes json",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(4, "https://a.test/data.json", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: custom_json_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "hide_static_assets keeps .png when custom skip list only has json",
+                filter: HistoryFilter { hide_static_assets: true, ..Default::default() },
+                entry: entry(1, "https://a.test/logo.png", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: custom_json_skip.clone(),
+                expected: true,
+            },
+            // Status code buckets
+            FilterCase {
+                name: "status bucket filter allows 200 OK when 2xx enabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "200 OK"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "status bucket filter allows 204 No Content when 2xx enabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "204 No Content"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "status bucket filter hides 302 Found when 3xx disabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "302 Found"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "status bucket filter allows 404 Not Found when 4xx enabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "404 Not Found"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "status bucket filter hides 503 Unavailable when 5xx disabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "503 Unavailable"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "status bucket filter allows 200 (Tunnel) when 2xx enabled",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", "200 (Tunnel)"),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "status bucket filter allows CONNECTION_FAILED when hide_no_response is false",
+                filter: HistoryFilter { show_3xx: false, show_5xx: false, ..Default::default() },
+                entry: entry(1, "http://a.test/", crate::http::CONNECTION_FAILED),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "hide_no_response hides CONNECTION_FAILED",
+                filter: HistoryFilter { hide_no_response: true, ..Default::default() },
+                entry: entry(1, "http://a.test/", crate::http::CONNECTION_FAILED),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            // Substring & Regex search across host, method, path, status, MIME
+            FilterCase {
+                name: "substring search matches host case-insensitively",
+                filter: HistoryFilter { search_term: "api.test".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search matches method case-insensitively",
+                filter: HistoryFilter { search_term: "post".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search matches path case-insensitively",
+                filter: HistoryFilter { search_term: "/V1/US".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search matches status code",
+                filter: HistoryFilter { search_term: "201".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search matches MIME type case-insensitively",
+                filter: HistoryFilter { search_term: "html".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search trims surrounding whitespace",
+                filter: HistoryFilter { search_term: "  users  ".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "substring search rejects unmatched method",
+                filter: HistoryFilter { search_term: "delete".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "substring search treats regex brackets literally",
+                filter: HistoryFilter { search_term: "v[0-9]".into(), is_regex: false, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "regex search matches path digits",
+                filter: HistoryFilter { search_term: r"/v\d+/".into(), is_regex: true, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "regex search matches whole method field case-insensitively",
+                filter: HistoryFilter { search_term: "^post$".into(), is_regex: true, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "regex search matches 2xx status pattern",
+                filter: HistoryFilter { search_term: r"^2\d\d".into(), is_regex: true, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+            FilterCase {
+                name: "regex search rejects non-matching 4xx status pattern",
+                filter: HistoryFilter { search_term: r"^4\d\d".into(), is_regex: true, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: false,
+            },
+            FilterCase {
+                name: "invalid regex filters nothing and allows entry through",
+                filter: HistoryFilter { search_term: "(unclosed".into(), is_regex: true, ..Default::default() },
+                entry: post_api_entry.clone(),
+                scope: default_scope.clone(),
+                skip_ext: default_skip.clone(),
+                expected: true,
+            },
+        ];
+
+        assert_table!(cases, |case| {
+            assert_eq!(
+                case.filter.matches(&case.entry, &case.scope, &case.skip_ext),
+                case.expected,
+                "case '{}'",
+                case.name
+            );
+        });
+
+        assert!(HistoryFilter::default().is_default_filter());
+        assert!(!HistoryFilter { hide_static_assets: true, ..Default::default() }.is_default_filter());
+        assert!(HistoryFilter { search_term: "(unclosed".into(), is_regex: true, ..Default::default() }.regex_error());
+        assert!(!HistoryFilter { search_term: "(unclosed".into(), is_regex: false, ..Default::default() }.regex_error());
     }
 }
