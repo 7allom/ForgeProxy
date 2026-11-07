@@ -33,17 +33,20 @@ fn keep_selection_on_right_click(out: &egui::text_edit::TextEditOutput) {
 }
 
 /// Where a message editor's right-click menu sends text.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SendText { Decoder, Comparer }
 
 /// What was picked in a message editor's right-click menu: the destination, the text, and
 /// whether it was a selection (rather than the whole message).
+#[allow(dead_code)]
 pub struct MenuPick {
     pub to: SendText,
     pub text: String,
     pub selection: bool,
 }
 
+#[allow(dead_code)]
 impl MenuPick {
     /// Comparer item label: "Repeater response" or "Repeater response selection (142 bytes)".
     pub fn label(&self, what: &str) -> String {
@@ -51,16 +54,9 @@ impl MenuPick {
     }
 }
 
-/// Right-click menu on a message editor: send the selection (or the whole message when
-/// nothing is selected) to the Decoder or the Comparer, or copy the selection.
-pub fn message_menu(out: &egui::text_edit::TextEditOutput, text: &str) -> Option<MenuPick> {
-    menu_for(out, text, text, "message")
-}
-
-/// The menu for a view showing `shown` (Pretty or Hex text) of the message `raw`: a
-/// selection is taken from what's shown; "the message" is always the original.
-/// `noun` names the whole message in the menu ("message", "response").
-fn menu_for(out: &egui::text_edit::TextEditOutput, shown: &str, raw: &str, noun: &str) -> Option<MenuPick> {
+/// Preserve the editor's selection across a secondary-button click and offer any focused
+/// selection to the Inspector's Auto-Decoder. Returns the currently selected text, if any.
+pub fn prepare_context_menu(out: &egui::text_edit::TextEditOutput, shown: &str) -> Option<String> {
     keep_selection_on_right_click(out);
     let selection = selected_text(out, shown);
     // only the pane being worked in feeds the Auto-Decoder: a selection left behind in a
@@ -68,6 +64,22 @@ fn menu_for(out: &egui::text_edit::TextEditOutput, shown: &str, raw: &str, noun:
     if let Some(sel) = selection.as_ref().filter(|_| out.response.has_focus()) {
         offer_to_decoder(&out.response.ctx, "Selection", sel);
     }
+    selection
+}
+
+/// Right-click menu on a message editor: send the selection (or the whole message when
+/// nothing is selected) to the Decoder or the Comparer, or copy the selection.
+#[allow(dead_code)]
+pub fn message_menu(out: &egui::text_edit::TextEditOutput, text: &str) -> Option<MenuPick> {
+    menu_for(out, text, text, "message")
+}
+
+/// The menu for a view showing `shown` (Pretty or Hex text) of the message `raw`: a
+/// selection is taken from what's shown; "the message" is always the original.
+/// `noun` names the whole message in the menu ("message", "response").
+#[allow(dead_code)]
+fn menu_for(out: &egui::text_edit::TextEditOutput, shown: &str, raw: &str, noun: &str) -> Option<MenuPick> {
+    let selection = prepare_context_menu(out, shown);
     let mut pick = None;
     out.response.context_menu(|ui| {
         let what = if selection.is_some() { "selection" } else { noun };
@@ -317,15 +329,22 @@ pub struct MessageView {
 }
 
 impl MessageView {
+    /// Text as currently rendered in this view (Pretty/Hex formatting, or `raw` in Raw mode).
+    pub fn shown_text<'a>(&'a self, raw: &'a str) -> &'a str {
+        self.shown.as_deref().unwrap_or(raw)
+    }
+
     /// The right-click menu (see `message_menu`): selections come from what's shown, the
     /// whole message is always `raw`, the original.
+    #[allow(dead_code)]
     pub fn menu(&self, raw: &str) -> Option<MenuPick> {
         self.menu_named(raw, "message")
     }
 
     /// `menu`, with the whole message called `noun` ("Send response to Comparer").
+    #[allow(dead_code)]
     pub fn menu_named(&self, raw: &str, noun: &str) -> Option<MenuPick> {
-        menu_for(&self.out, self.shown.as_deref().unwrap_or(raw), raw, noun)
+        menu_for(&self.out, self.shown_text(raw), raw, noun)
     }
 }
 

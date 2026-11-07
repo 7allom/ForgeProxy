@@ -148,6 +148,8 @@ pub fn reset(app: &mut App) {
     app.new_scan_urls.clear();
     app.new_scan_crawl = true;
     app.organizer.clear();
+    app.org_sel = None;
+    app.discover_sel = None;
     app.reset_repeater();
     app.rep_renaming = None;
     app.int_target = DEFAULT_INT_TARGET.into();

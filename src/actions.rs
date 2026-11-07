@@ -418,7 +418,70 @@ pub fn send_text_to_decoder(app: &mut App, text: String) {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum SendTo { Repeater, Intruder, Sequencer, Comparer, ComparerRequest, Organizer, Scope }
+pub enum SendTo { Repeater, Intruder, Sequencer, Comparer, ComparerRequest, Decoder, Organizer, Scope }
+
+/// "Send to Intruder": populates the Intruder target and request template from a raw request
+/// and switches to the Intruder tab.
+pub fn send_to_intruder(app: &mut App, url: &str, request: &str) {
+    let full_url = repeater_target(request, url);
+    app.int_target = origin_of(&full_url);
+    app.int_template = request.to_string();
+    // results of the previous attack belong to the previous request
+    reset_attack(app);
+    app.int_sel = None;
+    app.tab = crate::state::Tab::Intruder;
+}
+
+/// "Send to Sequencer": populates the Sequencer live-capture request template and target origin,
+/// resets any previous token collection, and switches to the Sequencer tab.
+pub fn send_to_sequencer(app: &mut App, url: &str, request: &str) {
+    let full_url = repeater_target(request, url);
+    app.seq_template = request.to_string();
+    app.seq_origin = origin_of(&full_url);
+    app.seq_samples.clear();
+    app.seq_analysis = None;
+    app.seq_message.clear();
+    app.seq_sub = 0;
+    app.tab = crate::state::Tab::Sequencer;
+}
+
+/// "Send to Organizer": stores the request/response in the Organizer inbox and switches to Organizer.
+pub fn send_to_organizer(app: &mut App, url: &str, request: &str, response: &str) {
+    use crate::state::{OrgItem, OrgStatus, Tab};
+    let full_url = repeater_target(request, url);
+    let (host, path) = http::split_url(&full_url);
+    let method = request_method(request).unwrap_or_else(|| "GET".to_string());
+    app.organizer.push(OrgItem {
+        method,
+        host,
+        path,
+        note: String::new(),
+        highlight: None,
+        status: OrgStatus::New,
+        request: request.to_string(),
+        response: response.to_string(),
+        url: full_url,
+    });
+    app.tab = Tab::Organizer;
+}
+
+/// Full raw HTTP request for an Organizer item (synthesizing a minimal HTTP/1.1 request if
+/// loaded from an older project file that only stored method/host/path).
+pub fn org_item_request(it: &crate::state::OrgItem) -> String {
+    if !it.request.trim().is_empty() {
+        return it.request.clone();
+    }
+    let path = if it.path.is_empty() { "/".to_string() } else { it.path.clone() };
+    format!("{} {} HTTP/1.1\nHost: {}\nUser-Agent: {}\nAccept: */*\nConnection: close\n\n", it.method, path, it.host, http::USER_AGENT)
+}
+
+/// Target URL for an Organizer item.
+pub fn org_item_url(it: &crate::state::OrgItem) -> String {
+    if !it.url.trim().is_empty() {
+        return it.url.clone();
+    }
+    format!("http://{}{}", it.host, if it.path.is_empty() { "/" } else { &it.path })
+}
 
 /// "Proxy history", "Repeater history"... for labels of items taken from history.
 pub fn history_name(e: &HttpEntry) -> String {
@@ -476,23 +539,8 @@ pub fn send_to(app: &mut App, e: &HttpEntry, to: SendTo) {
     use crate::state::{OrgItem, OrgStatus, Tab};
     match to {
         SendTo::Repeater => send_to_repeater(app, &e.method, &entry_url(e), &raw_request(e)),
-        SendTo::Intruder => {
-            app.int_target = origin_of(&entry_url(e));
-            app.int_template = raw_request(e);
-            // results of the previous attack belong to the previous request
-            reset_attack(app);
-            app.int_sel = None;
-            app.tab = Tab::Intruder;
-        }
-        SendTo::Sequencer => {
-            app.seq_template = raw_request(e);
-            app.seq_origin = origin_of(&entry_url(e));
-            app.seq_samples.clear();
-            app.seq_analysis = None;
-            app.seq_message.clear();
-            app.seq_sub = 0;
-            app.tab = Tab::Sequencer;
-        }
+        SendTo::Intruder => send_to_intruder(app, &entry_url(e), &raw_request(e)),
+        SendTo::Sequencer => send_to_sequencer(app, &entry_url(e), &raw_request(e)),
         SendTo::Comparer => {
             crate::comparer::add(app, format!("{} #{} (Response)", history_name(e), e.id), e.response.as_bytes());
             app.tab = Tab::Comparer;
@@ -501,8 +549,22 @@ pub fn send_to(app: &mut App, e: &HttpEntry, to: SendTo) {
             crate::comparer::add(app, format!("{} #{} (Request)", history_name(e), e.id), raw_request(e).as_bytes());
             app.tab = Tab::Comparer;
         }
+        SendTo::Decoder => {
+            let text = if !e.request.trim().is_empty() { raw_request(e) } else { e.response.clone() };
+            send_text_to_decoder(app, text);
+        }
         SendTo::Organizer => {
-            app.organizer.push(OrgItem { method: e.method.clone(), host: e.host.clone(), path: e.path.clone(), note: String::new(), highlight: None, status: OrgStatus::New });
+            app.organizer.push(OrgItem {
+                method: e.method.clone(),
+                host: e.host.clone(),
+                path: e.path.clone(),
+                note: String::new(),
+                highlight: None,
+                status: OrgStatus::New,
+                request: raw_request(e),
+                response: e.response.clone(),
+                url: entry_url(e),
+            });
             app.tab = Tab::Organizer;
         }
         SendTo::Scope => app.target_scope.add(&scope_prefix(e)),
@@ -781,5 +843,40 @@ mod tests {
         drain_attack(&ctx, &mut app, 500);
         assert!(!app.int_running, "stopped");
         assert!(app.int_results.len() < 500, "not every request ran after Stop");
+    }
+
+    #[test]
+    fn send_to_sequencer_and_inter_tool_routing_work() {
+        let (_ctx, mut app) = test_app();
+        app.seq_samples = vec!["old_tok".into()];
+        let raw_req = "POST /session HTTP/1.1\nHost: auth.example.com\n\nuser=alice";
+        send_to_sequencer(&mut app, "https://auth.example.com/session", raw_req);
+        assert_eq!(app.tab, crate::state::Tab::Sequencer);
+        assert_eq!(app.seq_origin, "https://auth.example.com");
+        assert_eq!(app.seq_template, raw_req);
+        assert!(app.seq_samples.is_empty());
+
+        // Self-link filtering in centralized context menu targets
+        for tool_tab in [
+            crate::state::Tab::Repeater,
+            crate::state::Tab::Intruder,
+            crate::state::Tab::Sequencer,
+            crate::state::Tab::Comparer,
+            crate::state::Tab::Decoder,
+            crate::state::Tab::Organizer,
+        ] {
+            let targets = crate::ui_tools::traffic_context_menu_targets(tool_tab);
+            assert_eq!(targets.len(), 5, "calling tool {:?} should hide only itself", tool_tab);
+            let self_label = format!("Send to {}", tool_tab.label());
+            assert!(
+                targets.iter().all(|(l, _)| *l != self_label),
+                "redundant self-link {:?} should be hidden",
+                self_label
+            );
+        }
+
+        // Non-destination views (Proxy, Target, Logger, Discover) show all 6 standard targets
+        let proxy_targets = crate::ui_tools::traffic_context_menu_targets(crate::state::Tab::Proxy);
+        assert_eq!(proxy_targets.len(), 6);
     }
 }

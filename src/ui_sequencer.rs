@@ -36,7 +36,10 @@ fn capture(app: &mut App, ui: &mut Ui, p: &Palette) {
         ui.add_space(4.0);
         // the raw request is editable (monospace, multiline) until a capture is running, so
         // headers/cookies can be tweaked here before Start
-        editor::message_editor(ui, p, "seq_template", &mut app.seq_template, !app.seq_running, false, 150.0);
+        let out = editor::message_editor(ui, p, "seq_template", &mut app.seq_template, !app.seq_running, false, 150.0);
+        let seq_url = app.seq_origin.clone();
+        let seq_req = app.seq_template.clone();
+        crate::ui_tools::attach_editor_context_menu(&out, &seq_req, &seq_req, app, crate::state::Tab::Sequencer, &seq_url, &seq_req, None, "Sequencer request");
     }
 
     ui.add_space(10.0);

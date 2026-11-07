@@ -11,11 +11,12 @@ use egui::Color32;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
     Dashboard, Target, Proxy, Intruder, Repeater, Collaborator, Sequencer,
     Decoder, Comparer, Logger, Organizer, Discover,
 }
+impl Copy for Tab {}
 
 impl Tab {
     pub const ALL: [Tab; 12] = [
@@ -53,6 +54,12 @@ pub struct OrgItem {
     pub note: String,
     pub highlight: Option<usize>,
     pub status: OrgStatus,
+    #[serde(default)]
+    pub request: String,
+    #[serde(default)]
+    pub response: String,
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Clone)]
@@ -419,9 +426,11 @@ pub struct App {
 
     // organizer
     pub organizer: Vec<OrgItem>,
+    pub org_sel: Option<usize>,
     pub org_only_highlighted: bool,
     pub org_only_notes: bool,
     pub org_search: String,
+    pub discover_sel: Option<usize>,
 
     // extensions
     pub show_settings: bool,
@@ -616,9 +625,11 @@ impl App {
             comparer_next_id: 0,
             comparer_paste: String::new(),
             organizer: Vec::new(),
+            org_sel: None,
             org_only_highlighted: false,
             org_only_notes: false,
             org_search: String::new(),
+            discover_sel: None,
             show_settings: false,
             settings_page: SettingsPage::Proxy,
             settings_focus: None,

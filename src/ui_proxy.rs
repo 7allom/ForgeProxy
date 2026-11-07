@@ -145,7 +145,9 @@ fn intercept(app: &mut App, ui: &mut Ui, p: &Palette) {
         // the Inspector follows the edits: it parses the held request as it stands
         let held = app.held_loaded.map_or(String::new(), |id| id.to_string());
         crate::ui_inspector::inspector_panel(ui, p, &mut app.inspector, "intercept", &held, &app.held_edit, None);
-        editor::message_editor(ui, p, "held", &mut app.held_edit, true, false, ui.available_height() - 10.0);
+        let out = editor::message_editor(ui, p, "held", &mut app.held_edit, true, false, ui.available_height() - 10.0);
+        let cur_req = app.held_edit.clone();
+        crate::ui_tools::attach_editor_context_menu(&out, &cur_req, &cur_req, app, crate::state::Tab::Proxy, &url, &cur_req, None, "Intercepted request");
         return;
     }
     let on = app.proxy.intercept.load(Ordering::SeqCst);
@@ -385,7 +387,19 @@ pub enum RowAction { AddToScope, RemoveFromScope, Send(crate::actions::SendTo) }
 
 /// Right-click menu for a history row or site map item. Drawing can't change the app, so
 /// it returns the choice; `scope_menu_apply` carries it out.
+#[allow(dead_code)]
 pub fn scope_menu_pick(ui: &mut Ui, scope: &crate::scope::TargetScope, e: &crate::http::HttpEntry, prefix: &str) -> Option<RowAction> {
+    scope_menu_pick_for(ui, scope, e, prefix, crate::state::Tab::Proxy)
+}
+
+/// Right-click menu for a traffic row in `source_tab`, hiding any redundant link to `source_tab`.
+pub fn scope_menu_pick_for(
+    ui: &mut Ui,
+    scope: &crate::scope::TargetScope,
+    e: &crate::http::HttpEntry,
+    prefix: &str,
+    source_tab: crate::state::Tab,
+) -> Option<RowAction> {
     use crate::actions::SendTo;
     let in_scope = scope.is_in_scope(&crate::actions::entry_url(e));
     let mut pick = None;
@@ -396,9 +410,12 @@ pub fn scope_menu_pick(ui: &mut Ui, scope: &crate::scope::TargetScope, e: &crate
         pick = Some(RowAction::RemoveFromScope);
     }
     ui.separator();
-    for (label, to) in [("Send to Repeater", SendTo::Repeater), ("Send to Intruder", SendTo::Intruder), ("Send to Sequencer", SendTo::Sequencer),
-                        ("Send to Organizer", SendTo::Organizer), ("Send request to Comparer", SendTo::ComparerRequest), ("Send response to Comparer", SendTo::Comparer)] {
+    for (label, to) in crate::ui_tools::traffic_context_menu_targets(source_tab) {
         if ui.button(label).clicked() { pick = Some(RowAction::Send(to)); }
+        if to == SendTo::Comparer {
+            if ui.button("Send request to Comparer").clicked() { pick = Some(RowAction::Send(SendTo::ComparerRequest)); }
+            if ui.button("Send response to Comparer").clicked() { pick = Some(RowAction::Send(SendTo::Comparer)); }
+        }
     }
     ui.separator();
     if ui.button("Copy as cURL").on_hover_text("Copy the request as a curl command").clicked() {

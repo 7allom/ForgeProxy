@@ -12,14 +12,12 @@ use crate::ui_core::method_color;
 use eframe::egui;
 use egui::{RichText, Ui};
 
-/// A right-click choice on a tree node, applied after drawing (drawing can't touch the app).
+/// A right-click choice on a tree node or table row, applied after drawing (drawing can't touch the app).
 enum NodeAction {
     /// Add the node's origin to the target scope (via a representative request).
     AddHostToScope(usize),
-    /// Send a representative request under the node to Repeater.
-    SendToRepeater(usize),
-    /// Send a representative request under the node to the Sequencer.
-    SendToSequencer(usize),
+    /// Send a request under the node to another tool.
+    Send(usize, actions::SendTo),
     /// Copy the node's URL to the clipboard.
     CopyUrl(String),
 }
@@ -38,9 +36,21 @@ fn node_menu(ui: &mut Ui, node: &SiteMapNode) -> Option<NodeAction> {
         if ui.button("Add host to scope").clicked() {
             pick = Some(NodeAction::AddHostToScope(id));
         }
-        if ui.button("Send to Repeater").clicked() {
-            pick = Some(NodeAction::SendToRepeater(id));
+        ui.separator();
+        for (label, to) in crate::ui_tools::traffic_context_menu_targets(crate::state::Tab::Target) {
+            if ui.button(label).clicked() {
+                pick = Some(NodeAction::Send(id, to));
+            }
+            if to == actions::SendTo::Comparer {
+                if ui.button("Send request to Comparer").clicked() {
+                    pick = Some(NodeAction::Send(id, actions::SendTo::ComparerRequest));
+                }
+                if ui.button("Send response to Comparer").clicked() {
+                    pick = Some(NodeAction::Send(id, actions::SendTo::Comparer));
+                }
+            }
         }
+        ui.separator();
     }
     if ui.button("Copy URL").clicked() {
         pick = Some(NodeAction::CopyUrl(node.full_url.clone()));
@@ -58,14 +68,9 @@ fn apply_node_action(app: &mut App, all: &[std::sync::Arc<crate::http::HttpEntry
                 app.target_scope.add(&actions::scope_prefix(e));
             }
         }
-        NodeAction::SendToRepeater(id) => {
+        NodeAction::Send(id, to) => {
             if let Some(e) = all.iter().find(|e| e.id == id).cloned() {
-                actions::send_to(app, &e, actions::SendTo::Repeater);
-            }
-        }
-        NodeAction::SendToSequencer(id) => {
-            if let Some(e) = all.iter().find(|e| e.id == id).cloned() {
-                actions::send_to(app, &e, actions::SendTo::Sequencer);
+                actions::send_to(app, &e, to);
             }
         }
         NodeAction::CopyUrl(url) => ctx.copy_text(url),
@@ -169,21 +174,35 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                         if theme::plain_button(ui, p, "Send to Repeater", true).clicked() {
                             actions::send_to(app, &e, actions::SendTo::Repeater);
                         }
+                        if theme::plain_button(ui, p, "Send to Intruder", true).clicked() {
+                            actions::send_to(app, &e, actions::SendTo::Intruder);
+                        }
+                        if theme::plain_button(ui, p, "Send to Sequencer", true).clicked() {
+                            actions::send_to(app, &e, actions::SendTo::Sequencer);
+                        }
+                        if theme::plain_button(ui, p, "Send to Comparer", true).clicked() {
+                            actions::send_to(app, &e, actions::SendTo::Comparer);
+                        }
+                        if theme::plain_button(ui, p, "Send to Decoder", true).clicked() {
+                            actions::send_to(app, &e, actions::SendTo::Decoder);
+                        }
+                        if theme::plain_button(ui, p, "Send to Organizer", true).clicked() {
+                            actions::send_to(app, &e, actions::SendTo::Organizer);
+                        }
                     });
                     ui.add_space(2.0);
                     let name = format!("{} #{}", actions::history_name(&e), e.id);
-                    let mut menu_pick = None;
-                    ui.columns(2, |cols| {
+                    let (out_req, out_resp) = ui.columns(2, |cols| {
                         cols[0].label(bold("Request", 13.0).color(p.strong));
-                        let out = editor::message_view(&mut cols[0], p, "sm_req", &e.request, 140.0);
-                        menu_pick = out.menu(&e.request).map(|m| (m, format!("{name} request")));
+                        let req_v = editor::message_view(&mut cols[0], p, "sm_req", &e.request, 140.0);
                         cols[1].label(bold("Response", 13.0).color(p.strong));
-                        let out = editor::message_view(&mut cols[1], p, "sm_resp", &e.response, 140.0);
-                        menu_pick = menu_pick.take().or_else(|| out.menu(&e.response).map(|m| (m, format!("{name} response"))));
+                        let resp_v = editor::message_view(&mut cols[1], p, "sm_resp", &e.response, 140.0);
+                        (req_v, resp_v)
                     });
-                    if let Some((m, what)) = menu_pick {
-                        crate::ui_tools::apply_menu_pick(app, m, &what);
-                    }
+                    let e_url = actions::entry_url(&e);
+                    let e_req = actions::raw_request(&e);
+                    crate::ui_tools::attach_view_context_menu(&out_req, &e.request, app, crate::state::Tab::Target, &e_url, &e_req, Some(&e.response), &format!("{name} request"));
+                    crate::ui_tools::attach_view_context_menu(&out_resp, &e.response, app, crate::state::Tab::Target, &e_url, &e_req, Some(&e.response), &format!("{name} response"));
                 });
         }
 
@@ -214,14 +233,23 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                             clicked = Some(e.id);
                         }
                         row.context_menu(|ui| {
-                            if ui.button("Send to Repeater").clicked() {
-                                menu = Some(NodeAction::SendToRepeater(e.id));
-                                ui.close_menu();
+                            for (label, to) in crate::ui_tools::traffic_context_menu_targets(crate::state::Tab::Target) {
+                                if ui.button(label).clicked() {
+                                    menu = Some(NodeAction::Send(e.id, to));
+                                    ui.close_menu();
+                                }
+                                if to == actions::SendTo::Comparer {
+                                    if ui.button("Send request to Comparer").clicked() {
+                                        menu = Some(NodeAction::Send(e.id, actions::SendTo::ComparerRequest));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Send response to Comparer").clicked() {
+                                        menu = Some(NodeAction::Send(e.id, actions::SendTo::Comparer));
+                                        ui.close_menu();
+                                    }
+                                }
                             }
-                            if ui.button("Send to Sequencer").clicked() {
-                                menu = Some(NodeAction::SendToSequencer(e.id));
-                                ui.close_menu();
-                            }
+                            ui.separator();
                             if ui.button("Copy as cURL").clicked() {
                                 ui.ctx().copy_text(actions::entry_as_curl(e));
                                 ui.close_menu();

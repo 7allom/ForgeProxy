@@ -320,6 +320,9 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
             let (a, b) = (r.primary.ccursor.index, r.secondary.ccursor.index);
             app.int_sel = if a != b { Some((a.min(b), a.max(b))) } else { app.int_sel.filter(|_| !out.response.has_focus()) };
         }
+        let int_url = app.int_target.clone();
+        let int_req = app.int_template.clone();
+        attach_editor_context_menu(&out, &int_req, &int_req, app, Tab::Intruder, &int_url, &int_req, None, "Intruder request");
     });
 }
 
@@ -420,12 +423,17 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                                 }
                             });
                             let h = (ui.available_height() - 22.0).max(60.0);
-                            ui.columns(2, |cols| {
+                            let (out_req, out_resp) = ui.columns(2, |cols| {
                                 cols[0].label(bold("Request", 12.5).color(p.strong));
-                                editor::message_view(&mut cols[0], p, &format!("int_req_{id}"), &e.request, h);
+                                let req_v = editor::message_view(&mut cols[0], p, &format!("int_req_{id}"), &e.request, h);
                                 cols[1].label(bold("Response", 12.5).color(p.strong));
-                                editor::message_view(&mut cols[1], p, &format!("int_resp_{id}"), &e.response, h);
+                                let resp_v = editor::message_view(&mut cols[1], p, &format!("int_resp_{id}"), &e.response, h);
+                                (req_v, resp_v)
                             });
+                            let e_url = actions::entry_url(&e);
+                            let e_req = actions::raw_request(&e);
+                            attach_view_context_menu(&out_req, &e.request, app, Tab::Intruder, &e_url, &e_req, Some(&e.response), &format!("Intruder #{} request", e.id));
+                            attach_view_context_menu(&out_resp, &e.response, app, Tab::Intruder, &e_url, &e_req, Some(&e.response), &format!("Intruder #{} response", e.id));
                         }
                         None => { ui.label(RichText::new("This request is no longer in history.").size(12.0).color(p.disabled)); }
                     });
@@ -451,11 +459,20 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                                 row_click = Some(id);
                             }
                             row.context_menu(|ui| {
-                                for (label, to) in [("Send request to Comparer", actions::SendTo::ComparerRequest), ("Send response to Comparer", actions::SendTo::Comparer),
-                                                    ("Send to Repeater", actions::SendTo::Repeater)] {
+                                for (label, to) in traffic_context_menu_targets(Tab::Intruder) {
                                     if ui.button(label).clicked() {
                                         attack_pick = Some((id, to));
                                         ui.close_menu();
+                                    }
+                                    if to == actions::SendTo::Comparer {
+                                        if ui.button("Send request to Comparer").clicked() {
+                                            attack_pick = Some((id, actions::SendTo::ComparerRequest));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Send response to Comparer").clicked() {
+                                            attack_pick = Some((id, actions::SendTo::Comparer));
+                                            ui.close_menu();
+                                        }
                                     }
                                 }
                             });
@@ -486,7 +503,6 @@ const REPEATER_PAD: i8 = 6;
 pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
     let mut send = false;
     let mut to_sequencer: Option<(String, String)> = None;
-    let mut pick = None;
     egui::Frame::new().inner_margin(egui::Margin::same(REPEATER_PAD)).show(ui, |ui| {
         repeater_tab_strip(app, ui, p);
         ui.add_space(6.0);
@@ -517,7 +533,7 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
                 ui.ctx().copy_text(crate::export::to_curl(&tab.request, &actions::origin_of(&tab.url)));
             }
             if theme::plain_button(ui, p, "Send to Sequencer", tab.can_send()).on_hover_text("Analyse the randomness of a token in this response").clicked() {
-                to_sequencer = Some((tab.request.clone(), actions::origin_of(&tab.url)));
+                to_sequencer = Some((tab.url.clone(), tab.request.clone()));
             }
             crate::ui_inspector::toggle_button(ui, &mut app.inspector);
         });
@@ -538,45 +554,42 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
             });
             ui.add_space(4.0);
         };
+        let tab_url = app.repeater_tabs[i].url.clone();
+        let tab_req = app.repeater_tabs[i].request.clone();
+        let tab_resp = app.repeater_tabs[i].response.clone();
+        let tab_title = app.repeater_tabs[i].title.clone();
         egui::SidePanel::right("rep_response_pane").resizable(true).default_width(width / 2.0)
             .width_range((width * 0.25)..=(width * 0.75))
             .frame(egui::Frame::new().inner_margin(egui::Margin { left: GAP, ..Default::default() }))
             .show_inside(ui, |ui| {
-                let tab = &mut app.repeater_tabs[i];
-                header(ui, format!("Response{}", response_summary(tab)));
+                let summary = response_summary(&app.repeater_tabs[i]);
+                header(ui, format!("Response{summary}"));
                 let h = ui.available_height() - 2.0;
                 // each tab keeps its own Raw / Pretty / Hex choice
                 let view_id = format!("rep_resp:{tab_id}");
-                editor::set_view_mode(ui.ctx(), &view_id, tab.view_mode);
-                let text = tab.response.as_deref().unwrap_or("");
+                editor::set_view_mode(ui.ctx(), &view_id, app.repeater_tabs[i].view_mode);
+                let text = tab_resp.as_deref().unwrap_or("");
                 let out = editor::message_view(ui, p, &view_id, text, h);
-                pick = out.menu_named(text, "response").map(|m| (m, format!("Repeater tab {} response", tab.title)));
-                tab.view_mode = editor::view_mode(ui.ctx(), &view_id);
+                app.repeater_tabs[i].view_mode = editor::view_mode(ui.ctx(), &view_id);
+                let what = format!("Repeater tab {tab_title} response");
+                attach_view_context_menu(&out, text, app, Tab::Repeater, &tab_url, &tab_req, tab_resp.as_deref(), &what);
             });
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { right: GAP, ..Default::default() }))
             .show_inside(ui, |ui| {
                 header(ui, "Request".into());
                 let h = ui.available_height() - 2.0;
-                let tab = &mut app.repeater_tabs[i];
                 // per-tab editor state: cursor and undo history don't leak between tabs
-                let out = editor::message_editor(ui, p, &format!("rep_req:{tab_id}"), &mut tab.request, true, false, h);
-                let what = format!("Repeater tab {} request", tab.title);
-                pick = pick.take().or_else(|| editor::message_menu(&out, &tab.request).map(|m| (m, what)));
+                let out = editor::message_editor(ui, p, &format!("rep_req:{tab_id}"), &mut app.repeater_tabs[i].request, true, false, h);
+                let cur_req = app.repeater_tabs[i].request.clone();
+                let what = format!("Repeater tab {tab_title} request");
+                attach_editor_context_menu(&out, &cur_req, &cur_req, app, Tab::Repeater, &tab_url, &cur_req, tab_resp.as_deref(), &what);
             });
-        sync_repeater_target(&mut app.repeater_tabs[i], &url_before, &request_before);
+        if app.repeater_tabs.get(i).is_some_and(|t| t.id == tab_id) {
+            sync_repeater_target(&mut app.repeater_tabs[i], &url_before, &request_before);
+        }
     });
-    if let Some((m, what)) = pick {
-        apply_menu_pick(app, m, &what);
-        return;
-    }
-    if let Some((template, origin)) = to_sequencer {
-        app.seq_template = template;
-        app.seq_origin = origin;
-        app.seq_samples.clear();
-        app.seq_analysis = None;
-        app.seq_message.clear();
-        app.seq_sub = 0;
-        app.tab = Tab::Sequencer;
+    if let Some((url, template)) = to_sequencer {
+        actions::send_to_sequencer(app, &url, &template);
         return;
     }
     if send {
@@ -1467,6 +1480,11 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
         }
     }
     ui.add_space(2.0);
+    let source_tab = match view {
+        View::ProxyHistory => Tab::Proxy,
+        View::Logger => Tab::Logger,
+        View::SiteMap => Tab::Target,
+    };
     // right-click actions run after drawing: (entry, scope prefix)
     let mut menu_pick: Option<(std::sync::Arc<crate::http::HttpEntry>, String, crate::ui_proxy::RowAction)> = None;
     let sel_id = app.history_sel;
@@ -1479,7 +1497,6 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
     // fills the whole view.
     let avail = ui.available_height();
     if let Some(e) = selected {
-        let mut pick = None;
         egui::TopBottomPanel::bottom(egui::Id::new(("traffic_detail", view as u8)))
             .resizable(true)
             .default_height(300.0)
@@ -1496,6 +1513,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                     if theme::plain_button(ui, p, "Send to Intruder", true).clicked() { actions::send_to(app, &e, actions::SendTo::Intruder); }
                     if theme::plain_button(ui, p, "Send to Sequencer", true).clicked() { actions::send_to(app, &e, actions::SendTo::Sequencer); }
                     if theme::plain_button(ui, p, "Send to Comparer", true).on_hover_text("Adds the response; right-click the row or a message for the request or a selection").clicked() { actions::send_to(app, &e, actions::SendTo::Comparer); }
+                    if theme::plain_button(ui, p, "Send to Decoder", true).clicked() { actions::send_to(app, &e, actions::SendTo::Decoder); }
                     if theme::plain_button(ui, p, "Send to Organizer", true).clicked() { actions::send_to(app, &e, actions::SendTo::Organizer); }
                     if theme::plain_button(ui, p, "Copy as cURL", true).on_hover_text("Copy the request as a curl command").clicked() { ui.ctx().copy_text(actions::entry_as_curl(&e)); }
                     if theme::plain_button(ui, p, "Add host to scope", true).clicked() { actions::send_to(app, &e, actions::SendTo::Scope); }
@@ -1508,19 +1526,19 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                 egui::ScrollArea::vertical().id_salt(("traffic_detail_scroll", view as u8)).auto_shrink([false, false]).show(ui, |ui| {
                     crate::ui_inspector::inspector_panel(ui, p, &mut app.inspector, "history", &e.id.to_string(), &e.request, Some(&e.response));
                     let h = (ui.available_height() - 22.0).max(120.0);
-                    ui.columns(2, |cols| {
+                    let (out_req, out_resp) = ui.columns(2, |cols| {
                         cols[0].label(bold("Request", 13.0).color(p.strong));
-                        let out = editor::message_view(&mut cols[0], p, "tv_req", &e.request, h);
-                        pick = out.menu(&e.request).map(|m| (m, format!("{name} request")));
+                        let req_v = editor::message_view(&mut cols[0], p, "tv_req", &e.request, h);
                         cols[1].label(bold("Response", 13.0).color(p.strong));
-                        let out = editor::message_view(&mut cols[1], p, "tv_resp", &e.response, h);
-                        pick = pick.take().or_else(|| out.menu(&e.response).map(|m| (m, format!("{name} response"))));
+                        let resp_v = editor::message_view(&mut cols[1], p, "tv_resp", &e.response, h);
+                        (req_v, resp_v)
                     });
+                    let e_url = actions::entry_url(&e);
+                    let e_req = actions::raw_request(&e);
+                    attach_view_context_menu(&out_req, &e.request, app, source_tab, &e_url, &e_req, Some(&e.response), &format!("{name} request"));
+                    attach_view_context_menu(&out_resp, &e.response, app, source_tab, &e_url, &e_req, Some(&e.response), &format!("{name} response"));
                 });
             });
-        if let Some((m, what)) = pick {
-            apply_menu_pick(app, m, &what);
-        }
     }
 
     egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
@@ -1553,7 +1571,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                                         let url = actions::entry_url(e);
                                         let prefix = url.split(['?', '#']).next().unwrap_or(&url).to_string();
                                         item.context_menu(|ui| {
-                                            if let Some(a) = crate::ui_proxy::scope_menu_pick(ui, &app.target_scope, e, &prefix) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                                         });
                                     }
                                 }
@@ -1561,7 +1579,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                             if let Some(e) = first {
                                 let prefix = actions::scope_prefix(&e);
                                 header.header_response.context_menu(|ui| {
-                                    if let Some(a) = crate::ui_proxy::scope_menu_pick(ui, &app.target_scope, &e, &prefix) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                                    if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, &e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                                 });
                             }
                         }
@@ -1594,7 +1612,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                         if row.secondary_clicked() { clicked = Some(e.id); }
                         let prefix = actions::scope_prefix(e);
                         row.context_menu(|ui| {
-                            if let Some(a) = crate::ui_proxy::scope_menu_pick(ui, &app.target_scope, e, &prefix) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                         });
                     }
                 });
@@ -1644,6 +1662,7 @@ fn sort_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, crate::history::His
 
 /// Carry out a message editor's right-click choice. `what` names the message for a
 /// Comparer item's label ("Repeater response", "Proxy history #3 request").
+#[allow(dead_code)]
 pub(crate) fn apply_menu_pick(app: &mut App, m: editor::MenuPick, what: &str) {
     match m.to {
         editor::SendText::Decoder => actions::send_text_to_decoder(app, m.text),
@@ -1652,6 +1671,142 @@ pub(crate) fn apply_menu_pick(app: &mut App, m: editor::MenuPick, what: &str) {
             app.tab = Tab::Comparer;
         }
     }
+}
+
+/// Standard inter-tool routing targets offered in traffic context menus, excluding the calling tool (`source_tab`).
+pub fn traffic_context_menu_targets(source_tab: Tab) -> Vec<(&'static str, actions::SendTo)> {
+    use actions::SendTo;
+    let all = [
+        ("Send to Repeater", Tab::Repeater, SendTo::Repeater),
+        ("Send to Intruder", Tab::Intruder, SendTo::Intruder),
+        ("Send to Sequencer", Tab::Sequencer, SendTo::Sequencer),
+        ("Send to Comparer", Tab::Comparer, SendTo::Comparer),
+        ("Send to Decoder", Tab::Decoder, SendTo::Decoder),
+        ("Send to Organizer", Tab::Organizer, SendTo::Organizer),
+    ];
+    all.into_iter()
+        .filter(|(_, tab, _)| *tab != source_tab)
+        .map(|(label, _, to)| (label, to))
+        .collect()
+}
+
+/// Centralized traffic context menu for HTTP message editors, viewers, and traffic rows.
+/// Hides any redundant link to `source_tab` (e.g. hides "Send to Repeater" when inside Repeater).
+#[allow(clippy::too_many_arguments)]
+pub fn show_traffic_context_menu(
+    ui: &mut Ui,
+    app: &mut App,
+    source_tab: Tab,
+    url: &str,
+    request: &str,
+    response: Option<&str>,
+    active_text: &str,
+    selection: Option<&str>,
+    label: &str,
+) {
+    let sel = selection.filter(|s| !s.is_empty());
+    let has_req = !request.trim().is_empty();
+    let payload_text = sel.unwrap_or(if !active_text.is_empty() { active_text } else { request });
+
+    for (btn_label, to) in traffic_context_menu_targets(source_tab) {
+        match to {
+            actions::SendTo::Repeater => {
+                if ui.add_enabled(has_req, egui::Button::new(btn_label)).clicked() {
+                    let method = actions::request_method(request).unwrap_or_else(|| "GET".to_string());
+                    actions::send_to_repeater(app, &method, url, request);
+                    ui.close_menu();
+                }
+            }
+            actions::SendTo::Intruder => {
+                if ui.add_enabled(has_req, egui::Button::new(btn_label)).clicked() {
+                    actions::send_to_intruder(app, url, request);
+                    ui.close_menu();
+                }
+            }
+            actions::SendTo::Sequencer => {
+                if ui.add_enabled(has_req, egui::Button::new(btn_label)).clicked() {
+                    actions::send_to_sequencer(app, url, request);
+                    ui.close_menu();
+                }
+            }
+            actions::SendTo::Comparer => {
+                if ui.button(btn_label).clicked() {
+                    let item_label = match sel {
+                        Some(s) => format!("{label} selection ({} bytes)", s.len()),
+                        None => label.to_string(),
+                    };
+                    crate::comparer::add(app, item_label, payload_text.as_bytes());
+                    app.tab = Tab::Comparer;
+                    ui.close_menu();
+                }
+            }
+            actions::SendTo::Decoder => {
+                if ui.button(btn_label).clicked() {
+                    actions::send_text_to_decoder(app, payload_text.to_string());
+                    ui.close_menu();
+                }
+            }
+            actions::SendTo::Organizer => {
+                if ui.add_enabled(has_req, egui::Button::new(btn_label)).clicked() {
+                    actions::send_to_organizer(app, url, request, response.unwrap_or(""));
+                    ui.close_menu();
+                }
+            }
+            _ => {}
+        }
+    }
+    ui.separator();
+    if let Some(s) = sel {
+        if ui.button("Copy selection").clicked() {
+            ui.ctx().copy_text(s.to_string());
+            ui.close_menu();
+        }
+    }
+    if !active_text.is_empty() && ui.button("Copy message").on_hover_text("Exactly as received, whatever the view").clicked() {
+        ui.ctx().copy_text(active_text.to_string());
+        ui.close_menu();
+    }
+    if has_req && ui.button("Copy as cURL").on_hover_text("Copy the request as a curl command").clicked() {
+        let full_url = actions::repeater_target(request, url);
+        ui.ctx().copy_text(crate::export::to_curl(request, &actions::origin_of(&full_url)));
+        ui.close_menu();
+    }
+}
+
+/// Attach [`show_traffic_context_menu`] to an [`editor::message_editor`] output while preserving
+/// right-click text selections and feeding the Inspector's Auto-Decoder.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_editor_context_menu(
+    out: &egui::text_edit::TextEditOutput,
+    shown: &str,
+    raw_active: &str,
+    app: &mut App,
+    source_tab: Tab,
+    url: &str,
+    request: &str,
+    response: Option<&str>,
+    label: &str,
+) {
+    let selection = editor::prepare_context_menu(out, shown);
+    out.response.context_menu(|ui| {
+        show_traffic_context_menu(ui, app, source_tab, url, request, response, raw_active, selection.as_deref(), label);
+    });
+}
+
+/// Attach [`show_traffic_context_menu`] to an [`editor::MessageView`] output while preserving
+/// right-click text selections in Raw, Pretty, or Hex mode.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_view_context_menu(
+    view: &editor::MessageView,
+    raw_active: &str,
+    app: &mut App,
+    source_tab: Tab,
+    url: &str,
+    request: &str,
+    response: Option<&str>,
+    label: &str,
+) {
+    attach_editor_context_menu(&view.out, view.shown_text(raw_active), raw_active, app, source_tab, url, request, response, label);
 }
 
 // ---- Organizer (picture-23) ---------------------------------------------
@@ -1669,6 +1824,49 @@ pub fn organizer(app: &mut App, ui: &mut Ui, p: &Palette) {
                 ui.label(RichText::new("Inbox").color(p.strong));
             });
         });
+    let sel_item = app.org_sel.and_then(|i| app.organizer.get(i).cloned().map(|it| (i, it)));
+    if let Some((sel_idx, it)) = sel_item {
+        let item_url = actions::org_item_url(&it);
+        let item_req = actions::org_item_request(&it);
+        let item_resp = it.response.clone();
+        egui::TopBottomPanel::bottom("org_detail")
+            .resizable(true)
+            .default_height(240.0)
+            .min_height(100.0)
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { top: 6, ..Default::default() }))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(bold(format!("{} {}{}", it.method, it.host, it.path), 12.5).color(p.strong));
+                    if theme::plain_button(ui, p, "Send to Repeater", true).clicked() {
+                        actions::send_to_repeater(app, &it.method, &item_url, &item_req);
+                    }
+                    if theme::plain_button(ui, p, "Send to Intruder", true).clicked() {
+                        actions::send_to_intruder(app, &item_url, &item_req);
+                    }
+                    if theme::plain_button(ui, p, "Send to Sequencer", true).clicked() {
+                        actions::send_to_sequencer(app, &item_url, &item_req);
+                    }
+                    if theme::plain_button(ui, p, "Send to Comparer", true).clicked() {
+                        let data = if !item_resp.is_empty() { item_resp.as_bytes() } else { item_req.as_bytes() };
+                        crate::comparer::add(app, format!("Organizer #{sel_idx}"), data);
+                        app.tab = Tab::Comparer;
+                    }
+                    if theme::plain_button(ui, p, "Send to Decoder", true).clicked() {
+                        actions::send_text_to_decoder(app, item_req.clone());
+                    }
+                });
+                let h = (ui.available_height() - 22.0).max(80.0);
+                let (out_req, out_resp) = ui.columns(2, |cols| {
+                    cols[0].label(bold("Request", 12.5).color(p.strong));
+                    let req_v = editor::message_view(&mut cols[0], p, &format!("org_req_{sel_idx}"), &item_req, h);
+                    cols[1].label(bold("Response", 12.5).color(p.strong));
+                    let resp_v = editor::message_view(&mut cols[1], p, &format!("org_resp_{sel_idx}"), &item_resp, h);
+                    (req_v, resp_v)
+                });
+                attach_view_context_menu(&out_req, &item_req, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &format!("Organizer #{sel_idx} request"));
+                attach_view_context_menu(&out_resp, &item_resp, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &format!("Organizer #{sel_idx} response"));
+            });
+    }
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(10))).show_inside(ui, |ui| {
         ui.horizontal(|ui| { ui.label(bold("Inbox", 14.0).color(p.strong)); });
         ui.add_space(4.0);
@@ -1689,41 +1887,78 @@ pub fn organizer(app: &mut App, ui: &mut Ui, p: &Palette) {
                         ui.label(bold(h, 12.5).color(p.strong));
                     }
                     ui.end_row();
-                    for (i, it) in app.organizer.iter_mut().enumerate() {
-                        let ext_hidden = it.path.contains('.')
-                            && it.path.rsplit('.').next().is_some_and(|e| rules::ORGANIZER_HIDE_EXTENSIONS.contains(&e));
-                        if ext_hidden
-                            || (!q.is_empty() && !format!("{}{} {}", it.host, it.path, it.note).to_ascii_lowercase().contains(&q))
-                            || (app.org_only_highlighted && it.highlight.is_none())
-                            || (app.org_only_notes && it.note.trim().is_empty())
-                        {
+                    let len = app.organizer.len();
+                    for i in 0..len {
+                        let (ext_hidden, matches_filter, item_url, item_req, item_resp, method, host, path, highlight) = {
+                            let it = &app.organizer[i];
+                            let ext_hidden = it.path.contains('.')
+                                && it.path.rsplit('.').next().is_some_and(|e| rules::ORGANIZER_HIDE_EXTENSIONS.contains(&e));
+                            let matches_filter = (q.is_empty() || format!("{}{} {}", it.host, it.path, it.note).to_ascii_lowercase().contains(&q))
+                                && (!app.org_only_highlighted || it.highlight.is_some())
+                                && (!app.org_only_notes || !it.note.trim().is_empty());
+                            (
+                                ext_hidden,
+                                matches_filter,
+                                actions::org_item_url(it),
+                                actions::org_item_request(it),
+                                it.response.clone(),
+                                it.method.clone(),
+                                it.host.clone(),
+                                it.path.clone(),
+                                it.highlight,
+                            )
+                        };
+                        if ext_hidden || !matches_filter {
                             continue;
                         }
-                        egui::ComboBox::from_id_salt(("orgst", i)).width(100.0)
-                            .selected_text(RichText::new(it.status.label()).color(it.status.color(p)))
-                            .show_ui(ui, |ui| {
-                                for st in crate::state::OrgStatus::ALL {
-                                    ui.selectable_value(&mut it.status, st, RichText::new(st.label()).color(st.color(p)));
-                                }
-                            });
-                        egui::ComboBox::from_id_salt(("orghl", i)).width(80.0)
-                            .selected_text(it.highlight.map(|h| HIGHLIGHTS[h].0).unwrap_or("None"))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut it.highlight, None, "None");
-                                for (h, (name, col)) in HIGHLIGHTS.iter().enumerate() {
-                                    ui.selectable_value(&mut it.highlight, Some(h), RichText::new(*name).background_color(*col).color(Color32::BLACK));
-                                }
-                            });
-                        ui.colored_label(method_color(p, &it.method), &it.method);
-                        let addr = RichText::new(format!("{}{}", it.host, it.path));
-                        ui.label(match it.highlight { Some(h) => addr.background_color(HIGHLIGHTS[h].1).color(Color32::BLACK), None => addr });
-                        ui.add_sized([320.0, 20.0], egui::TextEdit::singleline(&mut it.note).hint_text("Add a note"));
+                        {
+                            let it = &mut app.organizer[i];
+                            egui::ComboBox::from_id_salt(("orgst", i)).width(100.0)
+                                .selected_text(RichText::new(it.status.label()).color(it.status.color(p)))
+                                .show_ui(ui, |ui| {
+                                    for st in crate::state::OrgStatus::ALL {
+                                        ui.selectable_value(&mut it.status, st, RichText::new(st.label()).color(st.color(p)));
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt(("orghl", i)).width(80.0)
+                                .selected_text(it.highlight.map(|h| HIGHLIGHTS[h].0).unwrap_or("None"))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut it.highlight, None, "None");
+                                    for (h, (name, col)) in HIGHLIGHTS.iter().enumerate() {
+                                        ui.selectable_value(&mut it.highlight, Some(h), RichText::new(*name).background_color(*col).color(Color32::BLACK));
+                                    }
+                                });
+                        }
+                        let m_resp = ui.add(egui::Label::new(RichText::new(&method).color(method_color(p, &method))).sense(egui::Sense::click()));
+                        let addr = RichText::new(format!("{host}{path}"));
+                        let addr_styled = match highlight { Some(h) => addr.background_color(HIGHLIGHTS[h].1).color(Color32::BLACK), None => addr };
+                        let a_resp = ui.add(egui::Label::new(addr_styled).sense(egui::Sense::click()));
+                        if m_resp.clicked() || a_resp.clicked() {
+                            app.org_sel = if app.org_sel == Some(i) { None } else { Some(i) };
+                        }
+                        let row_label = format!("Organizer #{i} ({method} {host}{path})");
+                        m_resp.context_menu(|ui| {
+                            show_traffic_context_menu(ui, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &item_req, None, &row_label);
+                        });
+                        a_resp.context_menu(|ui| {
+                            show_traffic_context_menu(ui, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &item_req, None, &row_label);
+                        });
+                        ui.add_sized([320.0, 20.0], egui::TextEdit::singleline(&mut app.organizer[i].note).hint_text("Add a note"));
                         if ui.small_button("Remove").clicked() { remove = Some(i); }
                         ui.end_row();
                     }
                 });
             });
-            if let Some(i) = remove { app.organizer.remove(i); }
+            if let Some(i) = remove {
+                app.organizer.remove(i);
+                if app.org_sel == Some(i) {
+                    app.org_sel = None;
+                } else if let Some(sel) = app.org_sel {
+                    if sel > i {
+                        app.org_sel = Some(sel - 1);
+                    }
+                }
+            }
         }
     });
 }
@@ -1775,5 +2010,55 @@ pub fn discover(app: &mut App, ui: &mut Ui, p: &Palette) {
                 }
             });
         });
+        let items: Vec<std::sync::Arc<crate::http::HttpEntry>> = app.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !items.is_empty() {
+            let mut menu_pick: Option<(std::sync::Arc<crate::http::HttpEntry>, String, crate::ui_proxy::RowAction)> = None;
+            egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(20, 14)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(bold("Discovered items", 15.0).color(p.strong));
+                ui.add_space(6.0);
+                theme::table_well(ui, p, 180.0, |ui| {
+                    theme::table_header(ui, p, &[("#", 50.0), ("Method", 70.0), ("Host", 200.0), ("Path", 300.0), ("Status", 120.0)]);
+                    egui::ScrollArea::vertical().id_salt("discover_items").show(ui, |ui| {
+                        for (i, e) in items.iter().enumerate() {
+                            let cells = [
+                                (e.id.to_string(), 50.0, None),
+                                (e.method.clone(), 70.0, Some(method_color(p, &e.method))),
+                                (e.host.clone(), 200.0, None),
+                                (e.path.clone(), 300.0, None),
+                                (e.status.clone(), 120.0, None),
+                            ];
+                            let row = theme::table_row(ui, p, &cells, app.discover_sel == Some(e.id), i % 2 == 1);
+                            if row.clicked() || row.secondary_clicked() {
+                                app.discover_sel = Some(e.id);
+                            }
+                            let prefix = actions::scope_prefix(e);
+                            row.context_menu(|ui| {
+                                if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, Tab::Discover) {
+                                    menu_pick = Some((e.clone(), prefix.clone(), a));
+                                }
+                            });
+                        }
+                    });
+                });
+                if let Some(e) = app.discover_sel.and_then(|id| items.iter().find(|e| e.id == id)).cloned() {
+                    ui.add_space(8.0);
+                    let (out_req, out_resp) = ui.columns(2, |cols| {
+                        cols[0].label(bold("Request", 12.5).color(p.strong));
+                        let req_v = editor::message_view(&mut cols[0], p, "disc_req", &e.request, 140.0);
+                        cols[1].label(bold("Response", 12.5).color(p.strong));
+                        let resp_v = editor::message_view(&mut cols[1], p, "disc_resp", &e.response, 140.0);
+                        (req_v, resp_v)
+                    });
+                    let e_url = actions::entry_url(&e);
+                    let e_req = actions::raw_request(&e);
+                    attach_view_context_menu(&out_req, &e.request, app, Tab::Discover, &e_url, &e_req, Some(&e.response), &format!("Discovered #{} request", e.id));
+                    attach_view_context_menu(&out_resp, &e.response, app, Tab::Discover, &e_url, &e_req, Some(&e.response), &format!("Discovered #{} response", e.id));
+                }
+            });
+            if let Some((e, prefix, action)) = menu_pick {
+                crate::ui_proxy::scope_menu_apply(app, &e, &prefix, action);
+            }
+        }
     });
 }

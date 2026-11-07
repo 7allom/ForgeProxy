@@ -152,6 +152,7 @@ fn live_task(app: &mut App, ui: &mut Ui, p: &Palette, task: &Task, items: &[std:
     ui.add_space(6.0);
     let mut open_browser = false;
     let mut picked: Option<&crate::http::HttpEntry> = None;
+    let mut menu_pick: Option<(std::sync::Arc<crate::http::HttpEntry>, String, crate::ui_proxy::RowAction)> = None;
     let added = items.iter().map(|e| (e.host.clone(), e.path.clone())).collect::<std::collections::HashSet<_>>().len();
     details_card(ui, p, "live_task_details", &[
         ("Task configuration", vec![
@@ -181,9 +182,16 @@ fn live_task(app: &mut App, ui: &mut Ui, p: &Palette, task: &Task, items: &[std:
                 egui::ScrollArea::vertical().id_salt("live_items").auto_shrink([false, false]).show(ui, |ui| {
                     for (i, e) in items.iter().enumerate() {
                         let cells = [(e.host.clone(), w[0], None), (e.method.clone(), w[1], None), (e.path.clone(), w[2], None), (e.status.clone(), w[3], None), (e.mime.clone(), w[4], None)];
-                        if theme::table_row(ui, p, &cells, false, i % 2 == 1).clicked() {
+                        let row = theme::table_row(ui, p, &cells, false, i % 2 == 1);
+                        if row.clicked() {
                             picked = Some(e);
                         }
+                        let prefix = actions::scope_prefix(e);
+                        row.context_menu(|ui| {
+                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, Tab::Dashboard) {
+                                menu_pick = Some((e.clone(), prefix.clone(), a));
+                            }
+                        });
                     }
                 });
             }
@@ -191,6 +199,9 @@ fn live_task(app: &mut App, ui: &mut Ui, p: &Palette, task: &Task, items: &[std:
     });
     if open_browser {
         crate::ui_proxy::open_browser(app);
+    }
+    if let Some((e, prefix, action)) = menu_pick {
+        crate::ui_proxy::scope_menu_apply(app, &e, &prefix, action);
     }
     if let Some(e) = picked {
         // show the item in Target > Site map: its host/path selected in the tree, its request below
