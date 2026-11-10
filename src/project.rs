@@ -228,6 +228,29 @@ pub fn with_extension(path: std::path::PathBuf) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Repeater and Intruder start a new project on the same baseline origin, and the Intruder
+    /// template's Host header agrees with its target: the default request is sendable as written,
+    /// and the Target/Host sync has nothing to correct on the first frame.
+    #[test]
+    fn a_new_project_starts_both_tools_on_the_same_origin() {
+        use crate::actions::{host_header, host_header_value, url_parts};
+        use crate::state::{DEFAULT_INT_TARGET, DEFAULT_INT_TEMPLATE, DEFAULT_REP_REQUEST, DEFAULT_REP_URL};
+        use crate::test_utils::assert_table;
+        let (rep_scheme, rep_authority, _) = url_parts(DEFAULT_REP_URL);
+        let (int_scheme, int_authority, _) = url_parts(DEFAULT_INT_TARGET);
+        // positions are the user's to move, so the header is read with the markers stripped
+        let template = DEFAULT_INT_TEMPLATE.replace('§', "");
+        let cases: [(&str, String, String); 4] = [
+            ("Intruder and Repeater share the scheme", int_scheme.clone(), rep_scheme),
+            ("Intruder and Repeater share the authority", int_authority.clone(), rep_authority),
+            ("the template's Host header matches the target", host_header(&template).unwrap_or_default(), host_header_value(&int_scheme, &int_authority)),
+            ("Repeater's request still matches its own bar", host_header(DEFAULT_REP_REQUEST).unwrap_or_default(), "example.com".to_string()),
+        ];
+        assert_table!(cases, |idx, (what, got, want)| {
+            assert_eq!(got, want, "case #{idx} ({what})");
+        });
+    }
     #[test]
     fn project_round_trip() {
         let mut f = ProjectFile { version: 1, name: "t".into(), ..Default::default() };

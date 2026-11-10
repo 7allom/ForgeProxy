@@ -272,6 +272,18 @@ pub fn host_header(raw: &str) -> Option<String> {
     })
 }
 
+/// What the Host header should say for an origin: the authority, less the port when it is the
+/// default for the scheme (RFC 9110 7.2). A non-standard port stays, so 8080 and 8443 are sent
+/// as `host:8080` and `host:8443`; so is a port on a scheme we don't recognise.
+pub fn host_header_value(scheme: &str, authority: &str) -> String {
+    let (host, port) = split_host_port(authority);
+    match port {
+        Some("80") if scheme.eq_ignore_ascii_case("http") => host.to_string(),
+        Some("443") if scheme.eq_ignore_ascii_case("https") => host.to_string(),
+        _ => authority.trim().to_string(),
+    }
+}
+
 /// Set the Host header (replacing the first one, or adding it after the request line).
 pub fn set_host_header(raw: &str, authority: &str) -> String {
     let mut lines: Vec<String> = raw.split('\n').map(String::from).collect();
@@ -842,6 +854,7 @@ pub fn poll_collaborator(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     const REQ: &str = "GET /a?b=1 HTTP/1.1\nHost: shop.test:8080\nAccept: */*\n\nbody: not a header";
 
@@ -863,6 +876,21 @@ mod tests {
         assert_eq!(r, "GET / HTTP/1.1\r\nHost: n.test\r\nAccept: */*\r\n\r\n");
         // a "host:" line in the body is not a header
         assert_eq!(host_header("GET / HTTP/1.1\n\nHost: body.test"), None);
+
+        // the port is sent only when it is not the scheme's default (RFC 9110 7.2)
+        let port_cases: [(&str, &str, &str); 8] = [
+            ("http", "shop.test", "shop.test"),
+            ("http", "shop.test:80", "shop.test"),
+            ("http", "shop.test:8080", "shop.test:8080"),
+            ("https", "shop.test:443", "shop.test"),
+            ("https", "shop.test:8443", "shop.test:8443"),
+            ("https", "shop.test:80", "shop.test:80"),
+            ("", "shop.test:80", "shop.test:80"),
+            ("https", "[::1]:443", "[::1]"),
+        ];
+        assert_table!(port_cases, |idx, (scheme, authority, want)| {
+            assert_eq!(host_header_value(scheme, authority), want, "case #{idx} ({scheme} {authority})");
+        });
     }
 
     #[test]

@@ -221,6 +221,8 @@ fn describe(name: &str) -> String {
 
 // ---- Intruder (picture-16) ----------------------------------------------
 pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
+    // the two sides of the target/Host sync as they stood before this frame's edits
+    let (target_before, template_before) = (app.int_target.clone(), app.int_template.clone());
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         theme::icon_help(ui, p);
@@ -253,6 +255,13 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
             .on_hover_text("Off: send the Host header written in the request below (payload positions in it are filled in)");
         ui.label(RichText::new("Update Host header to match target").size(12.0).color(p.text));
     });
+    if intruder::host_marked(&app.int_template) {
+        ui.horizontal(|ui| {
+            ui.add_space(46.0);
+            ui.label(RichText::new("The Host header holds payload positions, so editing the target leaves it as written.")
+                .size(11.5).color(p.medium));
+        });
+    }
     ui.add_space(4.0);
     egui::SidePanel::right("payloads").resizable(true).default_width(370.0).width_range(300.0..=640.0)
         .frame(egui::Frame::new().fill(p.deep).inner_margin(egui::Margin::same(10))).show_inside(ui, |ui| {
@@ -315,17 +324,7 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
                 ui.label(RichText::new(format!("{} payload positions", intruder::count_positions(&app.int_template))).size(11.5).color(p.text));
             });
         });
-        let tpl_before = app.int_template.clone();
         let out = editor::message_editor(ui, p, "int_pos", &mut app.int_template, true, true, 240.0);
-        if app.int_template != tpl_before {
-            let clean = app.int_template.replace('§', "");
-            if actions::host_header(&clean).is_some()
-                || actions::request_target(&clean)
-                    .is_some_and(|t| t.starts_with("http://") || t.starts_with("https://"))
-            {
-                app.int_target = actions::resolve_target_origin(app, "", &app.int_template);
-            }
-        }
         if let Some(r) = out.cursor_range {
             let (a, b) = (r.primary.ccursor.index, r.secondary.ccursor.index);
             app.int_sel = if a != b { Some((a.min(b), a.max(b))) } else { app.int_sel.filter(|_| !out.response.has_focus()) };
@@ -334,6 +333,34 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
         let int_req = app.int_template.clone();
         attach_editor_context_menu(&out, &int_req, &int_req, app, Tab::Intruder, &int_url, &int_req, None, "Intruder request");
     });
+    sync_intruder_target(app, &target_before, &template_before);
+}
+
+/// Keep the Intruder target and the request template pointing at the same host. Editing the
+/// target writes the Host header; editing the template's Host header (or putting an absolute
+/// URL on the request line) rewrites the target. Only one side changes per frame, so they
+/// can't fight, and the target never touches a Host header carrying payload positions.
+fn sync_intruder_target(app: &mut App, target_before: &str, template_before: &str) {
+    if app.int_target != target_before {
+        let (scheme, authority, _) = actions::url_parts(&app.int_target);
+        if authority.is_empty() || intruder::host_marked(&app.int_template) {
+            return;
+        }
+        let want = actions::host_header_value(&scheme, &authority);
+        // only write when the header really says something else: rewriting it every frame
+        // would fight the editor and move the caret
+        if actions::host_header(&app.int_template).as_deref() != Some(want.as_str()) {
+            app.int_template = actions::set_host_header(&app.int_template, &want);
+        }
+    } else if app.int_template != template_before {
+        let clean = app.int_template.replace('§', "");
+        if actions::host_header(&clean).is_some()
+            || actions::request_target(&clean)
+                .is_some_and(|t| t.starts_with("http://") || t.starts_with("https://"))
+        {
+            app.int_target = actions::resolve_target_origin(app, "", &app.int_template);
+        }
+    }
 }
 
 /// Append `lines` to a payload list (one per line), keeping a newline between what's there
@@ -750,9 +777,10 @@ fn repeater_tab_strip(app: &mut App, ui: &mut Ui, p: &Palette) {
 /// request line) rewrites the URL. Only one side changes per frame, so they can't fight.
 fn sync_repeater_target(tab: &mut crate::repeater::RepeaterTab, url_before: &str, request_before: &str) {
     if tab.url != url_before {
-        let (_, authority, path) = actions::url_parts(&tab.url);
+        let (scheme, authority, path) = actions::url_parts(&tab.url);
         if !authority.is_empty() {
-            let request = actions::set_host_header(&tab.request, &authority);
+            let host = actions::host_header_value(&scheme, &authority);
+            let request = actions::set_host_header(&tab.request, &host);
             tab.request = actions::set_request_target(&request, &path);
         }
     } else if tab.request != request_before {
@@ -2109,4 +2137,189 @@ pub fn discover(app: &mut App, ui: &mut Ui, p: &Palette) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod intruder_sync_tests {
+    use super::sync_intruder_target;
+    use crate::state::App;
+    use crate::test_utils::{assert_table, MockAppBuilder};
+
+    const REQ: &str = "GET /a HTTP/1.1\r\nHost: shop.test\r\nAccept: */*\r\n\r\n";
+
+    fn app(target: &str, template: &str) -> App {
+        MockAppBuilder::default()
+            .with_intruder_target(target)
+            .with_intruder_template(template)
+            .build_with_ctx()
+            .1
+    }
+
+    struct SyncCase<'a> {
+        name: &'a str,
+        /// What the two sides said before this frame...
+        target_before: &'a str,
+        template_before: &'a str,
+        /// ...and what they say after the user typed in one of them.
+        target: &'a str,
+        template: &'a str,
+        want_target: &'a str,
+        want_template: &'a str,
+    }
+
+    /// The target and the Host header follow each other both ways. Each case edits one side
+    /// and says what both should read afterwards.
+    #[test]
+    fn target_and_host_header_follow_each_other_matrix() {
+        let no_host = "GET /a HTTP/1.1\r\nAccept: */*\r\n\r\nbody";
+        let marked = "GET /a HTTP/1.1\r\nHost: §shop.test§\r\nAccept: */*\r\n\r\n";
+        let part_marked = "GET /a HTTP/1.1\r\nHost: §sub§.shop.test\r\nAccept: */*\r\n\r\n";
+        let marked_name = "GET /a HTTP/1.1\r\n§Host§: shop.test\r\nAccept: */*\r\n\r\n";
+
+        let cases = [
+            SyncCase {
+                name: "a new target host rewrites the Host header",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://api.shop.test", template: REQ,
+                want_target: "http://api.shop.test",
+                want_template: "GET /a HTTP/1.1\r\nHost: api.shop.test\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "a non-standard port joins the Host header",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://shop.test:8080", template: REQ,
+                want_target: "http://shop.test:8080",
+                want_template: "GET /a HTTP/1.1\r\nHost: shop.test:8080\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "8443 over https joins it too",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "https://shop.test:8443", template: REQ,
+                want_target: "https://shop.test:8443",
+                want_template: "GET /a HTTP/1.1\r\nHost: shop.test:8443\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "the default port for the scheme is left off (https:443)",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "https://other.test:443", template: REQ,
+                want_target: "https://other.test:443",
+                want_template: "GET /a HTTP/1.1\r\nHost: other.test\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "and for http:80, which the header already says, so nothing is written",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://shop.test:80", template: REQ,
+                want_target: "http://shop.test:80",
+                want_template: REQ,
+            },
+            SyncCase {
+                name: "a template with no Host header gains one after the request line",
+                target_before: "http://shop.test", template_before: no_host,
+                target: "http://api.shop.test:8080", template: no_host,
+                want_target: "http://api.shop.test:8080",
+                want_template: "GET /a HTTP/1.1\r\nHost: api.shop.test:8080\r\nAccept: */*\r\n\r\nbody",
+            },
+            SyncCase {
+                name: "an emptied target is not written into the Host header",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "", template: REQ,
+                want_target: "", want_template: REQ,
+            },
+            SyncCase {
+                name: "editing the Host header moves the target",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://shop.test",
+                template: "GET /a HTTP/1.1\r\nHost: other.test\r\nAccept: */*\r\n\r\n",
+                want_target: "http://other.test",
+                want_template: "GET /a HTTP/1.1\r\nHost: other.test\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "a port in the Host header moves the target to it",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://shop.test",
+                template: "GET /a HTTP/1.1\r\nHost: other.test:8443\r\nAccept: */*\r\n\r\n",
+                want_target: "http://other.test:8443",
+                want_template: "GET /a HTTP/1.1\r\nHost: other.test:8443\r\nAccept: */*\r\n\r\n",
+            },
+            SyncCase {
+                name: "a Host header that is one payload position is left as written",
+                target_before: "http://shop.test", template_before: marked,
+                target: "http://api.shop.test", template: marked,
+                want_target: "http://api.shop.test", want_template: marked,
+            },
+            SyncCase {
+                name: "so is one that is only partly marked",
+                target_before: "http://shop.test", template_before: part_marked,
+                target: "http://api.shop.test", template: part_marked,
+                want_target: "http://api.shop.test", want_template: part_marked,
+            },
+            SyncCase {
+                name: "and one whose field name is the position",
+                target_before: "http://shop.test", template_before: marked_name,
+                target: "http://api.shop.test", template: marked_name,
+                want_target: "http://api.shop.test", want_template: marked_name,
+            },
+            SyncCase {
+                name: "with neither side edited, neither side moves",
+                target_before: "http://shop.test", template_before: REQ,
+                target: "http://shop.test", template: REQ,
+                want_target: "http://shop.test", want_template: REQ,
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let mut app = app(case.target, case.template);
+            sync_intruder_target(&mut app, case.target_before, case.template_before);
+            assert_eq!(app.int_target, case.want_target, "case #{idx} ({}) target", case.name);
+            assert_eq!(app.int_template, case.want_template, "case #{idx} ({}) template", case.name);
+        });
+    }
+
+    /// A target edit must not disturb the payload positions: not their number, and not where
+    /// they sit, since every position after a moved marker would be filled from the wrong text.
+    #[test]
+    fn a_target_edit_leaves_payload_positions_where_they_were() {
+        let templates = [
+            "GET /a?id=§1§ HTTP/1.1\r\nHost: §shop.test§\r\nAccept: */*\r\n\r\n",
+            "GET /a?id=§1§ HTTP/1.1\r\nHost: §sub§.shop.test\r\nCookie: s=§abc§\r\n\r\n",
+            "POST /a HTTP/1.1\r\n§Host§: shop.test\r\n\r\nname=§v§",
+        ];
+
+        assert_table!(templates, |idx, template| {
+            let before: Vec<usize> = template.char_indices().filter(|(_, c)| *c == '§').map(|(i, _)| i).collect();
+            let mut app = app("https://moved.test:8443", template);
+            sync_intruder_target(&mut app, "http://shop.test", template);
+            let after: Vec<usize> = app.int_template.char_indices().filter(|(_, c)| *c == '§').map(|(i, _)| i).collect();
+            assert_eq!(app.int_template, template, "case #{idx}: the template is untouched");
+            assert_eq!(before, after, "case #{idx}: every marker is still at the same byte offset");
+            assert_eq!(
+                crate::intruder::count_positions(&app.int_template),
+                crate::intruder::count_positions(template),
+                "case #{idx}: the same number of payload positions"
+            );
+        });
+    }
+
+    /// Repeater writes the Host header by the same rule, so the two tools agree about ports.
+    #[test]
+    fn repeater_host_header_follows_the_same_port_rule() {
+        let cases: [(&str, &str, &str, &str); 4] = [
+            ("a non-standard port is sent", "http://shop.test:8080/a", "shop.test:8080", "/a"),
+            ("http on 80 sends the bare host", "http://shop.test:80/a", "shop.test", "/a"),
+            ("https on 443 sends the bare host", "https://shop.test:443/b", "shop.test", "/b"),
+            ("no port at all sends the bare host", "https://shop.test/b", "shop.test", "/b"),
+        ];
+
+        assert_table!(cases, |idx, (name, url, want_host, want_path)| {
+            let (_ctx, mut app) = MockAppBuilder::default()
+                .with_repeater_tab("GET", "http://shop.test/a", "GET /a HTTP/1.1\r\nHost: shop.test\r\n\r\n")
+                .build_with_ctx();
+            let before = app.repeater_tabs[0].clone();
+            app.repeater_tabs[0].url = url.to_string();
+            super::sync_repeater_target(&mut app.repeater_tabs[0], &before.url, &before.request);
+            let req = &app.repeater_tabs[0].request;
+            assert_eq!(crate::actions::host_header(req).as_deref(), Some(want_host), "case #{idx} ({name}) Host header");
+            assert_eq!(crate::actions::request_target(req).as_deref(), Some(want_path), "case #{idx} ({name}) request line");
+        });
+    }
 }

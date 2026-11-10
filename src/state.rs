@@ -278,8 +278,8 @@ pub struct Overrides {
 /// What a new project starts with in Repeater and Intruder.
 pub const DEFAULT_REP_URL: &str = "https://example.com/";
 pub const DEFAULT_REP_REQUEST: &str = concat!("GET / HTTP/1.1\nHost: example.com\nUser-Agent: ForgeProxy/", env!("CARGO_PKG_VERSION"), "\nAccept: */*\nConnection: close\n\n");
-pub const DEFAULT_INT_TARGET: &str = "http://localhost:80";
-pub const DEFAULT_INT_TEMPLATE: &str = "POST /example?p1=§p1val§&p2=§p2val§ HTTP/1.0\nCookie: c=§cval§\nContent-Length: 17\n\np3=§p3val§&p4=§p4val§";
+pub const DEFAULT_INT_TARGET: &str = "https://example.com";
+pub const DEFAULT_INT_TEMPLATE: &str = "POST /example?p1=§p1val§&p2=§p2val§ HTTP/1.0\nHost: example.com\nCookie: c=§cval§\nContent-Length: 17\n\np3=§p3val§&p4=§p4val§";
 
 /// A new project's Dashboard tasks: the live passive crawl.
 pub fn default_tasks() -> Vec<Task> {

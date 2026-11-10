@@ -134,6 +134,18 @@ fn mark_json_body(b: &str) -> String {
     out
 }
 
+/// Does the request's Host header carry payload positions? Its value is then the user's to
+/// place and the target must leave it alone: rewriting `Host: §sub§.example.test` as a plain
+/// host would drop a position and renumber every position after it. The line is matched with
+/// its markers stripped, so a position around the field name (`§Host§: x`) counts too.
+pub fn host_marked(template: &str) -> bool {
+    template
+        .split('\n')
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .any(|l| l.contains('§') && l.replace('§', "").split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("host")))
+}
+
 /// "Auto §": clear existing markers, then mark every parameter value in the query string,
 /// the Cookie header, a form-style body (name=value pairs), or a JSON body.
 pub fn auto_positions(template: &str) -> String {
