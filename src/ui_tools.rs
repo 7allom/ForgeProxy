@@ -424,7 +424,7 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     egui::Window::new(bold(format!("Intruder attack — {}", app.int_target.trim()), 14.0).color(p.strong))
         .id(egui::Id::new("intruder_attack"))
         .open(&mut open)
-        .default_size([820.0, 480.0])
+        .default_size([880.0, 480.0])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let state = if app.int_running { "Running" } else if done < total { "Stopped" } else { "Finished" };
@@ -442,8 +442,12 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
             let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
             ui.add(egui::ProgressBar::new(frac).text(format!("{done} of {total} requests")).animate(app.int_running));
             ui.add_space(4.0);
-            let cols: [(&str, f32); 5] = [("Request", 70.0), ("Payload", 220.0), ("Status code", 130.0), ("Length", 80.0), ("Error", 280.0)];
+            use crate::intruder::IntruderSortColumn as C;
+            // 150px of status: "500 Internal Server Error" fits without being cut short
+            let cols: [(&str, f32, C); 5] = [("Request", 70.0, C::Request), ("Payload", 220.0, C::Payload),
+                ("Status code", 170.0, C::StatusCode), ("Length", 80.0, C::Length), ("Error", 280.0, C::Error)];
             let mut row_click = None;
+            let mut sort_click = None;
             // a selected row's request and response are shown in a resizable pane below
             let detail = app.int_result_sel.map(|id| {
                 (id, app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).cloned())
@@ -476,13 +480,15 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                     });
             }
             egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                // the results keep the order they were recorded in; only the view is sorted
+                let order = app.int_sort.order(&app.int_results);
                 theme::table_well(ui, p, (ui.available_height() - 4.0).max(60.0), |ui| {
-                    theme::table_header(ui, p, &cols);
+                    sort_click = sort_header(ui, p, &cols, app.int_sort.sort_column, !app.int_sort.sort_desc);
                     egui::ScrollArea::vertical().id_salt("int_results").auto_shrink([false, false]).show(ui, |ui| {
                         if app.int_results.is_empty() {
                             ui.label(RichText::new("Waiting for the first response...").color(p.disabled));
                         }
-                        for (i, r) in app.int_results.iter().enumerate() {
+                        for (i, r) in order.iter().map(|&k| &app.int_results[k]).enumerate() {
                             let cells = [
                                 (r.request.to_string(), cols[0].1, None),
                                 (r.payload.clone(), cols[1].1, None),
@@ -517,9 +523,13 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                     });
                 });
             });
-            // clicking a row opens its detail pane (clicking it again closes it)
+            // clicking a row opens its detail pane (clicking it again closes it). The pane
+            // follows the row's history id, so re-sorting leaves the same request open.
             if let Some(id) = row_click {
                 app.int_result_sel = (app.int_result_sel != Some(id)).then_some(id);
+            }
+            if let Some(col) = sort_click {
+                app.int_sort.click_column(col);
             }
         });
     if let Some((id, to)) = attack_pick {
@@ -1668,7 +1678,9 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                 use crate::history::HistorySortColumn as C;
                 let cols: &[(&str, f32, C)] = &[("#", 50.0, C::Id), ("Time", 72.0, C::Time), ("Tool", 80.0, C::Tool), ("Method", 70.0, C::Method), ("Host", 200.0, C::Host),
                     ("Path", 300.0, C::Path), ("Status code", 130.0, C::Status), ("Length", 80.0, C::Length), ("MIME type", 120.0, C::Mime)];
-                sort_header(ui, p, cols, &mut app.history_filter);
+                if let Some(col) = sort_header(ui, p, cols, app.history_filter.sort_column, app.history_filter.sort_ascending) {
+                    app.history_filter.click_column(col);
+                }
                 // only the rows in view are drawn (history can hold thousands)
                 egui::ScrollArea::vertical().id_salt(("traffic", view as u8)).show_rows(ui, 19.0, hist.len(), |ui, range| {
                     for (i, e) in hist.iter().enumerate().skip(range.start).take(range.len()) {
@@ -1703,8 +1715,10 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
 }
 
 /// The table header with each column a button: click to sort by it, again to reverse.
-/// The sorted column shows a triangle (up: ascending).
-fn sort_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, crate::history::HistorySortColumn)], filter: &mut crate::history::HistoryFilter) {
+/// The column currently sorted on shows a triangle (up: ascending). Returns the column that
+/// was clicked, if any; the caller owns the sort state, so history and Intruder share this.
+fn sort_header<C: Copy + PartialEq>(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, C)], active: Option<C>, ascending: bool) -> Option<C> {
+    let mut clicked = None;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 0.0, p.header);
     let mut x = rect.left();
@@ -1716,10 +1730,10 @@ fn sort_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, crate::history::His
             ui.painter().rect_filled(cell, 0.0, p.hover);
         }
         let label = ui.painter().text(egui::pos2(x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, *name, FontId::proportional(12.5), p.text);
-        if filter.sort_column == Some(*col) {
+        if active == Some(*col) {
             // drawn, not a glyph: the bundled fonts have no triangles
             let c = egui::pos2(label.right() + 8.0, rect.center().y);
-            let pts = if filter.sort_ascending {
+            let pts = if ascending {
                 vec![c + egui::vec2(-4.0, 2.5), c + egui::vec2(4.0, 2.5), c + egui::vec2(0.0, -3.0)]
             } else {
                 vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.0)]
@@ -1727,13 +1741,14 @@ fn sort_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, crate::history::His
             ui.painter().add(egui::Shape::convex_polygon(pts, p.strong, egui::Stroke::NONE));
         }
         if r.on_hover_text(format!("Sort by {name}")).clicked() {
-            filter.click_column(*col);
+            clicked = Some(*col);
         }
         x += w;
         if i + 1 < cols.len() {
             ui.painter().line_segment([egui::pos2(x - 4.0, rect.top() + 2.0), egui::pos2(x - 4.0, rect.bottom() - 2.0)], egui::Stroke::new(1.0_f32, p.deep));
         }
     }
+    clicked
 }
 
 /// Carry out a message editor's right-click choice. `what` names the message for a
@@ -2320,6 +2335,84 @@ mod intruder_sync_tests {
             let req = &app.repeater_tabs[0].request;
             assert_eq!(crate::actions::host_header(req).as_deref(), Some(want_host), "case #{idx} ({name}) Host header");
             assert_eq!(crate::actions::request_target(req).as_deref(), Some(want_path), "case #{idx} ({name}) request line");
+        });
+    }
+}
+
+#[cfg(test)]
+mod sort_header_tests {
+    use super::*;
+    use crate::intruder::IntruderSortColumn as C;
+    use crate::test_utils::assert_table;
+
+    /// The Intruder results header, as the attack window lays it out.
+    const COLS: [(&str, f32, C); 5] = [("Request", 70.0, C::Request), ("Payload", 220.0, C::Payload),
+        ("Status code", 170.0, C::StatusCode), ("Length", 80.0, C::Length), ("Error", 280.0, C::Error)];
+
+    /// Draw the header twice and click `x` pixels into it on the second pass: the first pass
+    /// registers the column rects, the second lands a press and a release on them. Returns the
+    /// column `sort_header` reports as clicked.
+    fn click_header(x: f32) -> Option<C> {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        // (where the header was drawn, which column the click landed on)
+        let frame = |events: Vec<egui::Event>| {
+            let (mut origin, mut clicked) = (egui::Pos2::ZERO, None);
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                crate::theme::apply(ctx, crate::theme::Look::Dark);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    origin = ui.cursor().min;
+                    clicked = sort_header(ui, &crate::theme::DARK, &COLS, Some(C::Request), true);
+                });
+            });
+            (origin, clicked)
+        };
+        let (origin, _) = frame(Vec::new());
+        let pos = origin + egui::vec2(x, 10.0);
+        let (_, clicked) = frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ]);
+        clicked
+    }
+
+    /// A status cell draws its text into `width - 8` pixels and clips the rest, so the column
+    /// has to be wider than the longest phrase that routinely lands in it. The two in the brief
+    /// ("405 Method Not Allowed", "500 Internal Server Error") are the widest of them.
+    #[test]
+    fn standard_status_phrases_fit_the_status_column() {
+        let width = COLS[2].1 - 8.0;
+        let ctx = egui::Context::default();
+        // fonts installed by a pass of their own: a new set only takes effect the pass after
+        let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let phrases = ["200 OK", "404 Not Found", "403 Forbidden", "301 Moved Permanently",
+                "405 Method Not Allowed", "500 Internal Server Error", "503 Service Unavailable", "Status code"];
+            assert_table!(phrases, |idx, phrase| {
+                let drawn = ctx.fonts(|f| f.layout_no_wrap(phrase.to_string(), FontId::proportional(12.5), Color32::WHITE).rect.width());
+                assert!(drawn <= width, "case #{idx} ({phrase}): {drawn:.1}px of text in a {width:.1}px cell");
+            });
+        });
+    }
+
+    /// Every header cell is a button, and it is the column under the pointer that gets sorted:
+    /// the cells are laid out end to end at their declared widths, so a click is placed by
+    /// adding them up.
+    #[test]
+    fn clicking_a_header_cell_reports_that_column() {
+        let cases: [(&str, f32, Option<C>); 7] = [
+            ("the first column starts at the left edge", 10.0, Some(C::Request)),
+            ("Payload spans 70..290", 100.0, Some(C::Payload)),
+            ("Status code spans 290..460", 300.0, Some(C::StatusCode)),
+            ("its widened right edge is still Status code", 455.0, Some(C::StatusCode)),
+            ("Length spans 460..540", 480.0, Some(C::Length)),
+            ("Error spans 540..820", 600.0, Some(C::Error)),
+            ("past the last column nothing is sorted", 900.0, None),
+        ];
+        assert_table!(cases, |idx, (what, x, want)| {
+            assert_eq!(click_header(x), want, "case #{idx} ({what})");
         });
     }
 }

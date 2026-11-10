@@ -96,7 +96,7 @@ impl Task {
 }
 
 /// One row of the Intruder attack results.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntResult {
     pub request: usize,
     pub payload: String,
@@ -369,6 +369,8 @@ pub struct App {
     pub int_sel: Option<(usize, usize)>,
     /// The results-table row open in the detail viewer (its history id), if any.
     pub int_result_sel: Option<usize>,
+    /// Which results column the table is sorted by, and which way round.
+    pub int_sort: crate::intruder::IntruderSort,
 
     // sequencer
     /// Capture / Analysis sub-tab.
@@ -594,6 +596,7 @@ impl App {
             int_msg: String::new(),
             int_sel: None,
             int_result_sel: None,
+            int_sort: crate::intruder::IntruderSort::default(),
             seq_sub: 0,
             seq_template: String::new(),
             seq_origin: String::new(),

@@ -2,6 +2,8 @@
 //! (Sniper, Battering ram, Pitchfork, Cluster bomb). The template marks each payload
 //! position with § on both sides, like the original (ProjectDefaults intercept rules use §).
 
+use crate::state::IntResult;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttackType {
     Sniper,
@@ -20,6 +22,85 @@ impl AttackType {
             AttackType::Pitchfork => "Pitchfork",
             AttackType::ClusterBomb => "Cluster bomb",
         }
+    }
+}
+
+/// Columns the Intruder attack results table can be sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntruderSortColumn {
+    Request,
+    Payload,
+    StatusCode,
+    Length,
+    Error,
+}
+
+/// The attack results table's sort order. The results themselves are never reordered:
+/// [`IntruderSort::order`] hands back the row indices to draw, so every row keeps the
+/// history id it was recorded with and the detail pane stays on the request the user picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntruderSort {
+    pub sort_column: Option<IntruderSortColumn>,
+    pub sort_desc: bool,
+}
+
+impl Default for IntruderSort {
+    /// Request order ascending: the order results arrive in, so the table does not jump the
+    /// moment the first header is clicked.
+    fn default() -> Self {
+        IntruderSort { sort_column: Some(IntruderSortColumn::Request), sort_desc: false }
+    }
+}
+
+impl IntruderSort {
+    /// Click on a column header: the same column flips the order, another one sorts by it
+    /// ascending.
+    pub fn click_column(&mut self, col: IntruderSortColumn) {
+        if self.sort_column == Some(col) {
+            self.sort_desc = !self.sort_desc;
+        } else {
+            self.sort_column = Some(col);
+            self.sort_desc = false;
+        }
+    }
+
+    /// Indices into `rows` in display order. Numeric columns compare as numbers, so a 558-byte
+    /// response sorts before a 1024-byte one; requests that never got a response sort after
+    /// every status code, and rows without an error after every error, whichever way the
+    /// column is pointing. Ties keep request order, so the table never shuffles on its own.
+    pub fn order(&self, rows: &[IntResult]) -> Vec<usize> {
+        use std::cmp::Ordering;
+        let mut idx: Vec<usize> = (0..rows.len()).collect();
+        let Some(col) = self.sort_column else { return idx };
+        let text = |a: &str, b: &str| a.to_lowercase().cmp(&b.to_lowercase());
+        idx.sort_by(|&x, &y| {
+            let (a, b) = (&rows[x], &rows[y]);
+            let flip = |o: Ordering| if self.sort_desc { o.reverse() } else { o };
+            let primary = match col {
+                IntruderSortColumn::Request => a.request.cmp(&b.request),
+                IntruderSortColumn::Payload => text(&a.payload, &b.payload),
+                IntruderSortColumn::Length => a.length.cmp(&b.length),
+                IntruderSortColumn::StatusCode => {
+                    match (crate::http::status_code(&a.status), crate::http::status_code(&b.status)) {
+                        (Some(m), Some(n)) => m.cmp(&n),
+                        // no response at all: always last, both ways round
+                        (Some(_), None) => return Ordering::Less,
+                        (None, Some(_)) => return Ordering::Greater,
+                        (None, None) => Ordering::Equal,
+                    }
+                }
+                IntruderSortColumn::Error => match (a.error.is_empty(), b.error.is_empty()) {
+                    (false, false) => text(&a.error, &b.error),
+                    // the rows that went through carry no error text, and sit under the ones
+                    // that failed however the column is pointing
+                    (false, true) => return Ordering::Less,
+                    (true, false) => return Ordering::Greater,
+                    (true, true) => Ordering::Equal,
+                },
+            };
+            flip(primary).then(a.request.cmp(&b.request))
+        });
+        idx
     }
 }
 
@@ -552,6 +633,95 @@ pub fn requests(kind: AttackType, template: &str, set_a: &[String], set_b: &[Str
 mod tests {
     use super::*;
     use crate::test_utils::assert_table;
+
+    /// Five finished requests, with the lengths and status codes chosen so that a text sort
+    /// and a numeric sort disagree ("1024" sorts before "558" as text, after it as a number),
+    /// and two of them with no response at all.
+    fn results() -> Vec<IntResult> {
+        let row = |request, payload: &str, status: &str, length, error: &str| IntResult {
+            request,
+            payload: payload.to_string(),
+            status: status.to_string(),
+            length,
+            error: error.to_string(),
+            history_id: 100 + request,
+        };
+        vec![
+            row(1, "beta", "404 Not Found", 1024, ""),
+            row(2, "alpha", "200 OK", 558, ""),
+            row(3, "Gamma", "", 0, "timed out"),
+            row(4, "delta", "500 Internal Server Error", 90, ""),
+            row(5, "epsilon", "", 0, "connection refused"),
+        ]
+    }
+
+    /// The request numbers `sort` puts the table in.
+    fn shown(sort: IntruderSort, rows: &[IntResult]) -> Vec<usize> {
+        sort.order(rows).into_iter().map(|i| rows[i].request).collect()
+    }
+
+    #[test]
+    fn attack_results_sort_by_every_column_matrix() {
+        use IntruderSortColumn as C;
+        let rows = results();
+        let cases: [(&str, Option<C>, bool, [usize; 5]); 11] = [
+            ("unsorted keeps the order the results arrived in", None, false, [1, 2, 3, 4, 5]),
+            ("request ascending", Some(C::Request), false, [1, 2, 3, 4, 5]),
+            ("request descending", Some(C::Request), true, [5, 4, 3, 2, 1]),
+            // 558 before 1024, not "1024" before "558"
+            ("length ascending is numeric", Some(C::Length), false, [3, 5, 4, 2, 1]),
+            ("length descending is numeric", Some(C::Length), true, [1, 2, 4, 3, 5]),
+            // 200, 404, 500, then the two that never answered
+            ("status ascending is numeric, no response last", Some(C::StatusCode), false, [2, 1, 4, 3, 5]),
+            ("status descending is numeric, no response still last", Some(C::StatusCode), true, [4, 1, 2, 3, 5]),
+            ("payload ascending ignores case", Some(C::Payload), false, [2, 1, 4, 5, 3]),
+            ("payload descending ignores case", Some(C::Payload), true, [3, 5, 4, 1, 2]),
+            ("error ascending, the requests that worked last", Some(C::Error), false, [5, 3, 1, 2, 4]),
+            ("error descending, the requests that worked still last", Some(C::Error), true, [3, 5, 1, 2, 4]),
+        ];
+        assert_table!(cases, |idx, (what, column, sort_desc, want)| {
+            let sort = IntruderSort { sort_column: column, sort_desc };
+            assert_eq!(shown(sort, &rows), want, "case #{idx} ({what})");
+            assert_eq!(rows, results(), "case #{idx} ({what}): the results themselves are untouched");
+        });
+    }
+
+    #[test]
+    fn clicking_a_header_sorts_by_it_then_flips_it() {
+        use IntruderSortColumn as C;
+        let mut sort = IntruderSort::default();
+        let mut seen = Vec::new();
+        // the default column, another column, then that one twice more
+        for col in [C::Request, C::Length, C::Length, C::Length] {
+            sort.click_column(col);
+            seen.push((sort.sort_column, sort.sort_desc));
+        }
+        assert_eq!(seen, [
+            (Some(C::Request), true),  // the column already sorted on: flip it
+            (Some(C::Length), false),  // a new column: ascending
+            (Some(C::Length), true),   // flip
+            (Some(C::Length), false),  // and back
+        ]);
+    }
+
+    /// The table draws rows by index and reports the row's history id, so the open detail pane
+    /// stays on the request the user clicked however the table is sorted.
+    #[test]
+    fn the_open_row_follows_its_request_through_every_sort() {
+        use IntruderSortColumn as C;
+        let rows = results();
+        let open = rows.iter().find(|r| r.request == 4).unwrap().history_id;
+        let columns = [None, Some(C::Request), Some(C::Payload), Some(C::StatusCode), Some(C::Length), Some(C::Error)];
+        assert_table!(columns, |idx, column| {
+            for sort_desc in [false, true] {
+                let order = IntruderSort { sort_column: column, sort_desc }.order(&rows);
+                let picked: Vec<&IntResult> = order.iter().map(|&i| &rows[i]).filter(|r| r.history_id == open).collect();
+                assert_eq!(picked.len(), 1, "case #{idx} ({column:?}, desc {sort_desc}): the open row is drawn exactly once");
+                assert_eq!(picked[0].request, 4, "case #{idx} ({column:?}, desc {sort_desc}): and it is still request 4");
+                assert_eq!(order.len(), rows.len(), "case #{idx} ({column:?}, desc {sort_desc}): every row is drawn");
+            }
+        });
+    }
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()

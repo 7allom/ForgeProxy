@@ -49,9 +49,16 @@ impl HttpEntry {
         if s == "Tunnel (encrypted)" {
             return Some(200);
         }
-        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.len() == 3 { digits.parse().ok() } else { None }
+        status_code(s)
     }
+}
+
+/// The code a recorded status line starts with ("404 Not Found" -> 404), or `None` when the
+/// line holds no response at all (an error note, or nothing yet). Shared with Intruder, whose
+/// results carry the same status strings without being history entries.
+pub fn status_code(status: &str) -> Option<u16> {
+    let digits: String = status.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 3 { digits.parse().ok() } else { None }
 }
 
 /// Recorded traffic. Entries are shared (`Arc`): the UI takes a snapshot each frame by
