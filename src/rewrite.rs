@@ -6,11 +6,16 @@
 //! - Blank match on a header rule: the replacement is added as a new header.
 //! - Blank replace on a header rule: every matching header is removed.
 //! - "Regex match" treats the match as a regular expression; otherwise plain text.
+//! - A request first line rule works on the request line alone ("GET /a HTTP/1.1"), so a
+//!   method or path can be rewritten without touching a header that reads the same.
+//! - "Case sensitive" decides how the match is compared, for regular expressions and plain
+//!   text alike.
 
 use regex::Regex;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuleType {
+    RequestFirstLine,
     RequestHeader,
     RequestBody,
     ResponseHeader,
@@ -18,10 +23,11 @@ pub enum RuleType {
 }
 
 impl RuleType {
-    pub const ALL: [RuleType; 4] =
-        [RuleType::RequestHeader, RuleType::RequestBody, RuleType::ResponseHeader, RuleType::ResponseBody];
+    pub const ALL: [RuleType; 5] = [RuleType::RequestFirstLine, RuleType::RequestHeader,
+        RuleType::RequestBody, RuleType::ResponseHeader, RuleType::ResponseBody];
     pub fn label(&self) -> &'static str {
         match self {
+            RuleType::RequestFirstLine => "Request first line",
             RuleType::RequestHeader => "Request header",
             RuleType::RequestBody => "Request body",
             RuleType::ResponseHeader => "Response header",
@@ -31,8 +37,18 @@ impl RuleType {
     fn is_header(&self) -> bool {
         matches!(self, RuleType::RequestHeader | RuleType::ResponseHeader)
     }
+    pub fn is_first_line(&self) -> bool {
+        matches!(self, RuleType::RequestFirstLine)
+    }
     fn is_request(&self) -> bool {
-        matches!(self, RuleType::RequestHeader | RuleType::RequestBody)
+        matches!(self, RuleType::RequestFirstLine | RuleType::RequestHeader | RuleType::RequestBody)
+    }
+    /// Whether a new rule of this kind starts out case sensitive. A header is matched loosely:
+    /// field names are case-insensitive by definition (RFC 9110 5.1), and a request that
+    /// reached the proxy over HTTP/2 has had its names lower-cased on the way. A first line or
+    /// a body is matched exactly as it was typed.
+    pub fn starts_case_sensitive(&self) -> bool {
+        !self.is_header()
     }
 }
 
@@ -44,10 +60,34 @@ pub struct Rule {
     pub match_text: String,
     pub replace_text: String,
     pub comment: String,
+    /// Match the text exactly as typed. Rules saved before this setting existed are read as
+    /// case sensitive, which is how they behaved when they were saved.
+    #[serde(default = "case_sensitive_default")]
+    pub case_sensitive: bool,
+}
+
+fn case_sensitive_default() -> bool {
+    true
+}
+
+impl Rule {
+    /// A blank rule of this kind, with the case sensitivity that suits it.
+    pub fn new(kind: RuleType) -> Rule {
+        Rule {
+            enabled: true,
+            kind,
+            regex: false,
+            match_text: String::new(),
+            replace_text: String::new(),
+            comment: String::new(),
+            case_sensitive: kind.starts_case_sensitive(),
+        }
+    }
 }
 
 fn matcher(rule: &Rule) -> Option<Regex> {
-    if rule.regex { crate::regex_cache::get(&rule.match_text) } else { crate::regex_cache::get(&regex::escape(&rule.match_text)) }
+    let pattern = if rule.regex { rule.match_text.clone() } else { regex::escape(&rule.match_text) };
+    crate::regex_cache::get_with(&pattern, !rule.case_sensitive)
 }
 
 fn apply_headers(rule: &Rule, headers: &str) -> String {
@@ -97,11 +137,12 @@ fn apply_body(rule: &Rule, body: &str) -> String {
     }
 }
 
-/// Apply enabled request (or response) rules to (headers, body).
+/// Apply enabled request (or response) rules to (headers, body). The request line is not
+/// part of either: [`apply_first_line`] handles the rules that work on it.
 pub fn apply(rules: &[Rule], request: bool, headers: &str, body: &str) -> (String, String) {
     let mut h = headers.to_string();
     let mut b = body.to_string();
-    for r in rules.iter().filter(|r| r.enabled && r.kind.is_request() == request) {
+    for r in rules.iter().filter(|r| r.enabled && r.kind.is_request() == request && !r.kind.is_first_line()) {
         if r.kind.is_header() {
             h = apply_headers(r, &h);
         } else {
@@ -111,15 +152,46 @@ pub fn apply(rules: &[Rule], request: bool, headers: &str, body: &str) -> (Strin
     (h, b)
 }
 
+/// Apply the enabled "Request first line" rules to a request line ("GET /a?b=1 HTTP/1.1").
+/// Only that line is offered to them, so a path can be rewritten without a rule reaching the
+/// same text in a header or in the body.
+pub fn apply_first_line(rules: &[Rule], line: &str) -> String {
+    let mut out = line.to_string();
+    for r in rules.iter().filter(|r| r.enabled && r.kind.is_first_line()) {
+        out = apply_body(r, &out);
+    }
+    out
+}
+
+/// `raw` with its first line rewritten by the enabled "Request first line" rules; the headers
+/// and the body are left exactly as they are. Used where a whole request is in hand.
+pub fn apply_first_line_of(rules: &[Rule], raw: &str) -> String {
+    if !rules.iter().any(|r| r.enabled && r.kind.is_first_line()) {
+        return raw.to_string();
+    }
+    match raw.split_once('\n') {
+        Some((first, rest)) => {
+            // a CR belongs to the line ending, not to the HTTP version
+            let (line, cr) = match first.strip_suffix('\r') {
+                Some(l) => (l, "\r"),
+                None => (first, ""),
+            };
+            format!("{}{cr}\n{rest}", apply_first_line(rules, line))
+        }
+        None => apply_first_line(rules, raw),
+    }
+}
+
 /// The original's 12 default rules, all disabled.
 pub fn defaults() -> Vec<Rule> {
-    let rule = |kind, m: &str, r: &str, c: &str| Rule {
+    let rule = |kind: RuleType, m: &str, r: &str, c: &str| Rule {
         enabled: false,
-        kind,
         regex: true,
         match_text: m.into(),
         replace_text: r.into(),
         comment: c.into(),
+        case_sensitive: kind.starts_case_sensitive(),
+        kind,
     };
     use RuleType::*;
     vec![
@@ -144,7 +216,160 @@ mod tests {
     use crate::test_utils::assert_table;
 
     fn r(kind: RuleType, regex: bool, m: &str, rep: &str) -> Rule {
-        Rule { enabled: true, kind, regex, match_text: m.into(), replace_text: rep.into(), comment: String::new() }
+        Rule { enabled: true, kind, regex, match_text: m.into(), replace_text: rep.into(), comment: String::new(), case_sensitive: true }
+    }
+
+    /// The same rule, matched loosely.
+    fn ci(mut rule: Rule) -> Rule {
+        rule.case_sensitive = false;
+        rule
+    }
+
+    /// A first line rule sees the request line and nothing else, and every rule compares its
+    /// match the way its "Case sensitive" setting says. Each case runs the rules over a line,
+    /// a header block and a body at once, so a rule reaching text it has no business touching
+    /// shows up as a failure on the other two.
+    #[test]
+    fn first_line_rules_and_case_sensitivity_matrix() {
+        struct Case<'a> {
+            name: &'a str,
+            rules: Vec<Rule>,
+            want_line: &'a str,
+            want_headers: &'a str,
+            want_body: &'a str,
+        }
+        // the same text appears in all three places, so an over-reaching rule is visible
+        const LINE: &str = "GET /api/v1/users HTTP/1.1";
+        const HEADERS: &str = "user-agent: curl/8.5\nReferer: https://host/api/v1/users";
+        const BODY: &str = "next=/api/v1/users&role=Admin";
+
+        let cases = [
+            Case {
+                name: "a first line rule rewrites the path and nothing else",
+                rules: vec![r(RuleType::RequestFirstLine, false, "/api/v1/", "/api/v2/")],
+                want_line: "GET /api/v2/users HTTP/1.1",
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "and can rewrite the method",
+                rules: vec![r(RuleType::RequestFirstLine, true, "^GET\\b", "POST")],
+                want_line: "POST /api/v1/users HTTP/1.1",
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "a header rule never reaches the first line",
+                rules: vec![r(RuleType::RequestHeader, true, "^Referer.*$", "")],
+                want_line: LINE,
+                want_headers: "user-agent: curl/8.5",
+                want_body: BODY,
+            },
+            Case {
+                name: "a body rule never reaches it either",
+                rules: vec![r(RuleType::RequestBody, false, "/api/v1/users", "/api/v2/users")],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: "next=/api/v2/users&role=Admin",
+            },
+            // header field names are case-insensitive, and an HTTP/2 downgrade lower-cases them
+            Case {
+                name: "a loose header rule matches a lower-cased field name",
+                rules: vec![ci(r(RuleType::RequestHeader, true, "^User-Agent:.*$", "User-Agent: ForgeProxy"))],
+                want_line: LINE,
+                want_headers: "User-Agent: ForgeProxy\nReferer: https://host/api/v1/users",
+                want_body: BODY,
+            },
+            Case {
+                name: "an exact one does not",
+                rules: vec![r(RuleType::RequestHeader, true, "^User-Agent:.*$", "User-Agent: ForgeProxy")],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "an exact body rule leaves mismatched capitals alone",
+                rules: vec![r(RuleType::RequestBody, false, "admin", "guest")],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "a loose one catches them",
+                rules: vec![ci(r(RuleType::RequestBody, false, "admin", "guest"))],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: "next=/api/v1/users&role=guest",
+            },
+            Case {
+                name: "an exact first line rule leaves a mismatched path alone",
+                rules: vec![r(RuleType::RequestFirstLine, false, "/API/V1/", "/api/v2/")],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "a loose one rewrites it",
+                rules: vec![ci(r(RuleType::RequestFirstLine, false, "/API/V1/", "/api/v2/"))],
+                want_line: "GET /api/v2/users HTTP/1.1",
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "a disabled first line rule does nothing",
+                rules: vec![Rule { enabled: false, ..r(RuleType::RequestFirstLine, false, "/api/v1/", "/api/v2/") }],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+            Case {
+                name: "response rules are left out of a request entirely",
+                rules: vec![r(RuleType::ResponseBody, false, "/api/v1/users", "/gone")],
+                want_line: LINE,
+                want_headers: HEADERS,
+                want_body: BODY,
+            },
+        ];
+
+        assert_table!(cases, |idx, Case { name, rules, want_line, want_headers, want_body }| {
+            let (headers, body) = apply(&rules, true, HEADERS, BODY);
+            assert_eq!(apply_first_line(&rules, LINE), want_line, "case #{idx} ({name}): first line");
+            assert_eq!(headers, want_headers, "case #{idx} ({name}): headers");
+            assert_eq!(body, want_body, "case #{idx} ({name}): body");
+        });
+    }
+
+    /// `apply_first_line_of` rewrites line one of a whole request and leaves every byte after
+    /// it where it was, whichever line ending the request uses.
+    #[test]
+    fn rewriting_the_first_line_of_a_whole_request_matrix() {
+        let rules = vec![r(RuleType::RequestFirstLine, false, "/api/v1/", "/api/v2/")];
+        let cases: [(&str, &str, &str); 4] = [
+            ("LF, with a header and a body that read the same",
+                "GET /api/v1/users HTTP/1.1\nReferer: /api/v1/users\n\nnext=/api/v1/users",
+                "GET /api/v2/users HTTP/1.1\nReferer: /api/v1/users\n\nnext=/api/v1/users"),
+            ("CRLF keeps its carriage returns",
+                "GET /api/v1/users HTTP/1.1\r\nHost: a.test\r\n\r\n",
+                "GET /api/v2/users HTTP/1.1\r\nHost: a.test\r\n\r\n"),
+            ("a request line on its own", "GET /api/v1/users HTTP/1.1", "GET /api/v2/users HTTP/1.1"),
+            ("nothing to match", "GET /other HTTP/1.1\nHost: a.test\n\n", "GET /other HTTP/1.1\nHost: a.test\n\n"),
+        ];
+        assert_table!(cases, |idx, (what, raw, want)| {
+            assert_eq!(apply_first_line_of(&rules, raw), want, "case #{idx} ({what})");
+        });
+    }
+
+    /// Rules saved before "Case sensitive" existed are read back matching exactly as typed,
+    /// which is how they behaved when they were saved.
+    #[test]
+    fn a_rule_saved_without_case_sensitivity_stays_exact() {
+        let json = r#"{"enabled":true,"kind":"RequestHeader","regex":true,"match_text":"^Referer.*$","replace_text":"","comment":"old"}"#;
+        let old: Rule = serde_json::from_str(json).unwrap();
+        assert!(old.case_sensitive, "an older rule keeps the matching it was written for");
+        // while a new rule of that kind is offered the setting that suits it
+        assert!(!Rule::new(RuleType::RequestHeader).case_sensitive, "header names are matched loosely");
+        assert!(Rule::new(RuleType::RequestFirstLine).case_sensitive, "a request line exactly");
+        assert!(Rule::new(RuleType::RequestBody).case_sensitive, "a body exactly");
     }
 
     #[test]

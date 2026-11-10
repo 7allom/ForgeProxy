@@ -701,7 +701,13 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         Some(t) => rewrite::apply(&rules_now, true, &headers_text, t),
         None => (rewrite::apply(&rules_now, true, &headers_text, "").0, placeholder.clone()),
     };
-    let mut raw = format!("{method} {path} HTTP/1.1\n{headers_text}\n\n{body_text}");
+    // the request line gets its own rules, so a path or a method can be rewritten without a
+    // rule reaching the same text in a header; history then follows what the rule produced
+    let first_line = rewrite::apply_first_line(&rules_now, &format!("{method} {path} HTTP/1.1"));
+    let mut raw = format!("{first_line}\n{headers_text}\n\n{body_text}");
+    if let Some(f) = crate::http::request_facts(&raw) {
+        (method, path) = (f.method, f.path);
+    }
 
     if should_hold(sh, &path, &at.url(&path)) {
         let (tx, rx) = channel();
@@ -1082,7 +1088,7 @@ mod tests {
         let up = upstream();
         let sh = shared();
         sh.rules.lock().unwrap().push(crate::rewrite::Rule {
-            enabled: true, kind: crate::rewrite::RuleType::ResponseHeader, regex: true,
+            enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::ResponseHeader, regex: true,
             match_text: "^Set-Cookie.*$".into(), replace_text: String::new(), comment: String::new(),
         });
         let pp = free_port();
@@ -1254,6 +1260,35 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A "Request first line" rule rewrites the line that goes upstream, and the history row
+    /// and site map follow it: the entry's method, path and URL are re-read from the request
+    /// as the rule left it, not as the browser sent it.
+    #[test]
+    fn a_first_line_rule_rewrites_the_wire_and_the_recorded_metadata() {
+        let (up, seen) = recording_upstream();
+        let sh = shared();
+        sh.rules.lock().unwrap().push(crate::rewrite::Rule {
+            enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestFirstLine,
+            regex: true, match_text: "^GET /api/v1/".into(), replace_text: "POST /api/v2/".into(),
+            comment: String::new(),
+        });
+        let pp = free_port();
+        start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = through_proxy(pp, &format!("http://127.0.0.1:{up}/api/v1/users?page=2"));
+        let entry = sh.history.lock().unwrap().first().cloned().expect("the exchange was recorded");
+        sh.stop.store(true, Ordering::SeqCst);
+
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.starts_with("POST /api/v2/users?page=2 HTTP/1.1"), "the wire carries the rewritten line: {sent:?}");
+        // `through_proxy` sends "Host: x"; the rule had no business touching it
+        assert!(sent.contains("\r\nHost: x\r\n"), "and the headers it always had: {sent:?}");
+        assert_eq!(entry.method, "POST", "the table shows the method the rule produced");
+        assert_eq!(entry.path, "/api/v2/users?page=2", "and the path");
+        assert_eq!(entry.url, format!("http://127.0.0.1:{up}/api/v2/users?page=2"), "and the URL built from it");
+        assert!(entry.request.starts_with("POST /api/v2/users?page=2 HTTP/1.1"), "as does the request kept with it");
     }
 
     /// Send `path` through the proxy on another thread; returns its join handle.
@@ -1575,7 +1610,7 @@ mod tests {
         let (sh, pp) = mitm_proxy(proxy_ca.clone(), Some(&server_ca));
         // a request rule: add a header to every request
         sh.rules.lock().unwrap().push(crate::rewrite::Rule {
-            enabled: true, kind: crate::rewrite::RuleType::RequestHeader, regex: false,
+            enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestHeader, regex: false,
             match_text: String::new(), replace_text: "X-Forge: yes".into(), comment: String::new(),
         });
         let tls = https_client(pp, &format!("127.0.0.1:{up}"), "127.0.0.1", &proxy_ca).expect("client trusts the proxy's certificate");
@@ -2007,7 +2042,7 @@ mod tests {
 
     fn body_rule(from: &str, to: &str) -> crate::rewrite::Rule {
         crate::rewrite::Rule {
-            enabled: true, kind: crate::rewrite::RuleType::RequestBody, regex: false,
+            enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestBody, regex: false,
             match_text: from.into(), replace_text: to.into(), comment: String::new(),
         }
     }

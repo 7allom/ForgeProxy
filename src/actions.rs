@@ -24,12 +24,13 @@ pub fn send_repeater(app: &mut App) {
     tab.waiting = true;
     tab.status_text = "Sending...".into();
     let tab_id = tab.id;
-    let (method, _, headers, body) = parse_raw_request(&tab.request);
-    // the request itself says where it goes (Host header + request line); the address bar
-    // only supplies the scheme, and is updated to show the real destination
-    let url = repeater_target(&tab.request, &tab.url);
-    tab.url = url.clone();
-    let req_sent = tab.request.clone();
+    // the address bar follows the user's own request; the rules then act on the copy that is
+    // sent, so a rewritten request line never writes itself back into the editor
+    tab.url = repeater_target(&tab.request, &tab.url);
+    let req_sent = rewrite::apply_first_line_of(&app.mr_rules, &app.rep().request);
+    let (method, _, headers, body) = parse_raw_request(&req_sent);
+    // and the send follows the rewritten line, so a rewritten path is the path asked for
+    let url = repeater_target(&req_sent, &app.rep().url);
     let htext = headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n");
     let (htext, body2) = rewrite::apply(&app.mr_rules, true, &htext, &body);
     let hv = parse_headers(&htext);

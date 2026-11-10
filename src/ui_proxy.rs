@@ -223,7 +223,7 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
             if theme::side_button(ui, p, "Add", true).clicked() {
-                app.mr_rules.push(rewrite::Rule { enabled: true, kind: RuleType::RequestHeader, regex: false, match_text: String::new(), replace_text: String::new(), comment: String::new() });
+                app.mr_rules.push(rewrite::Rule::new(RuleType::RequestHeader));
                 app.mr_sel = Some(app.mr_rules.len() - 1);
                 editing = true;
             }
@@ -240,10 +240,11 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
                 if let Some(i) = sel { app.mr_rules.swap(i, i + 1); app.mr_sel = Some(i + 1); }
             }
         });
-        // (minimum width, share of the spare width) for Enabled, Item, Match, Replace, Type, Comment
-        const COLS: [(f32, f32); 6] = [(64.0, 0.0), (110.0, 0.16), (120.0, 0.26), (140.0, 0.34), (60.0, 0.0), (100.0, 0.24)];
+        // (minimum width, share of the spare width) for Enabled, Item, Match, Replace, Type,
+        // Case, Comment. "Item" holds the longest label, "Request first line".
+        const COLS: [(f32, f32); 7] = [(64.0, 0.0), (124.0, 0.16), (120.0, 0.26), (140.0, 0.34), (60.0, 0.0), (44.0, 0.0), (100.0, 0.24)];
         theme::fitted_table(ui, p, ("mr_table", id), 230.0, &COLS, |ui, w| {
-            theme::table_header(ui, p, &[("Enabled", w[0]), ("Item", w[1]), ("Match", w[2]), ("Replace", w[3]), ("Type", w[4]), ("Comment", w[5])]);
+            theme::table_header(ui, p, &[("Enabled", w[0]), ("Item", w[1]), ("Match", w[2]), ("Replace", w[3]), ("Type", w[4]), ("Case", w[5]), ("Comment", w[6])]);
             egui::ScrollArea::vertical().id_salt(("mr_rows", id)).auto_shrink([false, true]).show(ui, |ui| {
                 for i in 0..app.mr_rules.len() {
                     let r = &app.mr_rules[i];
@@ -253,7 +254,9 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
                         (r.match_text.clone(), w[2], None),
                         (r.replace_text.clone(), w[3], None),
                         (if r.regex { "Regex" } else { "Literal" }.to_string(), w[4], None),
-                        (r.comment.clone(), w[5], None),
+                        // "Aa" for a rule that matches the text exactly as typed
+                        (if r.case_sensitive { "Aa" } else { "" }.to_string(), w[5], None),
+                        (r.comment.clone(), w[6], None),
                     ];
                     let row = theme::table_row(ui, p, &cells, sel == Some(i), i % 2 == 1);
                     if row.clicked() { app.mr_sel = Some(i); }
@@ -271,15 +274,26 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
             ui.label("Enabled:"); ui.checkbox(&mut r.enabled, ""); ui.end_row();
             ui.label("Type:");
             egui::ComboBox::from_id_salt(("mr_type", id)).selected_text(r.kind.label()).show_ui(ui, |ui| {
-                for t in RuleType::ALL { ui.selectable_value(&mut r.kind, t, t.label()); }
+                for t in RuleType::ALL {
+                    // a kind the user picks brings the case sensitivity that suits it, until
+                    // they say otherwise with the checkbox below
+                    if ui.selectable_value(&mut r.kind, t, t.label()).clicked() {
+                        r.case_sensitive = t.starts_case_sensitive();
+                    }
+                }
             });
             ui.end_row();
             ui.label("Match:"); ui.add(egui::TextEdit::singleline(&mut r.match_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
             ui.label("Replace:"); ui.add(egui::TextEdit::singleline(&mut r.replace_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
             ui.label("Regex match:"); ui.checkbox(&mut r.regex, ""); ui.end_row();
+            ui.label("Case sensitive:");
+            ui.checkbox(&mut r.case_sensitive, "")
+                .on_hover_text("Off: the match ignores capitals, so user-agent matches User-Agent");
+            ui.end_row();
             ui.label("Comment:"); ui.add(egui::TextEdit::singleline(&mut r.comment).desired_width(460.0)); ui.end_row();
         });
         ui.label(RichText::new("Header rules work line by line: a blank match adds the replacement as a new header; a blank replacement removes matching headers.").size(11.5).color(p.disabled));
+        ui.label(RichText::new("A request first line rule sees only the line itself, such as \"GET /api/v1/users HTTP/1.1\".").size(11.5).color(p.disabled));
     }
     ui.data_mut(|d| d.insert_temp(editing_id, editing));
 }
