@@ -1674,10 +1674,10 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
             });
         }
         ui.vertical(|ui| {
-            theme::table_well(ui, p, table_h, |ui| {
+            theme::fitted_table(ui, p, ("traffic_table", view as u8), table_h, &HISTORY_COLS, |ui, w| {
                 use crate::history::HistorySortColumn as C;
-                let cols: &[(&str, f32, C)] = &[("#", 50.0, C::Id), ("Time", 72.0, C::Time), ("Tool", 80.0, C::Tool), ("Method", 70.0, C::Method), ("Host", 200.0, C::Host),
-                    ("Path", 300.0, C::Path), ("Status code", 130.0, C::Status), ("Length", 80.0, C::Length), ("MIME type", 120.0, C::Mime)];
+                let cols: &[(&str, f32, C)] = &[("#", w[0], C::Id), ("Time", w[1], C::Time), ("Tool", w[2], C::Tool), ("Method", w[3], C::Method), ("Host", w[4], C::Host),
+                    ("Path", w[5], C::Path), ("Status code", w[6], C::Status), ("Length", w[7], C::Length), ("MIME type", w[8], C::Mime)];
                 if let Some(col) = sort_header(ui, p, cols, app.history_filter.sort_column, app.history_filter.sort_ascending) {
                     app.history_filter.click_column(col);
                 }
@@ -1685,15 +1685,15 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                 egui::ScrollArea::vertical().id_salt(("traffic", view as u8)).show_rows(ui, 19.0, hist.len(), |ui, range| {
                     for (i, e) in hist.iter().enumerate().skip(range.start).take(range.len()) {
                         let cells = [
-                            (e.id.to_string(), 50.0, None),
-                            (crate::history::time_of_day(e.time), 72.0, Some(p.disabled)),
-                            (e.tool.clone(), 80.0, None),
-                            (e.method.clone(), 70.0, Some(method_color(p, &e.method))),
-                            (e.host.clone(), 200.0, None),
-                            (e.path.clone(), 300.0, None),
-                            (e.status.clone(), 130.0, None),
-                            (e.length.to_string(), 80.0, None),
-                            (e.mime.clone(), 120.0, None),
+                            (e.id.to_string(), w[0], None),
+                            (crate::history::time_of_day(e.time), w[1], Some(p.disabled)),
+                            (e.tool.clone(), w[2], None),
+                            (e.method.clone(), w[3], Some(method_color(p, &e.method))),
+                            (e.host.clone(), w[4], None),
+                            (e.path.clone(), w[5], None),
+                            (e.status.clone(), w[6], None),
+                            (e.length.to_string(), w[7], None),
+                            (e.mime.clone(), w[8], None),
                         ];
                         let row = theme::table_row(ui, p, &cells, sel_id == Some(e.id), i % 2 == 1);
                         if row.clicked() { clicked = Some(e.id); }
@@ -1713,6 +1713,14 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
         crate::ui_proxy::scope_menu_apply(app, &e, &prefix, action);
     }
 }
+
+/// HTTP history columns, as (minimum width, share of the spare width): #, Time, Tool, Method,
+/// Host, Path, Status code, Length, MIME type. Path takes all of the slack, so the row reaches
+/// the right edge instead of stopping short of it and leaving the MIME column marooned in blank
+/// space; below the minimums the table scrolls sideways rather than cutting the last column off.
+/// Status code is wide enough for "405 Method Not Allowed", as in the Intruder results table.
+const HISTORY_COLS: [(f32, f32); 9] = [(50.0, 0.0), (72.0, 0.0), (80.0, 0.0), (70.0, 0.0), (200.0, 0.0),
+    (220.0, 1.0), (170.0, 0.0), (80.0, 0.0), (150.0, 0.0)];
 
 /// The table header with each column a button: click to sort by it, again to reverse.
 /// The column currently sorted on shows a triangle (up: ascending). Returns the column that
@@ -2380,10 +2388,11 @@ mod sort_header_tests {
 
     /// A status cell draws its text into `width - 8` pixels and clips the rest, so the column
     /// has to be wider than the longest phrase that routinely lands in it. The two in the brief
-    /// ("405 Method Not Allowed", "500 Internal Server Error") are the widest of them.
+    /// ("405 Method Not Allowed", "500 Internal Server Error") are the widest of them. Both the
+    /// Intruder results table and HTTP history are checked against the same phrases.
     #[test]
     fn standard_status_phrases_fit_the_status_column() {
-        let width = COLS[2].1 - 8.0;
+        let width = COLS[2].1.min(HISTORY_COLS[6].0) - 8.0;
         let ctx = egui::Context::default();
         // fonts installed by a pass of their own: a new set only takes effect the pass after
         let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));
@@ -2393,6 +2402,22 @@ mod sort_header_tests {
             assert_table!(phrases, |idx, phrase| {
                 let drawn = ctx.fonts(|f| f.layout_no_wrap(phrase.to_string(), FontId::proportional(12.5), Color32::WHITE).rect.width());
                 assert!(drawn <= width, "case #{idx} ({phrase}): {drawn:.1}px of text in a {width:.1}px cell");
+            });
+        });
+    }
+
+    /// The last column has no slack to grow into, so it carries its own room: "application/
+    /// javascript" has to read in full rather than stopping mid-word at the table's edge.
+    #[test]
+    fn common_mime_types_fit_the_last_history_column() {
+        let width = HISTORY_COLS[8].0 - 8.0;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let types = ["text/html", "application/json", "application/javascript", "image/svg+xml", "text/css", "MIME type"];
+            assert_table!(types, |idx, mime| {
+                let drawn = ctx.fonts(|f| f.layout_no_wrap(mime.to_string(), FontId::proportional(12.5), Color32::WHITE).rect.width());
+                assert!(drawn <= width, "case #{idx} ({mime}): {drawn:.1}px of text in a {width:.1}px cell");
             });
         });
     }

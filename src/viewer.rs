@@ -321,6 +321,38 @@ pub fn hex_job(p: &Palette, text: &str, size: f32) -> LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
+
+    /// Pretty lays out the body of a whole message, and a blank line is what tells it where
+    /// that body starts. A head glued to its body by a single newline is not a message with a
+    /// body: it reads as one long head and comes back untouched, which is exactly how a
+    /// response recorded without that blank line used to arrive here.
+    #[test]
+    fn the_blank_line_is_what_separates_a_head_from_its_body() {
+        let json = "{\"id\":8821,\"items\":[{\"sku\":\"A-1\"}]}";
+        let html = "<html><body><p>Hi</p></body></html>";
+        let cases: [(&str, String, BodyKind, &str); 5] = [
+            ("a CRLF response with compact JSON",
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{json}"), BodyKind::Json, "\n  \"id\": 8821,"),
+            ("an LF response with compact JSON",
+                format!("HTTP/1.1 200 OK\nContent-Type: application/json\n\n{json}"), BodyKind::Json, "\n  \"items\": ["),
+            ("a request body counts the same",
+                format!("POST /v1/orders HTTP/1.1\nHost: api.test\n\n{json}"), BodyKind::Json, "\n  \"id\": 8821,"),
+            ("an HTML body is indented tag by tag",
+                format!("HTTP/1.1 200 OK\nContent-Type: text/html\n\n{html}"), BodyKind::Markup, "\n  <body>\n"),
+            // the shape the proxy used to record: no blank line, so no body to format
+            ("a head glued to its body has no body",
+                format!("HTTP/1.1 200 OK\nContent-Type: application/json\n{json}"), BodyKind::Other, json),
+        ];
+        assert_table!(cases, |idx, (what, raw, kind, want)| {
+            let (out, got) = pretty_message(&raw);
+            assert_eq!(got, kind, "case #{idx} ({what}): {raw:?}");
+            assert!(out.contains(want), "case #{idx} ({what}): {want:?} missing from {out:?}");
+            if kind == BodyKind::Other {
+                assert_eq!(out, raw.replace("\r\n", "\n"), "case #{idx} ({what}): left as it came");
+            }
+        });
+    }
 
     #[test]
     fn json_bodies_are_reindented_keeping_key_order() {

@@ -348,44 +348,9 @@ fn fill_values(parts: &[String], defaults: &[String], values: &[Option<String>])
         }
     }
     out.push_str(parts.get(defaults.len()).map_or("", |s| s.as_str()));
-    sync_content_length(out)
+    crate::http::sync_content_length(out)
 }
 
-/// Update `Content-Length` in `raw` to match the byte length of the body after `\r\n\r\n` or `\n\n`.
-pub fn sync_content_length(raw: String) -> String {
-    let (sep, split_idx) = if let Some(idx) = raw.find("\r\n\r\n") {
-        ("\r\n\r\n", idx)
-    } else if let Some(idx) = raw.find("\n\n") {
-        ("\n\n", idx)
-    } else {
-        return raw;
-    };
-    let head = &raw[..split_idx];
-    let body = &raw[split_idx + sep.len()..];
-    let has_cl = head.lines().skip(1).any(|l| {
-        l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-    });
-    if !has_cl {
-        return raw;
-    }
-    let line_sep = if sep == "\r\n\r\n" { "\r\n" } else { "\n" };
-    let updated_head: Vec<String> = head
-        .split('\n')
-        .enumerate()
-        .map(|(i, raw_line)| {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            if i > 0 {
-                if let Some((k, _)) = line.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("content-length") {
-                        return format!("{}: {}", k.trim(), body.len());
-                    }
-                }
-            }
-            line.to_string()
-        })
-        .collect();
-    format!("{}{sep}{body}", updated_head.join(line_sep))
-}
 
 /// Configurable payload generators for Intruder payload sets.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -663,8 +663,12 @@ fn plain(sh: Shared, mut io: BufReader<TcpStream>, head: String, latin1: bool, m
 /// framed (Content-Length) so the client connection can carry more requests. Returns false
 /// when the connection should end.
 #[allow(clippy::too_many_arguments)]
-fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, latin1: bool, method: String, path: String, at: &Target, keep_alive: bool) -> bool {
-    let host = at.host.clone();
+fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, latin1: bool, mut method: String, mut path: String, at: &Target, keep_alive: bool) -> bool {
+    // what history records: the request as it is finally sent, which Intercept may have had
+    // the user rewrite. The connection itself stays with `at`, which it was opened to.
+    let mut host = at.host.clone();
+    // a port an edited Host header carries, for the recorded URL
+    let mut edited_port: Option<u16> = None;
     // body: strict Content-Length framing; read as it arrives (no allocation up front)
     let len = match request_body_length(head) {
         Ok(n) => n,
@@ -703,7 +707,26 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         let (tx, rx) = channel();
         sh.held.lock().unwrap_or_else(|e| e.into_inner()).push(Held { id: next_held_id(), raw: raw.clone(), url: at.url(&path), reply: tx });
         match rx.recv() {
-            Ok(Decision::Forward(edited)) => raw = edited,
+            Ok(Decision::Forward(edited)) => {
+                raw = edited;
+                // a hand-edited request line or Host header is what goes on the wire, so the
+                // history row, the site map and the entry's URL follow it rather than the
+                // method, path and host the request first arrived with
+                if let Some(f) = crate::http::request_facts(&raw) {
+                    (method, path) = (f.method, f.path);
+                    if !f.host.is_empty() {
+                        let (h, p) = crate::http::split_authority(&f.host);
+                        host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+                        edited_port = p;
+                    }
+                }
+                // the body may have been edited too. The wire gets a corrected Content-Length
+                // below; this keeps the recorded request saying the same thing. A body that
+                // isn't text is forwarded byte for byte, and `raw` holds only a note about it.
+                if sh.fix_length.load(Ordering::SeqCst) && text_body.is_some() {
+                    raw = crate::http::sync_content_length(raw);
+                }
+            }
             _ => {
                 let msg = "Request dropped by the proxy.";
                 let _ = io.get_mut().write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}", msg.len()).as_bytes());
@@ -818,6 +841,12 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         String::from_utf8_lossy(&resp_body).into_owned()
     };
     let id = next_id(&sh.next_id);
+    // `at.url` spells the authority the socket went to; an edited Host header replaces it
+    let url = if host == at.host && edited_port.is_none() {
+        at.url(&path)
+    } else {
+        Target { https: at.https, host: host.clone(), port: edited_port.unwrap_or(at.port) }.url(&path)
+    };
     sh.history.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(HttpEntry {
         id,
         tool: "Proxy".into(),
@@ -828,8 +857,10 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         length,
         mime,
         request: raw,
-        response: format!("{}\n{}", final_head.replace("\r\n", "\n").trim_end(), shown_body),
-        url: at.url(&path),
+        // head and body separated by a blank line, as every other tool records them: the
+        // Pretty view, the Inspector and the Sequencer all find a response's body by it
+        response: format!("{}\n\n{}", final_head.replace("\r\n", "\n").trim_end(), shown_body),
+        url,
         truncated,
         time: crate::http::now_ms(),
     }));
@@ -1090,6 +1121,139 @@ mod tests {
         let resp = t.join().unwrap();
         assert!(resp.contains("got GET /edited HTTP/1.1"), "{resp}");
         sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// An upstream that keeps the whole request it was sent, head and body, so a test can see
+    /// exactly what the proxy put on the wire.
+    fn recording_upstream() -> (u16, Arc<Mutex<String>>) {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let out = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().take(2) {
+                let mut s = s.unwrap();
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let head = read_head(&mut r).unwrap_or_default();
+                let len: usize = header(&head, "content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                let mut body = vec![0u8; len];
+                let _ = r.read_exact(&mut body);
+                *out.lock().unwrap_or_else(|e| e.into_inner()) = format!("{head}\n{}", String::from_utf8_lossy(&body));
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        (port, seen)
+    }
+
+    /// Hold `request` for Intercept, hand `edit` the held text and forward what it returns.
+    /// Gives back the recorded history entry.
+    fn forward_edited(request: impl FnOnce(u16, u16) -> std::thread::JoinHandle<String>, edit: impl FnOnce(String) -> String, up: u16) -> HttpEntry {
+        let sh = shared();
+        sh.intercept.store(true, Ordering::SeqCst);
+        let pp = free_port();
+        start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let t = request(pp, up);
+        assert!(gets_held(&sh), "the request was held");
+        let h = sh.held.lock().unwrap().remove(0);
+        h.reply.send(Decision::Forward(edit(h.raw))).unwrap();
+        let _ = t.join().unwrap();
+        sh.stop.store(true, Ordering::SeqCst);
+        let entry = sh.history.lock().unwrap().first().map(|e| (**e).clone());
+        entry.expect("the forwarded request was recorded")
+    }
+
+    /// A request rewritten while it was held is recorded as it was sent, not as it arrived:
+    /// the history table, the site map and the entry's URL all follow the edited request line
+    /// and Host header. Before this, a request tampered into `/admin` still read `/original`.
+    #[test]
+    fn forwarding_an_edited_request_records_its_new_method_path_and_host() {
+        let up = upstream();
+        let entry = forward_edited(
+            |pp, up| send_async(pp, up, "/original"),
+            |raw| raw.replace("GET /original HTTP/1.1", "DELETE /admin/users/7?force=1 HTTP/1.1").replace("Host: x", "Host: shop.internal:8080"),
+            up,
+        );
+        assert_eq!(entry.method, "DELETE", "the method the table shows");
+        assert_eq!(entry.path, "/admin/users/7?force=1", "the path the table shows");
+        assert_eq!(entry.host, "shop.internal", "the host the table and the site map group it under");
+        assert_eq!(entry.url, "http://shop.internal:8080/admin/users/7?force=1", "and the URL built from both");
+    }
+
+    /// An edited body goes upstream with a Content-Length that matches it, and the request
+    /// kept in history says the same thing rather than the length the browser first sent.
+    #[test]
+    fn forwarding_an_edited_body_corrects_content_length_on_the_wire_and_in_history() {
+        let (up, seen) = recording_upstream();
+        let longer = "the body this request was edited to carry";
+        let entry = forward_edited(
+            |pp, up| {
+                let target = format!("http://127.0.0.1:{up}/pay");
+                let body = "short".to_string();
+                std::thread::spawn(move || post_through_proxy(pp, &target, &body))
+            },
+            |raw| raw.replace("short", longer),
+            up,
+        );
+        let want = format!("Content-Length: {}", longer.len());
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.contains(&want), "the wire carries the corrected length: {sent:?}");
+        assert!(sent.ends_with(longer), "and the edited body in full: {sent:?}");
+        assert!(entry.request.contains(&want), "history agrees with it: {:?}", entry.request);
+        assert!(entry.request.ends_with(longer), "and keeps the edited body: {:?}", entry.request);
+    }
+
+    /// POST `body` to `target` through the proxy on another thread.
+    fn post_through_proxy(proxy_port: u16, target: &str, body: &str) -> String {
+        let mut c = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+        let head = format!("POST {target} HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n", body.len());
+        c.write_all(head.as_bytes()).unwrap();
+        c.write_all(body.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    }
+
+    /// A recorded response has to be a message: head, blank line, body. Everything that reads
+    /// one back finds the body by that blank line -- the Pretty view, the Inspector's body
+    /// parameters, the Sequencer's token extraction -- so a response recorded without it reads
+    /// as one long head with no body at all, and Pretty leaves it exactly as it found it.
+    #[test]
+    fn a_recorded_response_keeps_the_blank_line_before_its_body() {
+        let body = r#"{"order":8821,"items":[{"sku":"A-1"}]}"#;
+        let up = json_upstream(body);
+        let sh = shared();
+        let pp = free_port();
+        start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = through_proxy(pp, &format!("http://127.0.0.1:{up}/v1/orders"));
+        let entry = sh.history.lock().unwrap().first().cloned().expect("the exchange was recorded");
+        sh.stop.store(true, Ordering::SeqCst);
+
+        let (head, found) = entry.response.split_once("\n\n").expect("head and body are separated");
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "the head is the response head: {head:?}");
+        assert_eq!(found, body, "and the body is the body");
+        // which is what lets Pretty recognise it and lay it out
+        let (pretty, kind) = crate::viewer::pretty_message(&entry.response);
+        assert_eq!(kind, crate::viewer::BodyKind::Json, "Pretty sees JSON: {:?}", entry.response);
+        assert!(pretty.contains("\n  \"order\": 8821,"), "and indents it: {pretty:?}");
+        // the request side has always been a whole message; it stays one
+        assert!(entry.request.contains("\n\n"), "the request too: {:?}", entry.request);
+    }
+
+    /// An upstream that answers every request with the same JSON body.
+    fn json_upstream(body: &'static str) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming().take(2) {
+                let mut s = s.unwrap();
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let _ = read_head(&mut r);
+                let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        port
     }
 
     /// Send `path` through the proxy on another thread; returns its join handle.

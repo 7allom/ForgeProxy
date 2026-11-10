@@ -61,6 +61,99 @@ pub fn status_code(status: &str) -> Option<u16> {
     if digits.len() == 3 { digits.parse().ok() } else { None }
 }
 
+/// What a raw request says about itself. A request held by Intercept is recorded from this
+/// after the user has had their hands on it, so the history table, the site map and the entry's
+/// URL show what was really sent rather than what first arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestFacts {
+    pub method: String,
+    /// The request target, reduced to its path and query: an absolute target
+    /// (`GET http://host/p?q`, the form a browser sends a proxy) keeps only `/p?q`.
+    pub path: String,
+    /// The authority the request names: an absolute target's, else the Host header's. Empty
+    /// when it names neither, which leaves the caller on the host it connected to.
+    pub host: String,
+}
+
+/// Read a raw request's own account of itself, or `None` when its first line is not a request
+/// line (no method and target). Header parsing stops at the blank line, so a Host written in
+/// the body is not mistaken for the real one.
+pub fn request_facts(raw: &str) -> Option<RequestFacts> {
+    let head = raw.split("\r\n\r\n").next().and_then(|h| h.split("\n\n").next()).unwrap_or(raw);
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+    let mut first = lines.next()?.split_whitespace();
+    let method = first.next()?.to_string();
+    let target = first.next()?;
+    let host_header = lines
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("host").then(|| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    // absolute form: the target's own authority is what the request is addressed to, and it
+    // wins over a Host header that disagrees with it (RFC 9112 3.2.2)
+    let absolute = target
+        .split_once("://")
+        .filter(|(s, _)| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+        .map(|(_, rest)| rest.split_once('/').map_or((rest, "/".to_string()), |(a, p)| (a, format!("/{p}"))));
+    let (host, path) = match absolute {
+        Some((authority, path)) => (authority.to_string(), path),
+        None => (host_header, target.to_string()),
+    };
+    Some(RequestFacts { method, path, host })
+}
+
+/// An authority split into its host and port: `a.test:8080` is ("a.test", Some(8080)) and
+/// `[::1]:443` is ("[::1]", Some(443)). A port is only read after the closing bracket of an
+/// IPv6 literal, so `[::1]` keeps all of its colons.
+pub fn split_authority(authority: &str) -> (&str, Option<u16>) {
+    let after_brackets = authority.rsplit_once(']').map_or(authority, |(_, rest)| rest);
+    match after_brackets.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (&authority[..authority.len() - port.len() - 1], port.parse().ok())
+        }
+        _ => (authority, None),
+    }
+}
+
+/// `raw` with its `Content-Length` header set to the byte length of its body. A request
+/// without that header, or without a body at all, is returned unchanged: the header is
+/// corrected, never added, so a request that deliberately carries none keeps none.
+pub fn sync_content_length(raw: String) -> String {
+    let (sep, split_idx) = if let Some(idx) = raw.find("\r\n\r\n") {
+        ("\r\n\r\n", idx)
+    } else if let Some(idx) = raw.find("\n\n") {
+        ("\n\n", idx)
+    } else {
+        return raw;
+    };
+    let head = &raw[..split_idx];
+    let body = &raw[split_idx + sep.len()..];
+    let has_cl = head.lines().skip(1).any(|l| {
+        l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+    });
+    if !has_cl {
+        return raw;
+    }
+    let line_sep = if sep == "\r\n\r\n" { "\r\n" } else { "\n" };
+    let updated_head: Vec<String> = head
+        .split('\n')
+        .enumerate()
+        .map(|(i, raw_line)| {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if i > 0 {
+                if let Some((k, _)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        return format!("{}: {}", k.trim(), body.len());
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    format!("{}{sep}{body}", updated_head.join(line_sep))
+}
+
 /// Recorded traffic. Entries are shared (`Arc`): the UI takes a snapshot each frame by
 /// copying pointers, never request or response bodies.
 pub type History = Arc<Mutex<Vec<Arc<HttpEntry>>>>;
@@ -217,6 +310,73 @@ mod tests {
     use super::*;
     use crate::test_utils::{assert_table, HttpFixture};
     use std::io::Write;
+
+    /// What a request held by Intercept says about itself once the user has edited it. The
+    /// method, path and host recorded in history all come from here, so a tampered request
+    /// line or Host header has to come back out intact.
+    #[test]
+    fn a_request_describes_itself_matrix() {
+        let cases: [(&str, &str, Option<(&str, &str, &str)>); 10] = [
+            ("origin form with a Host header",
+                "GET /cart?id=2 HTTP/1.1\nHost: shop.test\nAccept: */*\n\n", Some(("GET", "/cart?id=2", "shop.test"))),
+            ("an edited method and path",
+                "DELETE /admin/users/7 HTTP/1.1\nHost: shop.test\n\n", Some(("DELETE", "/admin/users/7", "shop.test"))),
+            ("an edited Host header",
+                "GET / HTTP/1.1\nHost: internal.test:8080\n\n", Some(("GET", "/", "internal.test:8080"))),
+            ("CRLF line endings",
+                "POST /pay HTTP/1.1\r\nHost: shop.test\r\n\r\namount=1", Some(("POST", "/pay", "shop.test"))),
+            // the form a browser sends a proxy: its own authority is what the request is for
+            ("absolute form outranks the Host header",
+                "GET http://real.test/a?b=1 HTTP/1.1\nHost: stale.test\n\n", Some(("GET", "/a?b=1", "real.test"))),
+            ("absolute form with no path at all",
+                "GET https://real.test HTTP/1.1\n\n", Some(("GET", "/", "real.test"))),
+            ("no Host header leaves the host to the caller",
+                "GET /x HTTP/1.0\n\n", Some(("GET", "/x", ""))),
+            // a Host line below the blank line is body text, not a header
+            ("a Host written in the body is not a header",
+                "POST /echo HTTP/1.1\nHost: shop.test\n\nHost: body.test\n", Some(("POST", "/echo", "shop.test"))),
+            ("a first line with no target is not a request line", "GET\nHost: shop.test\n\n", None),
+            ("and neither is an empty buffer", "", None),
+        ];
+        assert_table!(cases, |idx, (what, raw, want)| {
+            let got = request_facts(raw);
+            let want = want.map(|(method, path, host)| RequestFacts {
+                method: method.into(), path: path.into(), host: host.into(),
+            });
+            assert_eq!(got, want, "case #{idx} ({what})");
+        });
+    }
+
+    #[test]
+    fn an_authority_splits_into_host_and_port_matrix() {
+        let cases: [(&str, &str, (&str, Option<u16>)); 6] = [
+            ("a bare name", "shop.test", ("shop.test", None)),
+            ("a name and a port", "shop.test:8080", ("shop.test", Some(8080))),
+            ("an IPv4 address and a port", "127.0.0.1:3000", ("127.0.0.1", Some(3000))),
+            ("an IPv6 literal keeps its colons", "[::1]", ("[::1]", None)),
+            ("an IPv6 literal with a port", "[::1]:443", ("[::1]", Some(443))),
+            ("something that is not a port is part of the host", "shop.test:api", ("shop.test:api", None)),
+        ];
+        assert_table!(cases, |idx, (what, authority, want)| {
+            assert_eq!(split_authority(authority), want, "case #{idx} ({what})");
+        });
+    }
+
+    /// An edited body leaves the recorded request's own Content-Length stale, which is what
+    /// this corrects. The header is only ever corrected, never added or removed.
+    #[test]
+    fn content_length_follows_an_edited_body_matrix() {
+        let cases: [(&str, &str, &str); 5] = [
+            ("a body edited longer", "POST /p HTTP/1.1\nContent-Length: 2\n\nhello", "POST /p HTTP/1.1\nContent-Length: 5\n\nhello"),
+            ("a body edited away", "POST /p HTTP/1.1\nContent-Length: 9\n\n", "POST /p HTTP/1.1\nContent-Length: 0\n\n"),
+            ("CRLF endings are kept", "POST /p HTTP/1.1\r\nContent-Length: 1\r\n\r\nabc", "POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"),
+            ("a request with no such header gains none", "GET /p HTTP/1.1\nHost: a\n\n", "GET /p HTTP/1.1\nHost: a\n\n"),
+            ("a request with no body at all is left alone", "GET /p HTTP/1.1\nContent-Length: 4", "GET /p HTTP/1.1\nContent-Length: 4"),
+        ];
+        assert_table!(cases, |idx, (what, raw, want)| {
+            assert_eq!(sync_content_length(raw.to_string()), want, "case #{idx} ({what})");
+        });
+    }
 
     #[test]
     fn request_response_parsing_matrix() {
