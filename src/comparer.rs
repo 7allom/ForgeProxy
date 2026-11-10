@@ -1,8 +1,15 @@
 //! Comparer: captured items and the two comparisons.
 //!
-//! Words: both items are tokenized at the word level (`diff_words`) and diffed with
-//! `similar::TextDiff` configured with `Algorithm::Patience`. Runs of changes are grouped:
-//! a deletion next to an insertion is a modification, shown on both sides.
+//! Words: a two-phase diff. Phase one aligns the items line by line (Patience over the lines).
+//! A line only item A has is a deletion, a line only item B has is an addition, and two lines
+//! are a modification only when they are the same field with a changed value: the same header
+//! name, two start lines, or body text that is mostly the same (see `pair_score`). Phase two
+//! diffs the words of each such pair, so a token only one side has keeps its own kind instead
+//! of being collapsed with whatever the other side put nearby.
+//!
+//! The result is two streams of rows of the same length: where one item has a line the other
+//! has not, the other gets a filler row, so the two sides stay level all the way down and a
+//! matching line is on the same horizontal plane in both panes.
 //!
 //! Bytes: the two buffers are compared offset by offset (shown as 16-byte hex dump rows); a
 //! byte differs when the other item has a different byte, or none, at that offset.
@@ -55,17 +62,67 @@ pub enum Change {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub change: Change,
+    /// The difference this span belongs to, indexing [`WordDiff::hunks`]; `None` for unchanged
+    /// text. The one the view is on is drawn differently from the rest.
+    pub hunk: Option<usize>,
     pub text: String,
 }
 
-/// Word comparison: each side's text as spans, the number of changed regions, and the line
-/// (0-based) each change starts on in each side, for "next/previous difference".
+/// One row of the side-by-side view: the spans of one line, or nothing at all where this side
+/// has no line and the other does, which the viewer draws as blank to keep the two level.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Row {
+    /// The line this row shows, numbered (0-based) within its own item; `None` for a filler.
+    pub line: Option<usize>,
+    pub spans: Vec<Span>,
+}
+
+impl Row {
+    /// Is this the blank that stands in for a line the other side has and this one does not?
+    pub fn is_filler(&self) -> bool {
+        self.line.is_none()
+    }
+}
+
+/// What a span shows on its row: its text without the line terminator, which would otherwise
+/// start a second row and put the two sides out of step. The terminator stays in `Span::text`
+/// so the item can still be reproduced byte for byte, and so a changed one is still reported.
+pub fn shown(span: &Span) -> &str {
+    span.text.trim_end_matches(['\r', '\n'])
+}
+
+/// A side's spans end to end with the filler rows left out: the item's own text. Runs of the
+/// same kind join across rows, as they do within one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn spans(rows: &[Row]) -> Vec<Span> {
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| !r.is_filler()) {
+        for s in &row.spans {
+            append(&mut out, s.change, s.hunk, &s.text);
+        }
+    }
+    out
+}
+
+/// One difference, in document order: what it is, the row of the side-by-side view it starts
+/// on — the same row in both panes, which is where "next/previous difference" scrolls to — and
+/// the line (0-based) it starts on within each item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hunk {
+    /// Never `Change::Same`.
+    pub kind: Change,
+    pub row: usize,
+    pub line_a: usize,
+    pub line_b: usize,
+}
+
+/// Word comparison: the two sides as rows of spans, the same number on each side, and the
+/// differences between them in order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WordDiff {
-    pub a: Vec<Span>,
-    pub b: Vec<Span>,
-    pub changes: usize,
-    pub change_lines: Vec<(usize, usize)>,
+    pub a: Vec<Row>,
+    pub b: Vec<Row>,
+    pub hunks: Vec<Hunk>,
 }
 
 /// Byte comparison: per-offset changes for each side, rows of 16, the number of differing
@@ -86,7 +143,6 @@ pub const WORD_DIFF_LIMIT_NOTE: &str = "Item exceeds 256 KB — byte diff active
 // ---- tokens ---------------------------------------------------------------------------
 
 /// Tokens whose concatenation is exactly `s`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn tokenize(s: &str) -> Vec<&str> {
     #[derive(PartialEq, Clone, Copy)]
     enum K { Word, Space, Punct }
@@ -110,73 +166,340 @@ pub fn tokenize(s: &str) -> Vec<&str> {
     out
 }
 
-// ---- word comparison (Patience Diff) -----------------------------------------------------
+// ---- word comparison (phase one: lines) --------------------------------------------------
 
-/// Compute a word-level diff using `similar::TextDiff` configured with `Algorithm::Patience`.
+/// How much two lines must share to count as one field whose value changed. Below it they have
+/// too little in common to be read as a modification: they are a deletion and an addition that
+/// happen to sit next to each other.
+const PAIR_THRESHOLD: f32 = 0.5;
+
+/// Region sizes beyond which looking at every pair of lines costs more than it is worth; past
+/// it, lines are paired where they sit, which is all a positional diff could have done anyway.
+const MAX_PAIR_SEARCH: usize = 4096;
+
+/// The lines of `s`, each keeping its terminator, so their concatenation is exactly `s`.
+fn split_lines(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, _) in s.match_indices('\n') {
+        out.push(&s[start..=i]);
+        start = i + 1;
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// What a line says, without its terminator (which may be CRLF, LF or nothing at all).
+fn content(line: &str) -> &str {
+    let s = line.strip_suffix('\n').unwrap_or(line);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
+/// What a line is, syntactically. Two lines are a modification of one another only when they
+/// are the same kind — and, for a header, the same field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKind<'a> {
+    /// A request line ("GET /a HTTP/1.1") or a status line ("HTTP/1.1 200 OK").
+    Start,
+    /// "Name: value": the name is the field, the rest is its value.
+    Header(&'a str),
+    Empty,
+    /// A body line, or any text that is none of the above.
+    Other,
+}
+
+/// The field name of "Name: value", if the line is a header. The name has to be an HTTP token
+/// (RFC 9110 §5.6.2) with nothing before the colon, so a body line such as `{"id":42}` or
+/// `  "id": 42` is not taken for one.
+fn header_name(s: &str) -> Option<&str> {
+    let name = &s[..s.find(':')?];
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    (!name.is_empty() && name.chars().all(token)).then_some(name)
+}
+
+/// Does the line read as the first line of a request or of a response?
+fn is_start_line(s: &str) -> bool {
+    if s.starts_with("HTTP/") {
+        return true;
+    }
+    match (s.split(' ').next(), s.split(' ').nth(1), s.split(' ').nth(2), s.split(' ').nth(3)) {
+        (Some(method), Some(_target), Some(version), None) => {
+            !method.is_empty() && method.chars().all(|c| c.is_ascii_uppercase()) && version.starts_with("HTTP/")
+        }
+        _ => false,
+    }
+}
+
+fn line_kind(line: &str) -> LineKind<'_> {
+    let s = content(line);
+    if s.is_empty() {
+        LineKind::Empty
+    } else if is_start_line(s) {
+        LineKind::Start
+    } else if let Some(name) = header_name(s) {
+        LineKind::Header(name)
+    } else {
+        LineKind::Other
+    }
+}
+
+/// What two lines have in common: twice the words they share over the words they have
+/// (Sørensen-Dice over the word bags). 1.0 is the same words in any order, 0.0 nothing in
+/// common. Whitespace and punctuation are left out, so `alpha beta` and `alpha gamma!` are
+/// half the same rather than two fifths — punctuation is what a word diff sorts out, once the
+/// two lines are known to belong together. Deliberately cheap: it only decides whether to pay
+/// for that word diff.
+fn similarity(a: &str, b: &str) -> f32 {
+    fn words(s: &str) -> Vec<&str> {
+        tokenize(s).into_iter().filter(|t| t.chars().any(char::is_alphanumeric)).collect()
+    }
+    let mut bag: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let wa = words(a);
+    for t in &wa {
+        *bag.entry(*t).or_default() += 1;
+    }
+    let wb = words(b);
+    let mut shared = 0usize;
+    for t in &wb {
+        if let Some(n) = bag.get_mut(*t).filter(|n| **n > 0) {
+            *n -= 1;
+            shared += 1;
+        }
+    }
+    // two lines with no words at all (`{` against `}`) have nothing to tell them apart
+    if wa.len() + wb.len() == 0 {
+        return 1.0;
+    }
+    2.0 * shared as f32 / (wa.len() + wb.len()) as f32
+}
+
+/// `Some(score)` when the two lines could be one field whose value changed, so they are worth
+/// diffing word by word; `None` when they are unrelated and each stands on its own.
+fn pair_score(a: &str, b: &str) -> Option<f32> {
+    match (line_kind(a), line_kind(b)) {
+        // the same field, whatever its value became. Two *different* fields fall through to
+        // `None`: `User-Agent: Mozilla/5.0` becoming `Content-Length: 48` is one line gone
+        // and another arrived, not one line edited.
+        (LineKind::Header(x), LineKind::Header(y)) => x.eq_ignore_ascii_case(y).then_some(1.0),
+        // a start line against a start line: method, target and version are the same fields
+        (LineKind::Start, LineKind::Start) | (LineKind::Empty, LineKind::Empty) => Some(1.0),
+        // body and plain text have no fields to match up, so go by how much is shared
+        (LineKind::Other, LineKind::Other) => {
+            let s = similarity(content(a), content(b));
+            (s >= PAIR_THRESHOLD).then_some(s)
+        }
+        // a header is neither a start line nor a body line: nothing pairs across kinds
+        _ => None,
+    }
+}
+
+/// Match up the lines of a replaced region. `out[i] = Some(j)` reads A's `i`-th line and B's
+/// `j`-th (both numbered within the region) as one field whose value changed; `None` leaves
+/// the line as a whole-line deletion. Pairs are taken best first and never cross each other,
+/// so both sides stay in order.
+fn pair_lines(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
+    if old.len().saturating_mul(new.len()) > MAX_PAIR_SEARCH {
+        return (0..old.len())
+            .map(|i| match new.get(i) {
+                Some(b) if pair_score(old[i], b).is_some() => Some(i),
+                _ => None,
+            })
+            .collect();
+    }
+    let mut best: Vec<(f32, usize, usize)> = Vec::new();
+    for (i, a) in old.iter().enumerate() {
+        for (j, b) in new.iter().enumerate() {
+            if let Some(score) = pair_score(a, b) {
+                best.push((score, i, j));
+            }
+        }
+    }
+    // the closest match first; between equally good ones (two identical header names, say) the
+    // pair that moves the line the least, then the earliest
+    best.sort_by(|x, y| {
+        y.0.total_cmp(&x.0)
+            .then_with(|| x.1.abs_diff(x.2).cmp(&y.1.abs_diff(y.2)))
+            .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
+    });
+    let mut paired: Vec<Option<usize>> = vec![None; old.len()];
+    let mut used = vec![false; new.len()];
+    for (_, i, j) in best {
+        // a pair that crossed one already made would show the two sides out of order
+        let crossing = paired.iter().enumerate().any(|(k, p)| match *p {
+            Some(l) => (k < i) != (l < j),
+            None => false,
+        });
+        if paired[i].is_none() && !used[j] && !crossing {
+            paired[i] = Some(j);
+            used[j] = true;
+        }
+    }
+    paired
+}
+
+// ---- word comparison (phase two: words within a pair) ------------------------------------
+
+/// Builds the two row streams and the list of differences as the phases walk the two items.
+/// Every method leaves the two sides with the same number of rows, which is what keeps a line
+/// and the line it was compared against on the same horizontal plane in the two panes.
+struct Build {
+    a: Vec<Row>,
+    b: Vec<Row>,
+    hunks: Vec<Hunk>,
+    line_a: usize,
+    line_b: usize,
+}
+
+/// Append `text` to `spans`, extending the last span when it is part of the same difference.
+fn append(spans: &mut Vec<Span>, change: Change, hunk: Option<usize>, text: &str) {
+    match spans.last_mut() {
+        Some(last) if last.change == change && last.hunk == hunk => last.text.push_str(text),
+        _ => spans.push(Span { change, hunk, text: text.to_string() }),
+    }
+}
+
+impl Build {
+    fn new() -> Self {
+        Build { a: Vec::new(), b: Vec::new(), hunks: Vec::new(), line_a: 0, line_b: 0 }
+    }
+
+    /// Start a difference where both sides now stand, and return its index.
+    fn open(&mut self, kind: Change) -> usize {
+        debug_assert_eq!(self.a.len(), self.b.len(), "the two sides are level between rows");
+        self.hunks.push(Hunk { kind, row: self.a.len(), line_a: self.line_a, line_b: self.line_b });
+        self.hunks.len() - 1
+    }
+
+    /// One row on each side: a line of A against the line of B it was compared with.
+    fn pair(&mut self, sa: Vec<Span>, sb: Vec<Span>) {
+        self.a.push(Row { line: Some(self.line_a), spans: sa });
+        self.b.push(Row { line: Some(self.line_b), spans: sb });
+        self.line_a += 1;
+        self.line_b += 1;
+    }
+
+    /// Lines both items have, unchanged.
+    fn same(&mut self, old: &[&str], new: &[&str]) {
+        for (ta, tb) in old.iter().zip(new) {
+            let span = |t: &str| vec![Span { change: Change::Same, hunk: None, text: t.to_string() }];
+            self.pair(span(ta), span(tb));
+        }
+    }
+
+    /// A run of lines only item A has: one difference, however many lines it covers. B gets a
+    /// filler row against each of them, so what comes after stays level.
+    fn deleted(&mut self, lines: &[&str]) {
+        if lines.is_empty() {
+            return;
+        }
+        let h = self.open(Change::Deleted);
+        for t in lines {
+            let spans = vec![Span { change: Change::Deleted, hunk: Some(h), text: (*t).to_string() }];
+            self.a.push(Row { line: Some(self.line_a), spans });
+            self.b.push(Row::default());
+            self.line_a += 1;
+        }
+    }
+
+    /// A run of lines only item B has, against filler rows in A.
+    fn inserted(&mut self, lines: &[&str]) {
+        if lines.is_empty() {
+            return;
+        }
+        let h = self.open(Change::Inserted);
+        for t in lines {
+            let spans = vec![Span { change: Change::Inserted, hunk: Some(h), text: (*t).to_string() }];
+            self.b.push(Row { line: Some(self.line_b), spans });
+            self.a.push(Row::default());
+            self.line_b += 1;
+        }
+    }
+
+    /// Phase two: one line against the line phase one paired it with, token by token. Each run
+    /// of changed tokens is its own difference and keeps its own kind, so a token only A has
+    /// stays a deletion even though the line around it was modified.
+    fn modified(&mut self, ta: &str, tb: &str) {
+        let diff = similar::TextDiff::configure().algorithm(similar::Algorithm::Patience).diff_words(ta, tb);
+        let (old, new) = (diff.old_slices(), diff.new_slices());
+        // one row each, however many token runs changed inside it
+        let (mut sa, mut sb) = (Vec::new(), Vec::new());
+        for op in diff.ops() {
+            match *op {
+                similar::DiffOp::Equal { old_index, new_index, len } => {
+                    for k in 0..len {
+                        append(&mut sa, Change::Same, None, old[old_index + k]);
+                        append(&mut sb, Change::Same, None, new[new_index + k]);
+                    }
+                }
+                similar::DiffOp::Delete { old_index, old_len, .. } => {
+                    let h = self.open(Change::Deleted);
+                    for &t in &old[old_index..old_index + old_len] {
+                        append(&mut sa, Change::Deleted, Some(h), t);
+                    }
+                }
+                similar::DiffOp::Insert { new_index, new_len, .. } => {
+                    let h = self.open(Change::Inserted);
+                    for &t in &new[new_index..new_index + new_len] {
+                        append(&mut sb, Change::Inserted, Some(h), t);
+                    }
+                }
+                similar::DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                    let h = self.open(Change::Modified);
+                    for &t in &old[old_index..old_index + old_len] {
+                        append(&mut sa, Change::Modified, Some(h), t);
+                    }
+                    for &t in &new[new_index..new_index + new_len] {
+                        append(&mut sb, Change::Modified, Some(h), t);
+                    }
+                }
+            }
+        }
+        self.pair(sa, sb);
+    }
+
+    /// A region the line diff replaced wholesale: diff the lines that belong together, and
+    /// keep the rest apart as the deletions and additions they are.
+    fn replaced(&mut self, old: &[&str], new: &[&str]) {
+        let paired = pair_lines(old, new);
+        // the first A line of the run that has no counterpart, and how far B has been emitted
+        let (mut orphans, mut j) = (0usize, 0usize);
+        for (i, p) in paired.iter().enumerate() {
+            let Some(k) = *p else { continue };
+            self.deleted(&old[orphans..i]);
+            orphans = i + 1;
+            self.inserted(&new[j..k]);
+            j = k + 1;
+            self.modified(old[i], new[k]);
+        }
+        self.deleted(&old[orphans..]);
+        self.inserted(&new[j..]);
+    }
+}
+
+/// Compare two items word by word: Patience over the lines first, then over the words of each
+/// line pair phase one read as the same field with a changed value.
 /// Returns `Err(WORD_DIFF_LIMIT_NOTE)` when either input exceeds [`MAX_WORD_DIFF_SIZE`] (256 KB).
 pub fn compute_patience_word_diff(a: &str, b: &str) -> Result<WordDiff, String> {
     if a.len() > MAX_WORD_DIFF_SIZE || b.len() > MAX_WORD_DIFF_SIZE {
         return Err(WORD_DIFF_LIMIT_NOTE.into());
     }
-    let diff = similar::TextDiff::configure()
-        .algorithm(similar::Algorithm::Patience)
-        .diff_words(a, b);
-    let old_slices = diff.old_slices();
-    let new_slices = diff.new_slices();
-    let mut out = WordDiff {
-        a: Vec::new(),
-        b: Vec::new(),
-        changes: 0,
-        change_lines: Vec::new(),
-    };
-    let push = |spans: &mut Vec<Span>, change: Change, text: &str| match spans.last_mut() {
-        Some(last) if last.change == change => last.text.push_str(text),
-        _ => spans.push(Span { change, text: text.to_string() }),
-    };
-    let (mut line_a, mut line_b) = (0usize, 0usize);
-    for op in diff.ops() {
-        match *op {
+    let (la, lb) = (split_lines(a), split_lines(b));
+    let mut out = Build::new();
+    for op in similar::capture_diff_slices(similar::Algorithm::Patience, &la, &lb) {
+        match op {
             similar::DiffOp::Equal { old_index, new_index, len } => {
-                for k in 0..len {
-                    let ta = old_slices[old_index + k];
-                    let tb = new_slices[new_index + k];
-                    push(&mut out.a, Change::Same, ta);
-                    push(&mut out.b, Change::Same, tb);
-                    line_a += ta.matches('\n').count();
-                    line_b += tb.matches('\n').count();
-                }
+                out.same(&la[old_index..old_index + len], &lb[new_index..new_index + len]);
             }
-            similar::DiffOp::Delete { old_index, old_len, .. } => {
-                out.changes += 1;
-                out.change_lines.push((line_a, line_b));
-                for &t in &old_slices[old_index..old_index + old_len] {
-                    push(&mut out.a, Change::Deleted, t);
-                    line_a += t.matches('\n').count();
-                }
-            }
-            similar::DiffOp::Insert { new_index, new_len, .. } => {
-                out.changes += 1;
-                out.change_lines.push((line_a, line_b));
-                for &t in &new_slices[new_index..new_index + new_len] {
-                    push(&mut out.b, Change::Inserted, t);
-                    line_b += t.matches('\n').count();
-                }
-            }
+            similar::DiffOp::Delete { old_index, old_len, .. } => out.deleted(&la[old_index..old_index + old_len]),
+            similar::DiffOp::Insert { new_index, new_len, .. } => out.inserted(&lb[new_index..new_index + new_len]),
             similar::DiffOp::Replace { old_index, old_len, new_index, new_len } => {
-                out.changes += 1;
-                out.change_lines.push((line_a, line_b));
-                for &t in &old_slices[old_index..old_index + old_len] {
-                    push(&mut out.a, Change::Modified, t);
-                    line_a += t.matches('\n').count();
-                }
-                for &t in &new_slices[new_index..new_index + new_len] {
-                    push(&mut out.b, Change::Modified, t);
-                    line_b += t.matches('\n').count();
-                }
+                out.replaced(&la[old_index..old_index + old_len], &lb[new_index..new_index + new_len]);
             }
         }
     }
-    Ok(out)
+    Ok(WordDiff { a: out.a, b: out.b, hunks: out.hunks })
 }
 
 /// None when either item exceeds `MAX_WORD_DIFF_SIZE` (256 KB).
@@ -257,8 +580,9 @@ pub struct DiffView {
     /// The word comparison still running, if any.
     pub words_job: Option<WordJob>,
     pub bytes: Option<ByteDiff>,
-    /// Difference the view last jumped to.
-    pub current: Option<usize>,
+    /// The difference the view is on: the one "next/previous" last moved to, drawn
+    /// differently from the rest. Indexes `jump_targets`.
+    pub active_diff_index: Option<usize>,
     /// Note shown when word diff falls back to byte diff because an item exceeds 256 KB.
     pub fallback_note: Option<String>,
 }
@@ -272,7 +596,7 @@ impl DiffView {
             words: None,
             words_job: None,
             bytes: None,
-            current: None,
+            active_diff_index: None,
             fallback_note: None,
         };
         v.set_mode(mode);
@@ -281,7 +605,7 @@ impl DiffView {
 
     pub fn set_mode(&mut self, mode: DiffMode) {
         self.mode = mode;
-        self.current = None;
+        self.active_diff_index = None;
         match mode {
             DiffMode::Words => {
                 if self.a.data.len() > MAX_WORD_DIFF_SIZE || self.b.data.len() > MAX_WORD_DIFF_SIZE {
@@ -334,17 +658,23 @@ impl DiffView {
     /// Differences in the current mode (changed regions for words, offsets for bytes).
     pub fn difference_count(&self) -> usize {
         match self.mode {
-            DiffMode::Words => self.words.as_ref().and_then(|w| w.as_ref().ok()).map_or(0, |w| w.changes),
+            DiffMode::Words => self.word_diff().map_or(0, |w| w.hunks.len()),
             DiffMode::Bytes => self.bytes.as_ref().map_or(0, |b| b.differing),
         }
     }
 
-    /// Places "next/previous difference" can jump to: (row in A, row in B). Lines for
-    /// words, 16-byte rows for bytes.
-    pub fn jump_targets(&self) -> Vec<(usize, usize)> {
+    /// The word comparison, once it has landed and if it ran at all.
+    pub fn word_diff(&self) -> Option<&WordDiff> {
+        self.words.as_ref().and_then(|w| w.as_ref().ok())
+    }
+
+    /// Rows "next/previous difference" can jump to. Both panes show the same row of a word
+    /// comparison, because the two sides are padded to the same length; for bytes they are
+    /// 16-byte rows, which line up for the same reason.
+    pub fn jump_targets(&self) -> Vec<usize> {
         match self.mode {
-            DiffMode::Words => self.words.as_ref().and_then(|w| w.as_ref().ok()).map_or(Vec::new(), |w| w.change_lines.clone()),
-            DiffMode::Bytes => self.bytes.as_ref().map_or(Vec::new(), |b| b.diff_rows.iter().map(|&r| (r, r)).collect()),
+            DiffMode::Words => self.word_diff().map_or(Vec::new(), |w| w.hunks.iter().map(|h| h.row).collect()),
+            DiffMode::Bytes => self.bytes.as_ref().map_or(Vec::new(), |b| b.diff_rows.clone()),
         }
     }
 }
@@ -520,14 +850,15 @@ mod tests {
             let a = std::str::from_utf8(case.left).unwrap();
             let b = std::str::from_utf8(case.right).unwrap();
             let d = diff_words(a, b).unwrap();
-            assert_eq!(d.changes, case.expected_changes, "case #{idx} ({}) changes", case.name);
-            let got_left: Vec<(Change, &str)> = d.a.iter().map(|s| (s.change, s.text.as_str())).collect();
-            let got_right: Vec<(Change, &str)> = d.b.iter().map(|s| (s.change, s.text.as_str())).collect();
+            assert_eq!(d.hunks.len(), case.expected_changes, "case #{idx} ({}) changes", case.name);
+            let (flat_a, flat_b) = (spans(&d.a), spans(&d.b));
+            let got_left: Vec<(Change, &str)> = flat_a.iter().map(|s| (s.change, s.text.as_str())).collect();
+            let got_right: Vec<(Change, &str)> = flat_b.iter().map(|s| (s.change, s.text.as_str())).collect();
             assert_eq!(got_left, case.expected_left_ops, "case #{idx} ({}) left ops", case.name);
             assert_eq!(got_right, case.expected_right_ops, "case #{idx} ({}) right ops", case.name);
-            assert_eq!(d.change_lines.len(), case.expected_jump_rows.len(), "case #{idx} ({}) jump len", case.name);
+            assert_eq!(d.hunks.len(), case.expected_jump_rows.len(), "case #{idx} ({}) jump len", case.name);
             if !case.expected_jump_rows.is_empty() {
-                assert_eq!(d.change_lines[0], case.expected_jump_rows[0], "case #{idx} ({}) first jump row", case.name);
+                assert_eq!((d.hunks[0].line_a, d.hunks[0].line_b), case.expected_jump_rows[0], "case #{idx} ({}) first jump row", case.name);
             }
         });
 
@@ -602,11 +933,10 @@ mod tests {
 
         assert_table!(edge_cases, |idx, (name, left, right, expected_changes)| {
             let d = compute_patience_word_diff(left, right).unwrap();
-            let text_a: String = d.a.iter().map(|s| s.text.as_str()).collect();
-            let text_b: String = d.b.iter().map(|s| s.text.as_str()).collect();
+            let (text_a, text_b) = (rebuilt(&d.a), rebuilt(&d.b));
             assert_eq!(text_a, left, "case #{idx} ({name}) left reconstruction");
             assert_eq!(text_b, right, "case #{idx} ({name}) right reconstruction");
-            assert_eq!(d.changes, expected_changes, "case #{idx} ({name}) change count");
+            assert_eq!(d.hunks.len(), expected_changes, "case #{idx} ({name}) change count");
         });
 
         // Tokenize & ComparerItem classification table
@@ -658,8 +988,7 @@ mod tests {
         assert_table!(samples, |idx, (name, left, right)| {
             let d = compute_patience_word_diff(left, right).unwrap();
             // 1. Span stream on each side reproduces its respective buffer verbatim
-            let rebuilt_left: String = d.a.iter().map(|s| s.text.as_str()).collect();
-            let rebuilt_right: String = d.b.iter().map(|s| s.text.as_str()).collect();
+            let (rebuilt_left, rebuilt_right) = (rebuilt(&d.a), rebuilt(&d.b));
             assert_eq!(rebuilt_left, left, "case #{idx} ({name}) rebuilt left");
             assert_eq!(rebuilt_right, right, "case #{idx} ({name}) rebuilt right");
 
@@ -743,7 +1072,7 @@ mod tests {
 
         assert_table!(threshold_cases, |idx, (name, a, b, expected_word_changes, expected_mode, expected_note)| {
             assert_eq!(
-                diff_words(a, b).map(|d| d.changes),
+                diff_words(a, b).map(|d| d.hunks.len()),
                 expected_word_changes,
                 "case #{idx} ({name}) diff_words"
             );
@@ -769,7 +1098,7 @@ mod tests {
         assert!(v.bytes.is_none(), "bytes computed only when shown");
         v.set_mode(DiffMode::Bytes);
         assert_eq!(v.difference_count(), 6);
-        assert_eq!(v.jump_targets(), [(0, 0)]);
+        assert_eq!(v.jump_targets(), [0]);
         v.set_mode(DiffMode::Words);
         assert!(!v.poll(), "already computed: not started again");
         assert_eq!(v.difference_count(), 1);
@@ -791,6 +1120,222 @@ mod tests {
         assert!(v.difference_count() >= 1);
     }
 
+    struct ClassCase<'a> {
+        name: &'a str,
+        a: &'a str,
+        b: &'a str,
+        /// Every difference, in document order.
+        kinds: Vec<Change>,
+        /// The text highlighted red in A, green in B, and amber on each side.
+        deleted: Vec<&'a str>,
+        added: Vec<&'a str>,
+        modified_a: Vec<&'a str>,
+        modified_b: Vec<&'a str>,
+    }
+
+    /// The text of every span on one side belonging to a difference of this kind.
+    fn marked(rows: &[Row], kind: Change) -> Vec<&str> {
+        spans_of(rows).filter(|s| s.change == kind).map(|s| s.text.as_str()).collect()
+    }
+
+    /// Every span of a side, filler rows and all (they have none), in order.
+    fn spans_of(rows: &[Row]) -> impl Iterator<Item = &Span> {
+        rows.iter().flat_map(|r| r.spans.iter())
+    }
+
+    /// The text of one side end to end: filler rows add nothing, so this is the item itself.
+    fn rebuilt(rows: &[Row]) -> String {
+        spans_of(rows).map(|s| s.text.as_str()).collect()
+    }
+
+    /// A line only A has stays red and a line only B has stays green, however close together
+    /// they fall. Amber is for one field whose value changed and nothing else: before the diff
+    /// worked line by line, `User-Agent: Mozilla/5.0` and `Content-Length: 48` on the same line
+    /// of their items were paired into one amber block, as if the one had become the other.
+    #[test]
+    fn line_classification_matrix() {
+        let cases = [
+            ClassCase {
+                name: "pure deletion: a header only A has",
+                a: "Host: shop.test\nUser-Agent: Mozilla/5.0\nAccept: */*\n",
+                b: "Host: shop.test\nAccept: */*\n",
+                kinds: vec![Change::Deleted],
+                deleted: vec!["User-Agent: Mozilla/5.0\n"],
+                added: vec![],
+                modified_a: vec![],
+                modified_b: vec![],
+            },
+            ClassCase {
+                name: "pure addition: the header and body only B has",
+                a: "HTTP/1.1 200 OK\nContent-Type: application/json\n",
+                b: "HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: 2\n\n{}",
+                kinds: vec![Change::Inserted],
+                deleted: vec![],
+                // one difference, but three rows of it: the view draws a row at a time
+                added: vec!["Content-Length: 2\n", "\n", "{}"],
+                modified_a: vec![],
+                modified_b: vec![],
+            },
+            ClassCase {
+                name: "semantic modification: the same header with a changed value",
+                a: "X-Request-Id: 1\nContent-Length: 48\n",
+                b: "X-Request-Id: 1\nContent-Length: 96\n",
+                kinds: vec![Change::Modified],
+                deleted: vec![],
+                added: vec![],
+                modified_a: vec!["48"],
+                modified_b: vec!["96"],
+            },
+            ClassCase {
+                name: "semantic modification: the method and target of a start line",
+                a: "GET /users/42 HTTP/1.1\n",
+                b: "POST /orders HTTP/1.1\n",
+                kinds: vec![Change::Modified, Change::Modified],
+                deleted: vec![],
+                added: vec![],
+                modified_a: vec!["GET", "/users/42"],
+                modified_b: vec!["POST", "/orders"],
+            },
+            ClassCase {
+                name: "no ghost pairing: unrelated headers on the same line of each item",
+                a: "Host: shop.test\nUser-Agent: Mozilla/5.0\n\n",
+                b: "Host: shop.test\nContent-Length: 48\n\n",
+                kinds: vec![Change::Deleted, Change::Inserted],
+                deleted: vec!["User-Agent: Mozilla/5.0\n"],
+                added: vec!["Content-Length: 48\n"],
+                modified_a: vec![],
+                modified_b: vec![],
+            },
+            ClassCase {
+                name: "a whole request: start line amber, User-Agent red, length and body green",
+                a: "GET /users/42 HTTP/1.1\r\nHost: shop.test\r\nUser-Agent: Mozilla/5.0\r\n\r\n",
+                b: "POST /orders HTTP/1.1\r\nHost: shop.test\r\nContent-Length: 48\r\n\r\n{\"sku\":\"A-1\",\"qty\":2}",
+                kinds: vec![Change::Modified, Change::Modified, Change::Deleted, Change::Inserted, Change::Inserted],
+                deleted: vec!["User-Agent: Mozilla/5.0\r\n"],
+                added: vec!["Content-Length: 48\r\n", "{\"sku\":\"A-1\",\"qty\":2}"],
+                modified_a: vec!["GET", "/users/42"],
+                modified_b: vec!["POST", "/orders"],
+            },
+            ClassCase {
+                name: "a body line mostly the same is modified, not swapped out",
+                a: "{\n  \"role\": \"viewer\",\n  \"active\": true\n}\n",
+                b: "{\n  \"role\": \"admin\",\n  \"active\": true\n}\n",
+                kinds: vec![Change::Modified],
+                deleted: vec![],
+                added: vec![],
+                modified_a: vec!["\"viewer\","],
+                modified_b: vec!["\"admin\","],
+            },
+            ClassCase {
+                name: "a body line sharing no words is a deletion and an addition",
+                a: "{\n  \"role\": \"viewer\"\n}\n",
+                b: "{\n  \"totals\": [1, 2]\n}\n",
+                kinds: vec![Change::Deleted, Change::Inserted],
+                deleted: vec!["  \"role\": \"viewer\"\n"],
+                added: vec!["  \"totals\": [1, 2]\n"],
+                modified_a: vec![],
+                modified_b: vec![],
+            },
+        ];
+
+        assert_table!(cases, |idx, case| {
+            let d = compute_patience_word_diff(case.a, case.b).unwrap();
+            let kinds: Vec<Change> = d.hunks.iter().map(|h| h.kind).collect();
+            assert_eq!(kinds, case.kinds, "case #{idx} ({}) kinds", case.name);
+            assert_eq!(marked(&d.a, Change::Deleted), case.deleted, "case #{idx} ({}) red in A", case.name);
+            assert_eq!(marked(&d.b, Change::Inserted), case.added, "case #{idx} ({}) green in B", case.name);
+            assert_eq!(marked(&d.a, Change::Modified), case.modified_a, "case #{idx} ({}) amber in A", case.name);
+            assert_eq!(marked(&d.b, Change::Modified), case.modified_b, "case #{idx} ({}) amber in B", case.name);
+            // a deletion only ever shows in A and an addition only in B
+            assert!(marked(&d.b, Change::Deleted).is_empty(), "case #{idx} ({}) nothing deleted in B", case.name);
+            assert!(marked(&d.a, Change::Inserted).is_empty(), "case #{idx} ({}) nothing added in A", case.name);
+            // whatever the classification, each side still reproduces its item exactly
+            assert_eq!(rebuilt(&d.a), case.a, "case #{idx} ({}) A rebuilt", case.name);
+            assert_eq!(rebuilt(&d.b), case.b, "case #{idx} ({}) B rebuilt", case.name);
+            // every difference is marked on the side(s) it belongs to, so the window can pick
+            // the active one out of the spans of its own colour
+            for (h, hunk) in d.hunks.iter().enumerate() {
+                if hunk.kind != Change::Inserted {
+                    assert!(spans_of(&d.a).any(|s| s.hunk == Some(h)), "case #{idx} ({}) difference {h} marked in A", case.name);
+                }
+                if hunk.kind != Change::Deleted {
+                    assert!(spans_of(&d.b).any(|s| s.hunk == Some(h)), "case #{idx} ({}) difference {h} marked in B", case.name);
+                }
+            }
+        });
+    }
+
+    /// The two sides are drawn row against row, so they have to come out the same length, a
+    /// line must never face one it was not compared with, and the padding must leave what each
+    /// item says untouched.
+    #[test]
+    fn aligned_rows_pair_up_and_rebuild_both_items() {
+        let cases: [(&str, &str, &str); 8] = [
+            ("identical items", "a\nb\n", "a\nb\n"),
+            ("a multi-line insertion in the middle", "a\nd\n", "a\nb1\nb2\nb3\nd\n"),
+            ("a multi-line deletion in the middle", "a\nb1\nb2\nb3\nd\n", "a\nd\n"),
+            ("an insertion at the end", "a\n", "a\nb\nc\n"),
+            ("a deletion at the start", "x\ny\na\n", "a\n"),
+            ("both items empty", "", ""),
+            ("one item empty", "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", ""),
+            (
+                "a request gaining a body",
+                "GET /users/42 HTTP/1.1\r\nHost: shop.test\r\nUser-Agent: Mozilla/5.0\r\n\r\n",
+                "POST /orders HTTP/1.1\r\nHost: shop.test\r\nContent-Length: 48\r\n\r\n{\"sku\":\"A-1\"}",
+            ),
+        ];
+
+        assert_table!(cases, |idx, (name, a, b)| {
+            let d = compute_patience_word_diff(a, b).unwrap();
+            assert_eq!(d.a.len(), d.b.len(), "case #{idx} ({name}) the two sides are the same length");
+            // each item's lines are all there, once each and in order, padding aside
+            let own = |rows: &[Row]| rows.iter().filter_map(|r| r.line).collect::<Vec<_>>();
+            assert_eq!(own(&d.a), (0..split_lines(a).len()).collect::<Vec<_>>(), "case #{idx} ({name}) A's lines");
+            assert_eq!(own(&d.b), (0..split_lines(b).len()).collect::<Vec<_>>(), "case #{idx} ({name}) B's lines");
+            // and the padding has not changed a byte of either item
+            assert_eq!(rebuilt(&d.a), a, "case #{idx} ({name}) A rebuilt");
+            assert_eq!(rebuilt(&d.b), b, "case #{idx} ({name}) B rebuilt");
+            assert_table!(d.a.iter().zip(&d.b).enumerate().collect::<Vec<_>>(), |(row, (ra, rb))| {
+                assert!(!(ra.is_filler() && rb.is_filler()), "case #{idx} ({name}) row {row} is padding on both sides");
+                // nothing drawn carries a line terminator: one row of the model is one row on
+                // screen, which is what holds the two panes level
+                for s in ra.spans.iter().chain(&rb.spans) {
+                    assert!(!shown(s).contains(['\r', '\n']), "case #{idx} ({name}) row {row} draws a terminator");
+                }
+            });
+            assert_table!(&d.hunks, |h, hunk| {
+                assert!(hunk.row < d.a.len().max(1), "case #{idx} ({name}) difference {h} is on row {} of {}", hunk.row, d.a.len());
+            });
+        });
+    }
+
+    /// "Next" and "Previous" step through `jump_targets`, so there is one per difference, in
+    /// order, on a line that exists in the side it belongs to.
+    #[test]
+    fn navigation_targets_follow_the_differences() {
+        let a = "GET /users/42 HTTP/1.1\r\nHost: shop.test\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
+        let b = "POST /orders HTTP/1.1\r\nHost: shop.test\r\nContent-Length: 48\r\n\r\n{\"sku\":\"A-1\",\"qty\":2}";
+        let mut v = DiffView::new(ComparerItem::from_text(1, "A", a), ComparerItem::from_text(2, "B", b), DiffMode::Words);
+        wait(&mut v);
+        assert!(v.active_diff_index.is_none(), "the view starts on no difference in particular");
+        let targets = v.jump_targets();
+        assert_eq!(targets.len(), v.difference_count(), "one place to jump to per difference");
+        // both panes show the same rows, so one row number scrolls both: the start line is
+        // row 0, the deleted User-Agent row 2, the added Content-Length row 3 (against A's
+        // filler), and the added body row 5
+        assert_eq!(targets, [0, 0, 2, 3, 5]);
+        let rows = v.word_diff().unwrap().a.len();
+        assert_table!(targets, |idx, row| {
+            assert!(row < rows, "target #{idx} (row {row}) is one of the {rows} rows on show");
+        });
+        // changing mode drops the difference the view was on: the places to jump to are rows
+        // of the hex dump now, not lines
+        v.active_diff_index = Some(3);
+        v.set_mode(DiffMode::Bytes);
+        assert!(v.active_diff_index.is_none(), "the active difference does not survive the mode switch");
+        assert_eq!(v.jump_targets().len(), v.bytes.as_ref().unwrap().diff_rows.len());
+    }
+
     fn wait(v: &mut DiffView) {
         for _ in 0..500 {
             if !v.poll() {
@@ -801,3 +1346,4 @@ mod tests {
         panic!("word comparison never finished");
     }
 }
+

@@ -1,7 +1,7 @@
 //! Comparer tab: pick Item 1 and Item 2 from the captured items, then compare them by words
 //! or bytes in a side-by-side window whose two panes scroll together.
 
-use crate::comparer::{self, Change, DiffMode, Span, BYTES_PER_ROW};
+use crate::comparer::{self, Change, DiffMode, Row, BYTES_PER_ROW};
 use crate::state::App;
 use crate::theme::{self, bold, Look, Palette};
 use crate::ui_core::c;
@@ -111,6 +111,28 @@ fn item_list(app: &mut App, ui: &mut Ui, p: &Palette, second: bool, h: f32) {
     });
 }
 
+/// One fixed height for every row the window draws. The panes use the Monospace text style,
+/// so measuring that style measures the font actually on screen; it is then rounded to whole
+/// pixels because that is what the text layout does to each row, and scrolling by the
+/// unrounded height would drift a fraction of a pixel a row and miss by whole lines far down.
+fn row_height(ui: &Ui) -> f32 {
+    use egui::emath::GuiRounding as _;
+    ui.text_style_height(&egui::TextStyle::Monospace).round_to_pixels(ui.pixels_per_point())
+}
+
+/// The height of the "Item A" / "Item B" bar above each pane. Both are allocated exactly this
+/// tall, so the two panes' boxes start at the same y and their rows stay on the same planes.
+const PANE_TITLE_H: f32 = 22.0;
+
+/// What both panes draw with: the font, its row height, and the three highlight colours.
+struct PaneStyle<'a> {
+    font: &'a FontId,
+    /// One fixed height for every row drawn, filler rows included.
+    row_h: f32,
+    colors: [Color32; 3],
+    on_color: Color32,
+}
+
 /// The comparison window: summary bar, mode switch, difference navigation and the two panes.
 pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let theme = app.eff().theme;
@@ -128,10 +150,16 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
         .default_size([1100.0, 620.0])
         .min_size([600.0, 300.0])
         .show(ctx, |ui| {
-            let font = FontId::monospace(12.5);
-            let row_h = ui.fonts(|f| f.row_height(&font));
+            // one row height for the whole window: every row -- content, modified or filler,
+            // text or line number, in either pane -- is exactly this tall
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let row_h = row_height(ui);
+            let st = PaneStyle { font: &font, row_h, colors, on_color };
             let offset_id = egui::Id::new("comparer_scroll_y");
             let mut jump_to: Option<f32> = None;
+            // the line to put in the middle of both panes, resolved to an offset below, once
+            // the height left for them is known
+            let mut centre_on: Option<f32> = None;
             // summary bar
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("A:").color(p.disabled));
@@ -148,12 +176,9 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                     }
                 }
                 ui.add_space(12.0);
-                let n = view.difference_count();
-                let unit = match view.mode { DiffMode::Words if n == 1 => "difference", DiffMode::Words => "differences",
-                                             DiffMode::Bytes if n == 1 => "differing byte", DiffMode::Bytes => "differing bytes" };
-                ui.label(bold(format!("{n} {unit}"), 13.0).color(if n == 0 { p.st_done } else { p.strong }));
                 let targets = view.jump_targets();
-                ui.add_space(8.0);
+                let any = !targets.is_empty();
+                // the differences are a ring: Next from the last one comes back to the first
                 let step = |cur: Option<usize>, fwd: bool| -> usize {
                     match (cur, fwd) {
                         (None, true) => 0,
@@ -162,26 +187,42 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                         (Some(i), false) => (i + targets.len() - 1) % targets.len(),
                     }
                 };
-                let any = !targets.is_empty();
-                if theme::plain_button(ui, p, "Previous", any).clicked() { view.current = Some(step(view.current, false)); }
-                if theme::plain_button(ui, p, "Next", any).clicked() { view.current = Some(step(view.current, true)); }
-                if let Some(i) = view.current.filter(|&i| i < targets.len()) {
-                    ui.label(RichText::new(format!("{} of {}", i + 1, targets.len())).color(p.text));
+                let mut moved = None;
+                if theme::plain_button(ui, p, "Previous", any).on_hover_text("Go to the previous difference (wraps round)").clicked() {
+                    moved = Some(step(view.active_diff_index, false));
                 }
+                if theme::plain_button(ui, p, "Next", any).on_hover_text("Go to the next difference (wraps round)").clicked() {
+                    moved = Some(step(view.active_diff_index, true));
+                }
+                if let Some(i) = moved {
+                    view.active_diff_index = Some(i);
+                }
+                let active = view.active_diff_index.filter(|&i| i < targets.len());
+                // a button press scrolls even when it lands on the difference the view was
+                // already on (one difference, pressed twice), and so does the active one being
+                // set from elsewhere, which is what `jumped` catches
+                let jumped_id = egui::Id::new("comparer_jumped");
+                let key = active.map(|i| (view.mode == DiffMode::Bytes, i));
+                let settled = ui.ctx().data(|d| d.get_temp::<Option<(bool, usize)>>(jumped_id)).flatten();
+                if moved.is_some() || key != settled {
+                    // the lower of the two rows: a difference at the end of one item sits one
+                    // line past it, and that row is in view on both sides
+                    centre_on = active.map(|i| targets[i] as f32);
+                    ui.ctx().data_mut(|d| d.insert_temp(jumped_id, key));
+                }
+                let n = view.difference_count();
+                ui.add_space(8.0);
+                // which difference the view is on, or how many there are when it is on none
+                let counter = match (active, view.mode) {
+                    (Some(i), DiffMode::Words) => format!("Difference {} of {}", i + 1, targets.len()),
+                    (Some(i), DiffMode::Bytes) => format!("Row {} of {} with differences", i + 1, targets.len()),
+                    (None, DiffMode::Words) => format!("{n} difference{}", if n == 1 { "" } else { "s" }),
+                    (None, DiffMode::Bytes) => format!("{n} differing byte{}", if n == 1 { "" } else { "s" }),
+                };
+                ui.label(bold(counter, 13.0).color(if n == 0 { p.st_done } else { p.strong }));
                 if let Some(note) = &view.fallback_note {
                     ui.add_space(8.0);
                     ui.label(RichText::new(note).size(12.0).color(p.medium));
-                }
-                // scroll once per jump, to a few rows above the difference (whichever side
-                // has it higher up, so it's in view on both)
-                let jumped_id = egui::Id::new("comparer_jumped");
-                let key = view.current.map(|i| (view.mode == DiffMode::Bytes, i));
-                if key != ui.ctx().data(|d| d.get_temp::<Option<(bool, usize)>>(jumped_id)).flatten() {
-                    if let Some((_, i)) = key.filter(|k| k.1 < targets.len()) {
-                        let row = targets[i].0.min(targets[i].1);
-                        jump_to = Some(((row as f32 - 3.0) * row_h).max(0.0));
-                    }
-                    ui.ctx().data_mut(|d| d.insert_temp(jumped_id, key));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (name, col) in [("Modified", colors[2]), ("Deleted (A only)", colors[1]), ("Added (B only)", colors[0])] {
@@ -193,14 +234,26 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
             // the two panes share one vertical offset; whichever the user scrolled wins
             let mut shared: f32 = ui.data(|d| d.get_temp(offset_id)).unwrap_or(0.0);
             if let Some(y) = jump_to { shared = y; }
+            // put the active difference in the middle of the panes rather than barely in view.
+            // Their height is what is left here, less the "Item A" label above each of them.
+            if let Some(row) = centre_on {
+                let pane_h = (ui.available_height() - PANE_TITLE_H).max(0.0);
+                shared = ((row + 0.5) * row_h - pane_h * 0.5).max(0.0);
+            }
             let mut offsets = [shared, shared];
+            let targets = view.jump_targets();
+            let active = view.active_diff_index.filter(|&i| i < targets.len());
             match view.mode {
                 DiffMode::Words => match view.words.as_ref() {
                     Some(Ok(w)) => {
+                        // the two sides are padded to the same length, so one row number is
+                        // the active difference's place in both panes
+                        let mark = active.map(|i| targets[i]);
                         let (a, b) = (&w.a, &w.b);
+                        debug_assert_eq!(a.len(), b.len(), "the panes show the same number of rows");
                         ui.columns(2, |cols| {
-                            offsets[0] = word_pane(&mut cols[0], p, "cmp_pane_a", "Item A", a, shared, &font, colors, on_color);
-                            offsets[1] = word_pane(&mut cols[1], p, "cmp_pane_b", "Item B", b, shared, &font, colors, on_color);
+                            offsets[0] = word_pane(&mut cols[0], p, "cmp_pane_a", "Item A", a, &st, active, mark, shared);
+                            offsets[1] = word_pane(&mut cols[1], p, "cmp_pane_b", "Item B", b, &st, active, mark, shared);
                         });
                     }
                     Some(Err(msg)) => {
@@ -218,9 +271,10 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 },
                 DiffMode::Bytes => if let Some(bd) = view.bytes.as_ref() {
                     let rows = view.a.length.max(view.b.length).div_ceil(BYTES_PER_ROW).max(1);
+                    let mark = active.map(|i| targets[i]);
                     ui.columns(2, |cols| {
-                        offsets[0] = byte_pane(&mut cols[0], p, "cmp_bytes_a", "Item A", &view.a.data, &bd.a, rows, shared, &font, row_h, colors, on_color);
-                        offsets[1] = byte_pane(&mut cols[1], p, "cmp_bytes_b", "Item B", &view.b.data, &bd.b, rows, shared, &font, row_h, colors, on_color);
+                        offsets[0] = byte_pane(&mut cols[0], p, "cmp_bytes_a", "Item A", &view.a.data, &bd.a, rows, mark, &st, shared);
+                        offsets[1] = byte_pane(&mut cols[1], p, "cmp_bytes_b", "Item B", &view.b.data, &bd.b, rows, mark, &st, shared);
                     });
                 },
             }
@@ -236,67 +290,137 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     }
 }
 
-/// Line numbers and the highlighted text of one side; returns its scroll offset.
+/// Line numbers and the highlighted text of one side: one row of the pane per entry of `rows`,
+/// a filler row drawing blank so the line facing it in the other pane sits on the same plane.
+/// `active` is the difference the view is on, underlined, and `mark` the row it starts on,
+/// called out in the gutter of both panes. Returns the pane's scroll offset.
 #[allow(clippy::too_many_arguments)]
-fn word_pane(ui: &mut Ui, p: &Palette, id: &str, title: &str, spans: &[Span], offset: f32, font: &FontId, colors: [Color32; 3], on_color: Color32) -> f32 {
-    ui.label(bold(title, 12.5).color(p.strong));
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = f32::INFINITY;
-    for s in spans {
-        let changed = s.change != Change::Same;
-        job.append(&s.text, 0.0, egui::TextFormat {
-            font_id: font.clone(),
-            color: if changed { on_color } else { p.text },
-            background: background(s.change, colors),
-            ..Default::default()
-        });
-    }
-    let lines = spans.iter().map(|s| s.text.matches('\n').count()).sum::<usize>() + 1;
-    let numbers: String = (1..=lines).map(|n| format!("{n:>4}\n")).collect();
+fn word_pane(ui: &mut Ui, p: &Palette, id: &str, title: &str, rows: &[Row], st: &PaneStyle,
+             active: Option<usize>, mark: Option<usize>, offset: f32) -> f32 {
+    // no gap under the title: the pane's box then starts exactly PANE_TITLE_H down, in both
+    // panes, which is what the jump arithmetic assumes when it centres a difference
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PANE_TITLE_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.label(bold(title, 12.5).color(p.strong));
+    });
+    let numbers = gutter_job(rows, st, p, mark);
+    let text = text_job(rows, st, p, active);
     let out = egui::Frame::new().fill(p.deep).stroke(egui::Stroke::new(1.0_f32, p.header)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         egui::ScrollArea::both().id_salt(id).auto_shrink([false, false]).vertical_scroll_offset(offset).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.add(egui::Label::new(RichText::new(numbers.trim_end()).font(font.clone()).color(p.ed_line_numbers)).selectable(false));
-                ui.add(egui::Label::new(job).extend());
+                ui.add(egui::Label::new(numbers).selectable(false));
+                ui.add(egui::Label::new(text).extend());
             });
         })
     });
     out.inner.state.offset.y
 }
 
-/// Hex dump rows of one side, the differing bytes highlighted; returns its scroll offset.
+/// One side's text, one galley row per row of the side. Nothing wraps and no span carries a
+/// line terminator, so a row is always exactly one row high, which is what keeps the two panes
+/// level; a row with nothing to draw -- a filler, or a blank line -- is held open by a space,
+/// since a galley row with no glyphs in it is not guaranteed the font's height.
+fn text_job(rows: &[Row], st: &PaneStyle, p: &Palette, active: Option<usize>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let plain = egui::TextFormat { font_id: st.font.clone(), color: p.text, ..Default::default() };
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, plain.clone());
+        }
+        let mut drawn = false;
+        let mut first: Option<egui::TextFormat> = None;
+        for s in &row.spans {
+            let changed = s.change != Change::Same;
+            // the one difference the view is on: underlined, so it is told apart from the
+            // others of its own colour without changing what that colour means
+            let live = s.hunk.is_some() && s.hunk == active;
+            let format = egui::TextFormat {
+                font_id: st.font.clone(),
+                color: if changed { st.on_color } else { p.text },
+                background: background(s.change, st.colors),
+                underline: if live { egui::Stroke::new(2.0_f32, p.strong) } else { egui::Stroke::NONE },
+                ..Default::default()
+            };
+            first.get_or_insert_with(|| format.clone());
+            let text = comparer::shown(s);
+            drawn |= !text.is_empty();
+            job.append(text, 0.0, format);
+        }
+        if !drawn {
+            // a deleted or added blank line keeps its colour here, so it is still visible
+            job.append(" ", 0.0, first.unwrap_or_else(|| plain.clone()));
+        }
+    }
+    job
+}
+
+/// The line numbers beside one side: the item's own numbering, blank against a filler row, and
+/// the active difference's row called out -- the same row in both panes.
+fn gutter_job(rows: &[Row], st: &PaneStyle, p: &Palette, mark: Option<usize>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    for (i, row) in rows.iter().enumerate() {
+        let here = mark == Some(i);
+        let number = match row.line {
+            Some(n) => format!("{:>4}", n + 1),
+            None => "    ".to_string(),
+        };
+        let text = format!("{}{number}{}", if i == 0 { "" } else { "\n" }, if here { " >" } else { "  " });
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: st.font.clone(),
+            color: if here { p.accent } else { p.ed_line_numbers },
+            ..Default::default()
+        });
+    }
+    job
+}
+
+/// Hex dump rows of one side, the differing bytes highlighted; `mark` is the row the active
+/// difference is on. Returns the pane's scroll offset.
 #[allow(clippy::too_many_arguments)]
-fn byte_pane(ui: &mut Ui, p: &Palette, id: &str, title: &str, data: &[u8], changes: &[Change], rows: usize, offset: f32,
-             font: &FontId, row_h: f32, colors: [Color32; 3], on_color: Color32) -> f32 {
-    ui.label(bold(title, 12.5).color(p.strong));
+fn byte_pane(ui: &mut Ui, p: &Palette, id: &str, title: &str, data: &[u8], changes: &[Change], rows: usize,
+             mark: Option<usize>, st: &PaneStyle, offset: f32) -> f32 {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PANE_TITLE_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.label(bold(title, 12.5).color(p.strong));
+    });
     let out = egui::Frame::new().fill(p.deep).stroke(egui::Stroke::new(1.0_f32, p.header)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        egui::ScrollArea::both().id_salt(id).auto_shrink([false, false]).vertical_scroll_offset(offset).show_rows(ui, row_h, rows, |ui, range| {
+        egui::ScrollArea::both().id_salt(id).auto_shrink([false, false]).vertical_scroll_offset(offset).show_rows(ui, st.row_h, rows, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for row in range {
-                ui.add(egui::Label::new(byte_row_job(p, data, changes, row, font, colors, on_color)).extend());
+                ui.add(egui::Label::new(byte_row_job(p, data, changes, row, mark == Some(row), st)).extend());
             }
         })
     });
     out.inner.state.offset.y
 }
 
-/// "00000010: 48 65 ... |He...|" with each differing byte highlighted in hex and ASCII.
-fn byte_row_job(p: &Palette, data: &[u8], changes: &[Change], row: usize, font: &FontId, colors: [Color32; 3], on_color: Color32) -> egui::text::LayoutJob {
+/// "00000010: 48 65 ... |He...|" with each differing byte highlighted in hex and ASCII, and the
+/// row the view is on marked in the offset and underlined where it differs.
+fn byte_row_job(p: &Palette, data: &[u8], changes: &[Change], row: usize, live: bool, st: &PaneStyle) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-    let plain = |col: Color32| egui::TextFormat { font_id: font.clone(), color: col, ..Default::default() };
+    let plain = |col: Color32| egui::TextFormat { font_id: st.font.clone(), color: col, ..Default::default() };
     let marked = |ch: Change| {
         let changed = ch != Change::Same;
-        egui::TextFormat { font_id: font.clone(), color: if changed { on_color } else { p.text }, background: background(ch, colors), ..Default::default() }
+        egui::TextFormat {
+            font_id: st.font.clone(),
+            color: if changed { st.on_color } else { p.text },
+            background: background(ch, st.colors),
+            underline: if live && changed { egui::Stroke::new(2.0_f32, p.strong) } else { egui::Stroke::NONE },
+            ..Default::default()
+        }
     };
     let start = row * BYTES_PER_ROW;
-    job.append(&format!("{start:08x}: "), 0.0, plain(p.ed_line_numbers));
+    let at = |i: usize| changes.get(start + i).copied().unwrap_or(Change::Same);
+    job.append(&format!("{start:08x}{} ", if live { ">" } else { ":" }), 0.0, plain(if live { p.accent } else { p.ed_line_numbers }));
     for i in 0..BYTES_PER_ROW {
         match data.get(start + i) {
-            Some(b) => job.append(&format!("{b:02x}"), 0.0, marked(changes.get(start + i).copied().unwrap_or(Change::Same))),
+            Some(b) => job.append(&format!("{b:02x}"), 0.0, marked(at(i))),
             None => job.append("  ", 0.0, plain(p.text)),
         }
         job.append(" ", 0.0, plain(p.text));
@@ -306,11 +430,82 @@ fn byte_row_job(p: &Palette, data: &[u8], changes: &[Change], row: usize, font: 
         match data.get(start + i) {
             Some(&b) => {
                 let ch = if (0x20..0x7f).contains(&b) { (b as char).to_string() } else { ".".to_string() };
-                job.append(&ch, 0.0, marked(changes.get(start + i).copied().unwrap_or(Change::Same)));
+                job.append(&ch, 0.0, marked(at(i)));
             }
             None => job.append(" ", 0.0, plain(p.text)),
         }
     }
     job.append("|", 0.0, plain(p.disabled));
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comparer::compute_patience_word_diff;
+    use crate::test_utils::assert_table;
+
+    /// Lay the panes out for real and report, for each of the four galleys (the two gutters
+    /// and the two texts), how many rows it has and where each row starts.
+    fn planes(a: &str, b: &str, active: Option<usize>, mark: Option<usize>) -> (f32, Vec<Vec<f32>>) {
+        let d = compute_patience_word_diff(a, b).unwrap();
+        let ctx = egui::Context::default();
+        let (mut row_h, mut out) = (0.0, Vec::new());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            crate::theme::apply(ctx, crate::theme::Look::Dark);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                row_h = row_height(ui);
+                let st = PaneStyle { font: &font, row_h, colors: [Color32::RED; 3], on_color: Color32::WHITE };
+                let p = &crate::theme::DARK;
+                let jobs = [
+                    gutter_job(&d.a, &st, p, mark),
+                    text_job(&d.a, &st, p, active),
+                    gutter_job(&d.b, &st, p, mark),
+                    text_job(&d.b, &st, p, active),
+                ];
+                out = jobs
+                    .into_iter()
+                    .map(|job| ui.fonts(|f| f.layout_job(job)).rows.iter().map(|r| r.rect.min.y).collect())
+                    .collect();
+            });
+        });
+        (row_h, out)
+    }
+
+    /// Row *i* of Item A and row *i* of Item B must start at exactly the same y, and so must
+    /// each pane's line numbers: that is the whole point of the filler rows. Every row is one
+    /// monospace row high -- a blank line and a filler included, which is why they are held
+    /// open by a space rather than left empty.
+    #[test]
+    fn every_row_of_both_panes_sits_on_the_same_plane() {
+        let cases: [(&str, &str, &str); 6] = [
+            ("identical items", "GET / HTTP/1.1\r\nHost: a.test\r\n", "GET / HTTP/1.1\r\nHost: a.test\r\n"),
+            ("a multi-line insertion in the middle", "a\nz\n", "a\nb\nc\nd\nz\n"),
+            ("a multi-line deletion in the middle", "a\nb\nc\nd\nz\n", "a\nz\n"),
+            (
+                "a request gaining headers and a body",
+                "GET /users/42 HTTP/1.1\r\nHost: shop.test\r\nUser-Agent: Mozilla/5.0\r\n\r\n",
+                "POST /orders HTTP/1.1\r\nHost: shop.test\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"sku\":\"A-1\",\"qty\":2}",
+            ),
+            ("blank lines on both sides", "a\n\n\nb\n", "a\n\n\nc\n"),
+            ("one item empty", "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", ""),
+        ];
+
+        assert_table!(cases, |idx, (name, a, b)| {
+            let rows = compute_patience_word_diff(a, b).unwrap().a.len();
+            let (row_h, galleys) = planes(a, b, Some(0), Some(1));
+            assert!(row_h > 0.0, "case #{idx} ({name}) the monospace row height is known");
+            // the gutter and the text of each pane, and both panes, all have the same rows
+            assert_table!(&galleys, |g, tops| {
+                assert_eq!(tops.len(), rows, "case #{idx} ({name}) galley {g} has one row per row of the model");
+                assert_eq!(tops, &galleys[0], "case #{idx} ({name}) galley {g} is on the same planes as Item A's gutter");
+            });
+            // and every one of those rows is exactly one monospace row high
+            assert_table!(galleys[0].windows(2).collect::<Vec<_>>(), |r, pair| {
+                let step = pair[1] - pair[0];
+                assert!((step - row_h).abs() < 0.01, "case #{idx} ({name}) row {r} is {step} tall, not {row_h}");
+            });
+        });
+    }
 }
