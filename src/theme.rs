@@ -534,6 +534,25 @@ pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32
     resp
 }
 
+/// Side-by-side columns, with the check egui's own `Ui::columns` is missing. It divides the
+/// space left by the number of columns without making sure there is any ("TODO: ensure there
+/// is space", says its source) and hands the result to `set_width`, which panics on a negative
+/// width -- so a window dragged narrow enough takes the app with it. Below the width the
+/// columns need, they are laid out at that width inside a sideways scroll area instead.
+pub fn columns<R>(ui: &mut Ui, count: usize, add: impl FnOnce(&mut [Ui]) -> R) -> R {
+    /// Narrower than this a column has nothing left to show.
+    const MIN_COLUMN: f32 = 40.0;
+    let count = count.max(1);
+    let needed = MIN_COLUMN * count as f32 + ui.spacing().item_spacing.x * (count as f32 - 1.0);
+    if ui.available_width() >= needed {
+        return ui.columns(count, add);
+    }
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        ui.set_max_width(needed);
+        ui.columns(count, add)
+    }).inner
+}
+
 /// Dark well behind a table body, filling the given height and the available width.
 pub fn table_well(ui: &mut Ui, p: &Palette, height: f32, add: impl FnOnce(&mut Ui)) {
     let width = ui.available_width();
@@ -543,10 +562,13 @@ pub fn table_well(ui: &mut Ui, p: &Palette, height: f32, add: impl FnOnce(&mut U
 /// Table well of an exact width. Its contents always stack top to bottom, even when the
 /// well sits in a horizontal row (next to a button column, say); otherwise the header and
 /// the rows would be laid out side by side.
+///
+/// The width and height are floored at zero: a window dragged narrower than the panels
+/// inside it leaves negative space over, and egui asserts on a negative size.
 pub fn table_well_sized(ui: &mut Ui, p: &Palette, width: f32, height: f32, add: impl FnOnce(&mut Ui)) {
     egui::Frame::new().fill(p.deep).stroke(Stroke::new(1.0_f32, p.header)).show(ui, |ui| {
-        ui.set_min_height(height);
-        ui.set_width(width - 2.0);
+        ui.set_min_height(height.max(0.0));
+        ui.set_width((width - 2.0).max(0.0));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             add(ui);
@@ -567,13 +589,14 @@ pub fn fit_columns(avail: f32, cols: &[(f32, f32)]) -> Vec<f32> {
 /// scrolls sideways inside its own area (never widening its container). `add` gets the
 /// column widths to use.
 pub fn fitted_table(ui: &mut Ui, p: &Palette, id: impl std::hash::Hash, height: f32, cols: &[(f32, f32)], add: impl FnOnce(&mut Ui, &[f32])) {
-    let avail = ui.available_width();
+    // never negative: a squeezed window can leave a panel with less than no room
+    let avail = ui.available_width().max(0.0);
     let min_total: f32 = cols.iter().map(|c| c.0).sum::<f32>() + 12.0;
     if min_total <= avail {
-        let widths = fit_columns(avail - 12.0, cols);
+        let widths = fit_columns((avail - 12.0).max(0.0), cols);
         table_well(ui, p, height, |ui| add(ui, &widths));
     } else {
-        let widths = fit_columns(min_total - 12.0, cols);
+        let widths = fit_columns((min_total - 12.0).max(0.0), cols);
         egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).max_width(avail).show(ui, |ui| {
             table_well_sized(ui, p, min_total, height, |ui| add(ui, &widths));
         });
@@ -590,4 +613,54 @@ pub fn pill(ui: &mut Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
     ui.painter().rect_filled(rect, rect.height() / 2.0, fill);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, p.text);
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::assert_table;
+
+    /// Draw `add` in a ui `width` wide, however little that is.
+    fn in_a_ui_of(width: f32, add: impl FnOnce(&mut Ui)) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 200.0));
+        // `run` wants an FnMut, and this closure draws exactly once
+        let mut add = Some(add);
+        let _ = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // margins wider than the window itself: what is left inside the frame is less
+                // than nothing, which is how a squeezed window comes by a negative width
+                egui::Frame::new().inner_margin(egui::Margin::same(40)).show(ui, |ui| {
+                    if let Some(add) = add.take() {
+                        add(ui);
+                    }
+                });
+            });
+        });
+    }
+
+    /// egui asserts on a negative width or height, and a window dragged narrower than the
+    /// margins inside it leaves exactly that. These are the helpers every screen lays out
+    /// through, so each one has to cope with being handed nothing at all -- including the
+    /// column layout, whose egui original divides the space left without checking there is any.
+    #[test]
+    fn the_layout_helpers_cope_with_no_room_at_all() {
+        let p = &DARK;
+        let widths: [f32; 5] = [800.0, 100.0, 10.0, 1.0, 0.0];
+        assert_table!(widths, |idx, width| {
+            // the width a table well subtracts its border from, and the width the columns
+            // divide, are both worked out from this
+            in_a_ui_of(width, |ui| {
+                assert!(width > 80.0 || ui.available_width() < 2.0, "case #{idx} ({width}px): nothing to lay out in");
+            });
+            in_a_ui_of(width, |ui| table_well(ui, p, 40.0, |ui| { ui.label("row"); }));
+            in_a_ui_of(width, |ui| table_well_sized(ui, p, ui.available_width(), 40.0, |ui| { ui.label("row"); }));
+            in_a_ui_of(width, |ui| {
+                fitted_table(ui, p, ("t", idx), 40.0, &[(120.0, 1.0), (80.0, 0.0)], |ui, w| {
+                    table_header(ui, p, &[("A", w[0]), ("B", w[1])]);
+                });
+            });
+            in_a_ui_of(width, |ui| columns(ui, 4, |cols| for c in cols.iter_mut() { c.label("x"); }));
+        });
+    }
 }

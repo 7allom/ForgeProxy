@@ -31,7 +31,7 @@ pub fn comparer(app: &mut App, ui: &mut Ui, p: &Palette) {
     theme::section_title(ui, p, "Comparer", "Compare two items word by word or byte by byte. Send requests, responses or selections here from Proxy history, Repeater or Intruder (right-click), or add text below.");
     ui.add_space(6.0);
     let list_h = (ui.available_height() * 0.5).clamp(140.0, 360.0);
-    ui.columns(2, |cols| {
+    theme::columns(ui, 2, |cols| {
         item_list(app, &mut cols[0], p, false, list_h);
         item_list(app, &mut cols[1], p, true, list_h);
     });
@@ -251,7 +251,7 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                         let mark = active.map(|i| targets[i]);
                         let (a, b) = (&w.a, &w.b);
                         debug_assert_eq!(a.len(), b.len(), "the panes show the same number of rows");
-                        ui.columns(2, |cols| {
+                        theme::columns(ui, 2, |cols| {
                             offsets[0] = word_pane(&mut cols[0], p, "cmp_pane_a", "Item A", a, &st, active, mark, shared);
                             offsets[1] = word_pane(&mut cols[1], p, "cmp_pane_b", "Item B", b, &st, active, mark, shared);
                         });
@@ -272,7 +272,7 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 DiffMode::Bytes => if let Some(bd) = view.bytes.as_ref() {
                     let rows = view.a.length.max(view.b.length).div_ceil(BYTES_PER_ROW).max(1);
                     let mark = active.map(|i| targets[i]);
-                    ui.columns(2, |cols| {
+                    theme::columns(ui, 2, |cols| {
                         offsets[0] = byte_pane(&mut cols[0], p, "cmp_bytes_a", "Item A", &view.a.data, &bd.a, rows, mark, &st, shared);
                         offsets[1] = byte_pane(&mut cols[1], p, "cmp_bytes_b", "Item B", &view.b.data, &bd.b, rows, mark, &st, shared);
                     });

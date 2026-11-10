@@ -190,7 +190,7 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 
     ui.add_space(10.0);
-    ui.columns(2, |cols| {
+    theme::columns(ui, 2, |cols| {
         // per-position entropy
         cols[0].label(bold("Per-position entropy", 13.0).color(cols[0].style().visuals.strong_text_color()));
         cols[0].label(RichText::new("Low bars mark fixed prefixes or timestamp digits.").size(11.5).color(p.disabled));

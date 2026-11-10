@@ -464,7 +464,7 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                                 }
                             });
                             let h = (ui.available_height() - 22.0).max(60.0);
-                            let (out_req, out_resp) = ui.columns(2, |cols| {
+                            let (out_req, out_resp) = theme::columns(ui, 2, |cols| {
                                 cols[0].label(bold("Request", 12.5).color(p.strong));
                                 let req_v = editor::message_view(&mut cols[0], p, &format!("int_req_{id}"), &e.request, h);
                                 cols[1].label(bold("Response", 12.5).color(p.strong));
@@ -1454,7 +1454,7 @@ fn jwt_inspector(app: &mut App, ui: &mut Ui, p: &Palette) {
             });
         });
         ui.add_space(6.0);
-        ui.columns(2, |cols| {
+        theme::columns(ui, 2, |cols| {
             json_view(&mut cols[0], p, "jwt_header", "Header", colors[0], &j.header_json);
             json_view(&mut cols[1], p, "jwt_payload", "Payload", colors[1], &j.payload_json);
         });
@@ -1612,7 +1612,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                 egui::ScrollArea::vertical().id_salt(("traffic_detail_scroll", view as u8)).auto_shrink([false, false]).show(ui, |ui| {
                     crate::ui_inspector::inspector_panel(ui, p, &mut app.inspector, "history", &e.id.to_string(), &e.request, Some(&e.response));
                     let h = (ui.available_height() - 22.0).max(120.0);
-                    let (out_req, out_resp) = ui.columns(2, |cols| {
+                    let (out_req, out_resp) = theme::columns(ui, 2, |cols| {
                         cols[0].label(bold("Request", 13.0).color(p.strong));
                         let req_v = editor::message_view(&mut cols[0], p, "tv_req", &e.request, h);
                         cols[1].label(bold("Response", 13.0).color(p.strong));
@@ -1955,7 +1955,7 @@ pub fn organizer(app: &mut App, ui: &mut Ui, p: &Palette) {
                     }
                 });
                 let h = (ui.available_height() - 22.0).max(80.0);
-                let (out_req, out_resp) = ui.columns(2, |cols| {
+                let (out_req, out_resp) = theme::columns(ui, 2, |cols| {
                     cols[0].label(bold("Request", 12.5).color(p.strong));
                     let req_v = editor::message_view(&mut cols[0], p, &format!("org_req_{sel_idx}"), &item_req, h);
                     cols[1].label(bold("Response", 12.5).color(p.strong));
@@ -2069,7 +2069,7 @@ pub fn discover(app: &mut App, ui: &mut Ui, p: &Palette) {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| { ui.label(bold("Getting started with ForgeProxy", 22.0).color(p.strong)); });
             ui.add_space(16.0);
-            ui.columns(4, |cols| {
+            theme::columns(ui, 4, |cols| {
                 let cards = [
                     ("Set the target scope", "Choose which URLs to include or ignore so testing is focused on the right parts of your application.", "1. Target > Scope: add your site's address."),
                     ("Map the website", "Open the proxy browser and click through the site; every request lands in HTTP history and the site map.", "2. Open browser, then browse the site."),
@@ -2142,7 +2142,7 @@ pub fn discover(app: &mut App, ui: &mut Ui, p: &Palette) {
                 });
                 if let Some(e) = app.discover_sel.and_then(|id| items.iter().find(|e| e.id == id)).cloned() {
                     ui.add_space(8.0);
-                    let (out_req, out_resp) = ui.columns(2, |cols| {
+                    let (out_req, out_resp) = theme::columns(ui, 2, |cols| {
                         cols[0].label(bold("Request", 12.5).color(p.strong));
                         let req_v = editor::message_view(&mut cols[0], p, "disc_req", &e.request, 140.0);
                         cols[1].label(bold("Response", 12.5).color(p.strong));
@@ -2388,11 +2388,12 @@ mod sort_header_tests {
 
     /// A status cell draws its text into `width - 8` pixels and clips the rest, so the column
     /// has to be wider than the longest phrase that routinely lands in it. The two in the brief
-    /// ("405 Method Not Allowed", "500 Internal Server Error") are the widest of them. Both the
-    /// Intruder results table and HTTP history are checked against the same phrases.
+    /// ("405 Method Not Allowed", "500 Internal Server Error") are the widest of them. All
+    /// three tables that show a status -- Intruder results, HTTP history and the site map --
+    /// are checked against the same phrases.
     #[test]
     fn standard_status_phrases_fit_the_status_column() {
-        let width = COLS[2].1.min(HISTORY_COLS[6].0) - 8.0;
+        let width = COLS[2].1.min(HISTORY_COLS[6].0).min(crate::ui_target::SITE_MAP_COLS[5].0) - 8.0;
         let ctx = egui::Context::default();
         // fonts installed by a pass of their own: a new set only takes effect the pass after
         let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));

@@ -265,7 +265,7 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         return;
     }
     let sel = app.finding_sel.min(list.len() - 1);
-    ui.columns(2, |cols| {
+    theme::columns(ui, 2, |cols| {
         theme::table_well(&mut cols[0], p, 420.0, |ui| {
             theme::table_header(ui, p, &[("Issue", 260.0), ("Host", 150.0), ("Severity", 90.0)]);
             egui::ScrollArea::vertical().id_salt(("issues", task)).show(ui, |ui| {
