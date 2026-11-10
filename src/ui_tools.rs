@@ -532,20 +532,27 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
             if tab.method != shown {
                 tab.request = actions::set_request_method(&tab.request, &tab.method);
             }
-            ui.add(egui::TextEdit::singleline(&mut tab.url).id_salt(("rep_url", tab_id)).hint_text("https://target.example/").desired_width(ui.available_width() - 200.0));
-            let can_send = tab.can_send();
-            let why = if tab.waiting { "Waiting for the response" } else { "Write a request first" };
-            if ui.add_enabled(can_send, egui::Button::new(bold("Send", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(80.0, 24.0)))
-                .on_disabled_hover_text(why).clicked() {
-                send = true;
-            }
-            if theme::plain_button(ui, p, "Copy as cURL", tab.can_send()).on_hover_text("Copy the request as a curl command").clicked() {
-                ui.ctx().copy_text(crate::export::to_curl(&tab.request, &actions::origin_of(&tab.url)));
-            }
-            if theme::plain_button(ui, p, "Send to Sequencer", tab.can_send()).on_hover_text("Analyse the randomness of a token in this response").clicked() {
-                to_sequencer = Some((tab.url.clone(), tab.request.clone()));
-            }
-            crate::ui_inspector::toggle_button(ui, &mut app.inspector);
+            // the buttons are laid out from the right first, so the address bar takes exactly
+            // the width that is left: a fixed reservation would overflow the row, and an
+            // overflowing row widens this whole Ui (pushing the Inspector off the window).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::ui_inspector::toggle_button(ui, &mut app.inspector);
+                if theme::plain_button(ui, p, "Send to Sequencer", tab.can_send()).on_hover_text("Analyse the randomness of a token in this response").clicked() {
+                    to_sequencer = Some((tab.url.clone(), tab.request.clone()));
+                }
+                if theme::plain_button(ui, p, "Copy as cURL", tab.can_send()).on_hover_text("Copy the request as a curl command").clicked() {
+                    ui.ctx().copy_text(crate::export::to_curl(&tab.request, &actions::origin_of(&tab.url)));
+                }
+                let can_send = tab.can_send();
+                let why = if tab.waiting { "Waiting for the response" } else { "Write a request first" };
+                if ui.add_enabled(can_send, egui::Button::new(bold("Send", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(80.0, 24.0)))
+                    .on_disabled_hover_text(why).clicked() {
+                    send = true;
+                }
+                let room = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
+                ui.add(egui::TextEdit::singleline(&mut tab.url).id_salt(("rep_url", tab_id)).hint_text("https://target.example/").desired_width(room))
+                    .on_hover_text(&tab.url);
+            });
         });
         ui.add_space(8.0);
         {
@@ -557,10 +564,23 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
         // the divider side and draws its header at the same height
         let width = ui.available_width();
         const GAP: i8 = 8;
-        // fixed-height header row, left-aligned, so both panes' editors start at the same y
-        let header = |ui: &mut Ui, text: String| {
+        // fixed-height header row, left-aligned, so both panes' editors start at the same y.
+        // `status` (a status line or a transport error, which can be far wider than the pane)
+        // is truncated to the room left over, with the whole of it on hover; `badges` (the
+        // latency and the size) are laid out from the right first, so they stay visible.
+        let header = |ui: &mut Ui, title: &str, status: &str, badges: &[String]| {
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.label(bold(text, 13.0).color(p.strong));
+                ui.label(bold(title, 13.0).color(p.strong));
+                if status.is_empty() {
+                    return;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for b in badges.iter().rev() {
+                        ui.label(egui::RichText::new(b).size(12.0).color(p.disabled));
+                    }
+                    ui.add(egui::Label::new(bold(status, 13.0).color(p.strong)).truncate())
+                        .on_hover_text(status);
+                });
             });
             ui.add_space(4.0);
         };
@@ -577,8 +597,8 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
             .width_range((width * 0.25)..=(width * 0.75))
             .frame(egui::Frame::new().inner_margin(egui::Margin { left: GAP, ..Default::default() }))
             .show_inside(ui, |ui| {
-                let summary = response_summary(&app.repeater_tabs[i]);
-                header(ui, format!("Response{summary}"));
+                let (status, badges) = response_summary(&app.repeater_tabs[i]);
+                header(ui, "Response", &status, &badges);
                 let h = ui.available_height() - 2.0;
                 // each tab keeps its own Raw / Pretty / Hex choice
                 let view_id = format!("rep_resp:{tab_id}");
@@ -591,7 +611,7 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
             });
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { right: GAP, ..Default::default() }))
             .show_inside(ui, |ui| {
-                header(ui, "Request".into());
+                header(ui, "Request", "", &[]);
                 let h = ui.available_height() - 2.0;
                 // per-tab editor state: cursor and undo history don't leak between tabs
                 let out = editor::message_editor(ui, p, &format!("rep_req:{tab_id}"), &mut app.repeater_tabs[i].request, true, false, h);
@@ -613,21 +633,24 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 }
 
-/// "   200 OK · 143 ms · 1.2 KiB" after "Response" (or the error / "Sending...").
-fn response_summary(tab: &crate::repeater::RepeaterTab) -> String {
+/// What goes next to "Response": the status line ("200 OK", "Sending...", or a transport
+/// error, which can run to several hundred characters) and the badges after it ("143 ms",
+/// "1.2 KiB"). They are returned apart because the header strip truncates the first and
+/// keeps the others against the right edge.
+fn response_summary(tab: &crate::repeater::RepeaterTab) -> (String, Vec<String>) {
     if tab.status_text.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
-    let mut s = format!("   {}", tab.status_text);
+    let mut badges = Vec::new();
     if !tab.waiting {
         if let Some(ms) = tab.response_time_ms {
-            s.push_str(&format!(" · {ms} ms"));
+            badges.push(format!("· {ms} ms"));
         }
         if let Some(b) = tab.response_bytes {
-            s.push_str(&format!(" · {}", editor::human_size(b)));
+            badges.push(format!("· {}", editor::human_size(b)));
         }
     }
-    s
+    (tab.status_text.clone(), badges)
 }
 
 /// What a click in the tab strip asks for (applied after drawing it).

@@ -13,11 +13,14 @@ pub struct InspectorState {
     pub panel_width: f32,
 }
 
-pub const WIDTH_RANGE: std::ops::RangeInclusive<f32> = 180.0..=400.0;
+/// Drag range for the panel. The floor is what a name column plus a readable value column
+/// need: below it the values break into fragments a few characters wide. The ceiling lets a
+/// long value (a token, a Set-Cookie) be read without leaving the panel.
+pub const WIDTH_RANGE: std::ops::RangeInclusive<f32> = 260.0..=560.0;
 
 impl Default for InspectorState {
     fn default() -> Self {
-        InspectorState { show_inspector: true, panel_width: 240.0 }
+        InspectorState { show_inspector: true, panel_width: 300.0 }
     }
 }
 
@@ -212,6 +215,22 @@ pub fn inspector_panel(ui: &mut Ui, p: &Palette, state: &mut InspectorState, id:
     state.panel_width = shown.response.rect.width().clamp(*WIDTH_RANGE.start(), *WIDTH_RANGE.end());
 }
 
+/// Would wrapping `v` in a column `value_w` wide break it into fragments?
+///
+/// A value with somewhere to break (a media-type list, a Set-Cookie, anything with spaces)
+/// wraps into two or three readable lines. One long token (a JWT, a base64 cursor, a session
+/// id) has no break in it, so the wrapper cuts it wherever the column ends and the value
+/// comes apart into slivers a few characters wide. Those are cut with an ellipsis instead:
+/// the whole value is still on hover, under the copy button and in the Auto-Decoder.
+/// `ch_w` is the width of one monospace character.
+fn shreds_when_wrapped(v: &str, value_w: f32, ch_w: f32) -> bool {
+    let longest = v.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(|part| part.chars().count())
+        .max()
+        .unwrap_or(0);
+    (longest as f32) * ch_w > value_w
+}
+
 /// Draws key/value rows: click one to decode it below, copy it with its button or
 /// right-click menu.
 struct Rows<'a> {
@@ -297,19 +316,24 @@ impl Rows<'_> {
         // the highlight goes behind the row, so reserve its place before drawing the row
         let bg = ui.painter().add(egui::Shape::Noop);
         let width = ui.available_width();
-        let key_w = (width * 0.38).clamp(56.0, 130.0);
+        // the name column is kept narrow so the value keeps most of the panel; it never wraps,
+        // so a name is one line ("Protocol", "X-Correlation-Id") whatever the panel's width
+        let key_w = (width * 0.32).clamp(60.0, 110.0);
         let copy_w = 18.0;
         let value_w = (width - key_w - copy_w - 2.0 * ui.spacing().item_spacing.x).max(40.0);
+        let ch_w = ui.fonts(|f| f.glyph_width(&egui::FontId::monospace(12.0), '0')).max(1.0);
+        let shreds = shreds_when_wrapped(v, value_w, ch_w);
         let row = ui.horizontal_top(|ui| {
             let key = ui.allocate_ui_with_layout(egui::vec2(key_w, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 ui.set_width(key_w);
-                ui.add(egui::Label::new(RichText::new(k).size(12.0).color(p.disabled)).wrap().sense(egui::Sense::click()))
+                ui.add(egui::Label::new(RichText::new(k).size(12.0).color(p.disabled)).truncate().sense(egui::Sense::click()))
             }).inner;
             let value = ui.allocate_ui_with_layout(egui::vec2(value_w, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 ui.set_width(value_w);
                 let shown = if v.is_empty() { "(empty)" } else { v };
                 let col = if v.is_empty() { p.disabled } else { p.text };
-                let r = ui.add(egui::Label::new(RichText::new(shown).size(12.0).monospace().color(col)).wrap().sense(egui::Sense::click()));
+                let label = egui::Label::new(RichText::new(shown).size(12.0).monospace().color(col)).sense(egui::Sense::click());
+                let r = ui.add(if shreds { label.truncate() } else { label.wrap() });
                 for (a, av) in attributes {
                     let text = if av.is_empty() { a.clone() } else { format!("{a}={av}") };
                     ui.label(RichText::new(format!("· {text}")).size(11.0).color(p.disabled));
@@ -327,7 +351,16 @@ impl Rows<'_> {
         if hit.clicked() {
             crate::editor::offer_to_decoder(ui.ctx(), &source, v);
         }
-        let hit = hit.on_hover_text("Click to decode in the Auto-Decoder below; right-click to copy");
+        // a cut name or value is read here in full, whatever the panel's width
+        let hit = hit.on_hover_ui(|ui| {
+            ui.set_max_width(480.0);
+            ui.label(bold(k, 12.0).color(p.strong));
+            if !v.is_empty() {
+                ui.add(egui::Label::new(RichText::new(crate::editor::capped(v, 2048)).size(12.0).monospace().color(p.text)).wrap());
+            }
+            ui.add_space(2.0);
+            ui.label(RichText::new("Click to decode in the Auto-Decoder below; right-click to copy").size(11.0).color(p.disabled));
+        });
         hit.context_menu(|ui| {
             if ui.button("Copy value").clicked() {
                 ui.ctx().copy_text(v.to_string());
@@ -399,9 +432,36 @@ fn auto_decoder(ui: &mut Ui, p: &Palette, id: &str, pick: Option<&crate::editor:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     fn pairs(v: &[(&str, &str)]) -> Pairs {
         v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// A value is only cut short when wrapping it would shred it: one unbroken token wider
+    /// than its column. Anything with a break in it keeps wrapping and stays readable.
+    #[test]
+    fn values_wrap_unless_wrapping_would_shred_them() {
+        // the Inspector's value column at its narrowest (panel at WIDTH_RANGE's floor) and a
+        // 12px monospace character
+        let (value_w, ch_w) = (150.0, 7.2);
+        let fits = (value_w / ch_w) as usize; // 20 characters
+        let cases: [(&str, String, bool); 7] = [
+            ("short value", "HTTP/1.1".into(), false),
+            ("empty value", String::new(), false),
+            ("a list breaks at its commas", "application/json, text/plain;q=0.9, */*;q=0.5".into(), false),
+            ("a Set-Cookie breaks at its semicolons", "id=xyz; Path=/; HttpOnly; SameSite=Lax".into(), false),
+            ("a token just inside the column", "e".repeat(fits - 1), false),
+            ("a token past the column", "e".repeat(fits + 8), true),
+            ("a JWT in a Bearer header: the word breaks, the token does not", format!("Bearer {}", "e".repeat(300)), true),
+        ];
+        assert_table!(cases, |i, (what, v, shreds)| {
+            assert_eq!(shreds_when_wrapped(&v, value_w, ch_w), shreds, "case {i} ({what})");
+        });
+        // a wider panel takes a value that a narrow one had to cut
+        let token = "e".repeat(40);
+        assert!(shreds_when_wrapped(&token, 150.0, 7.2));
+        assert!(!shreds_when_wrapped(&token, 400.0, 7.2));
     }
 
     #[test]

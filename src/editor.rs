@@ -466,11 +466,14 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
             Style::Pretty(kind) => crate::viewer::pretty_job(&pal, s, kind, size),
             Style::Hex => crate::viewer::hex_job(&pal, s, size),
         };
+        let _ = wrap;
         for section in &mut job.sections {
             section.format.font_id.size = size;
         }
-        // hex rows never wrap (the columns would fall apart)
-        job.wrap.max_width = if matches!(style, Style::Hex) { f32::INFINITY } else { wrap };
+        // Nothing wraps: a wrapped line breaks mid-token (a URL, a JWT, a one-line JSON body
+        // comes apart) and pushes the rest of the message out of step with the line numbers
+        // in the gutter. Lines wider than the pane are reached with the horizontal scrollbar.
+        job.wrap.max_width = f32::INFINITY;
         ui.fonts(|f| f.layout_job(job))
     };
     let gutter = !matches!(style, Style::Hex); // the offsets are the hex view's line numbers
@@ -480,19 +483,42 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
     let lines = text_now.lines().count().max(1) + usize::from(text_now.ends_with('\n'));
     let mut out = None;
     let mut buf = buf;
+    // the message's vertical scroll offset, reported each frame so the gutter can follow it
+    let offset_id = egui::Id::new(id).with("gutter_follow");
     egui::Frame::new().fill(p.deep).show(ui, |ui| {
         ui.set_min_height(min_height);
-        let scroll = if gutter { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
-        scroll.id_salt(id).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if gutter {
-                    let nums: String = (1..=lines).map(|n| format!("{n}\n")).collect();
-                    ui.add(egui::Label::new(egui::RichText::new(nums.trim_end()).font(FontId::monospace(size)).color(p.ed_line_numbers)).selectable(false));
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, (lines as f32) * 16.0 * size / DEFAULT_FONT), egui::Sense::hover());
-                    ui.painter().rect_filled(r, 0.0, p.ed_gutter);
-                }
-                let rows = ((min_height / 16.0) as usize).max(3);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            // the gutter sits outside the message's scroll area, so the line numbers stay put
+            // when it is scrolled sideways; it is scrolled vertically to match instead
+            if gutter {
+                let follow: f32 = ui.ctx().data(|d| d.get_temp(offset_id)).unwrap_or(0.0);
+                egui::ScrollArea::vertical().id_salt((id, "gutter")).vertical_scroll_offset(follow)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .auto_shrink([true, false]).max_height(min_height).show(ui, |ui| {
+                        let nums: String = (1..=lines).map(|n| format!("{n}\n")).collect();
+                        ui.add(egui::Label::new(egui::RichText::new(nums.trim_end()).font(FontId::monospace(size)).color(p.ed_line_numbers)).selectable(false));
+                    });
+                let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, min_height), egui::Sense::hover());
+                ui.painter().rect_filled(r, 0.0, p.ed_gutter);
+            }
+            // both axes scroll, and the area fills its box rather than shrinking to the text,
+            // so a line wider than the pane gets a horizontal scrollbar instead of being cut
+            // off at the edge. `max_height` keeps that box to the height the caller asked for.
+            // The bars are laid out rather than floating: since nothing wraps, the horizontal
+            // bar is what says a line runs on past the edge, and a bar that only appears under
+            // the pointer would not say it.
+            ui.spacing_mut().scroll.floating = false;
+            let area = egui::ScrollArea::both().id_salt(id).auto_shrink([false, false]).max_height(min_height).show(ui, |ui| {
+                // the editor asks for as many rows as the box holds, measured at the font in
+                // use: a guessed row height leaves it a little taller than its own scroll
+                // area, which puts a vertical scrollbar on a message that fits
+                let row_h = ui.fonts(|f| f.row_height(&FontId::monospace(size))).max(1.0);
+                // room is left for the horizontal scrollbar, which takes its height out of the
+                // box: without it a message that fits gets a vertical scrollbar as well, purely
+                // because one of its lines is long
+                let bar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+                let rows = ((min_height - 4.0 - bar) / row_h).floor().max(3.0) as usize;
                 // read-only views use a &str buffer: selectable and copyable, not editable
                 let te = match &mut buf {
                     Buffer::Edit(t) => egui::TextEdit::multiline(*t),
@@ -507,6 +533,7 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
                     .layouter(&mut layouter)
                     .show(ui));
             });
+            ui.ctx().data_mut(|d| d.insert_temp(offset_id, area.state.offset.y));
         });
     });
     out.unwrap()
@@ -514,6 +541,47 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::assert_table;
+
+    /// Lay out one message in a pane far narrower than it, and count the rows the editor
+    /// produced. Wrapping would turn a long line into many rows (and put the text out of step
+    /// with the line numbers in the gutter); not wrapping keeps one row per line, and the
+    /// overflow is reached with the horizontal scrollbar instead.
+    fn rows_laid_out(text: &str) -> usize {
+        let ctx = egui::Context::default();
+        let mut rows = 0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 400.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut buf = text.to_string();
+                let out = super::message_editor(ui, &crate::theme::DARK, "wrap_test", &mut buf, true, false, 200.0);
+                rows = out.galley.rows.len();
+            });
+        });
+        rows
+    }
+
+    #[test]
+    fn long_lines_scroll_sideways_rather_than_wrapping() {
+        let long_path = format!("GET /api/v1/inventory?cursor={} HTTP/1.1", "x".repeat(400));
+        let jwt_header = format!("GET / HTTP/1.1\nAuthorization: Bearer {}\nConnection: close", "e".repeat(300));
+        let one_line_json = format!("{{\"items\":[{}]}}", "\"abcdefghij\",".repeat(60));
+        let cases: [(&str, &str); 5] = [
+            ("a request line far wider than the pane", &long_path),
+            ("a long token between short headers", &jwt_header),
+            ("a one-line JSON payload", &one_line_json),
+            ("lines that already fit", "GET / HTTP/1.1\nHost: a.test"),
+            ("a single short line", "GET / HTTP/1.1"),
+        ];
+        assert_table!(cases, |i, (what, text)| {
+            let lines = text.lines().count();
+            assert_eq!(rows_laid_out(text), lines, "case {i} ({what}): one row per line, whatever its width");
+        });
+    }
+
     #[test]
     fn display_cap_cuts_on_a_char_boundary() {
         assert_eq!(super::capped("short", 10), "short");
