@@ -44,7 +44,7 @@ fn target_scope(app: &mut App, ui: &mut Ui, p: &Palette) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut app.target_scope.advanced, "Use advanced scope control");
             ui.label(RichText::new(if app.target_scope.advanced {
-                "entries are regular expressions matched against the full URL"
+                "rules match on protocol, host, port and file; host, port and file are regular expressions, and an empty one matches anything"
             } else {
                 "entries are URL prefixes (https://host:port/path), hostnames, or domains (*.example.com)"
             }).size(11.5).color(p.disabled));
@@ -55,7 +55,10 @@ fn target_scope(app: &mut App, ui: &mut Ui, p: &Palette) {
             } else {
                 ("Target Scope: Include in scope", "With no include rules, everything is in scope. Otherwise an item must match one of them.")
             };
-            crate::ui_settings::setting_card(ui, title, desc, Some("Project setting"), |ui| scope_list(app, ui, p, exclude));
+            let advanced = app.target_scope.advanced;
+            crate::ui_settings::setting_card(ui, title, desc, Some("Project setting"), |ui| {
+                if advanced { advanced_scope_list(app, ui, p, exclude) } else { scope_list(app, ui, p, exclude) }
+            });
         }
         // quick check of the rules above
         let test_id = egui::Id::new("scope_test_url");
@@ -70,6 +73,177 @@ fn target_scope(app: &mut App, ui: &mut Ui, p: &Palette) {
             }
         });
         ui.data_mut(|d| d.insert_temp(test_id, test));
+    });
+}
+
+/// Inline editor for adding (index None) or editing an advanced scope rule.
+#[derive(Clone, Default)]
+struct AdvancedScopeEdit {
+    index: Option<usize>,
+    protocol: crate::scope::ScopeProtocol,
+    host: String,
+    port: String,
+    file: String,
+    error: String,
+}
+
+/// One advanced scope list: Add/Edit/Remove strip, the four-part rule table, and the editor.
+/// Each of Host, Port and File is a regular expression, and an empty one matches anything.
+fn advanced_scope_list(app: &mut App, ui: &mut Ui, p: &Palette, exclude: bool) {
+    use crate::scope::{ScopeProtocol, ScopeRule};
+    let edit_id = egui::Id::new(("scope_edit_advanced", exclude));
+    let mut edit: Option<AdvancedScopeEdit> = ui.data(|d| d.get_temp(edit_id));
+    let len = if exclude { app.target_scope.exclude.len() } else { app.target_scope.include.len() };
+    let sel = app.scope_sel.filter(|s| s.0 == exclude && s.1 < len).map(|s| s.1);
+    let mut remove = None;
+    let of = |r: &ScopeRule| AdvancedScopeEdit {
+        index: None,
+        protocol: r.protocol,
+        host: r.host.clone(),
+        port: r.port.clone(),
+        file: r.file.clone(),
+        error: String::new(),
+    };
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            if theme::side_button(ui, p, "Add", true).clicked() {
+                edit = Some(AdvancedScopeEdit::default());
+            }
+            if theme::side_button(ui, p, "Edit", sel.is_some()).clicked() {
+                if let Some(i) = sel {
+                    let list = if exclude { &app.target_scope.exclude } else { &app.target_scope.include };
+                    edit = Some(AdvancedScopeEdit { index: Some(i), ..of(&list[i]) });
+                }
+            }
+            if theme::side_button(ui, p, "Remove", sel.is_some()).clicked() { remove = sel; }
+        });
+        // Enabled, Protocol, Host, Port, File
+        const COLS: [(f32, f32); 5] = [(70.0, 0.0), (80.0, 0.0), (180.0, 0.4), (70.0, 0.0), (180.0, 0.6)];
+        theme::fitted_table(ui, p, ("scope_table_advanced", exclude), 19.0 * 5.0 + 6.0, &COLS, |ui, w| {
+            theme::table_header(ui, p, &[("Enabled", w[0]), ("Protocol", w[1]), ("Host", w[2]), ("Port", w[3]), ("File", w[4])]);
+            let list = if exclude { &mut app.target_scope.exclude } else { &mut app.target_scope.include };
+            if list.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(if exclude { "  No exclusions." } else { "  No include rules: everything is in scope." }).size(12.0).color(p.disabled));
+            }
+            for i in 0..list.len() {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), egui::Sense::click());
+                if sel == Some(i) { ui.painter().rect_filled(rect, 0.0, p.selection); }
+                else if i % 2 == 1 { ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color); }
+                let mut en = list[i].enabled;
+                if ui.put(egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0)), egui::Checkbox::without_text(&mut en)).changed() {
+                    list[i].enabled = en;
+                }
+                let bad = list[i].bad_patterns();
+                // a rule that names no part at all still matches on its prefix, the way
+                // advanced rules did before they had parts; the table says so rather than
+                // showing four empty cells that look like "matches everything"
+                let fallback = (!list[i].has_parts()).then(|| list[i].prefix.clone());
+                let cells: [(String, Option<&str>); 4] = match &fallback {
+                    Some(prefix) => [(format!("whole URL: {prefix}"), None), (String::new(), None), (String::new(), None), (String::new(), None)],
+                    None => [
+                        (list[i].protocol.label().to_string(), None),
+                        (list[i].host.clone(), Some("Host")),
+                        (list[i].port.clone(), Some("Port")),
+                        (list[i].file.clone(), Some("File")),
+                    ],
+                };
+                let mut x = rect.left() + 6.0 + w[0];
+                for (cell, (text, field)) in cells.iter().enumerate() {
+                    let width = if fallback.is_some() && cell == 0 { w[1] + w[2] + w[3] + w[4] } else { w[cell + 1] };
+                    let shown = if text.is_empty() && fallback.is_none() && cell > 0 { "any" } else { text.as_str() };
+                    let colour = match field {
+                        // an expression that will not compile matches nothing: say so in red
+                        Some(name) if bad.contains(name) => p.high,
+                        _ if shown == "any" => p.disabled,
+                        _ => p.text,
+                    };
+                    let clip = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + width - 8.0, rect.bottom()));
+                    ui.painter().with_clip_rect(clip).text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, shown, egui::FontId::monospace(12.0), colour);
+                    x += width;
+                }
+                if resp.clicked() { app.scope_sel = Some((exclude, i)); }
+                if resp.double_clicked() { edit = Some(AdvancedScopeEdit { index: Some(i), ..of(&list[i]) }); }
+            }
+        });
+    });
+    // one line naming every rule the engine cannot use, so a typo is not silently inert
+    let list = if exclude { &app.target_scope.exclude } else { &app.target_scope.include };
+    let broken: Vec<String> = list
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let bad = r.bad_patterns();
+            (!bad.is_empty()).then(|| format!("rule {} ({})", i + 1, bad.join(", ")))
+        })
+        .collect();
+    if !broken.is_empty() {
+        ui.label(RichText::new(format!("Not a valid regular expression in {}. A pattern that will not compile matches nothing.", broken.join("; ")))
+            .size(12.0).color(p.high));
+    }
+    if let Some(i) = remove {
+        if exclude { app.target_scope.exclude.remove(i); } else { app.target_scope.include.remove(i); }
+        app.scope_sel = None;
+        edit = edit.filter(|e| e.index.is_none());
+    }
+    let mut close = false;
+    if let Some(e) = edit.as_mut() {
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(if e.index.is_some() { "Edit rule:" } else { "New rule:" }).color(p.text));
+            egui::ComboBox::from_id_salt(("scope_protocol", exclude)).width(90.0).selected_text(e.protocol.label()).show_ui(ui, |ui| {
+                for t in ScopeProtocol::ALL { ui.selectable_value(&mut e.protocol, t, t.label()); }
+            });
+            let field = |ui: &mut Ui, label: &str, text: &mut String, width: f32, hint: &str| {
+                ui.label(RichText::new(label).size(12.0).color(p.text));
+                ui.add(egui::TextEdit::singleline(text).desired_width(width).font(egui::FontId::monospace(12.5)).hint_text(hint))
+            };
+            let h = field(ui, "Host:", &mut e.host, 180.0, "^example\\.com$");
+            let pt = field(ui, "Port:", &mut e.port, 70.0, "^8443$");
+            let f = field(ui, "File:", &mut e.file, 180.0, "^/api/");
+            if h.changed() || pt.changed() || f.changed() {
+                e.error.clear();
+            }
+            let submit = theme::primary_button(ui, p, "OK").clicked();
+            if theme::plain_button(ui, p, "Cancel", true).clicked() { close = true; }
+            if submit {
+                let candidate = ScopeRule {
+                    protocol: e.protocol,
+                    host: e.host.trim().to_string(),
+                    port: e.port.trim().to_string(),
+                    file: e.file.trim().to_string(),
+                    ..ScopeRule::new("")
+                };
+                let bad = candidate.bad_patterns();
+                if !bad.is_empty() {
+                    e.error = format!("Not a valid regular expression: {}.", bad.join(", "));
+                } else if !candidate.has_parts() {
+                    e.error = "Set a protocol, host, port or file; a rule matching every part would match everything.".into();
+                } else {
+                    let list = if exclude { &mut app.target_scope.exclude } else { &mut app.target_scope.include };
+                    match e.index.filter(|&i| i < list.len()) {
+                        Some(i) => {
+                            let kept = list[i].prefix.clone();
+                            list[i] = ScopeRule { prefix: kept, ..candidate };
+                        }
+                        None => {
+                            list.push(candidate);
+                            app.scope_sel = Some((exclude, list.len() - 1));
+                        }
+                    }
+                    close = true;
+                }
+            }
+        });
+        if !e.error.is_empty() {
+            ui.label(RichText::new(&e.error).size(12.0).color(p.high));
+        }
+    }
+    if close { edit = None; }
+    // removed, not stored as a default: a stored default would reopen the editor every frame
+    ui.data_mut(|d| match edit {
+        Some(e) => d.insert_temp(edit_id, e),
+        None => d.remove::<AdvancedScopeEdit>(edit_id),
     });
 }
 
@@ -155,7 +329,7 @@ fn scope_list(app: &mut App, ui: &mut Ui, p: &Palette, exclude: bool) {
                     match e.index.filter(|&i| i < list.len()) {
                         Some(i) => { list[i].prefix = text; list[i].subdomains = e.subdomains; }
                         None => {
-                            list.push(crate::scope::ScopeRule { enabled: true, prefix: text, subdomains: e.subdomains });
+                            list.push(crate::scope::ScopeRule { subdomains: e.subdomains, ..crate::scope::ScopeRule::new(text) });
                             app.scope_sel = Some((exclude, list.len() - 1));
                         }
                     }

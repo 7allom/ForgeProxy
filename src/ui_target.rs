@@ -375,6 +375,23 @@ mod layout_tests {
             Scene("Proxy > Match and replace", |a| { a.tab = Tab::Proxy; a.proxy_sub = 2; }),
             Scene("Proxy > Proxy settings", |a| { a.tab = Tab::Proxy; a.proxy_sub = 3; }),
             Scene("Target > Scope", |a| { a.tab = Tab::Target; a.target_sub = 1; }),
+            Scene("Target > Scope, advanced", |a| {
+                a.tab = Tab::Target;
+                a.target_sub = 1;
+                a.target_scope.advanced = true;
+                a.target_scope.include.push(crate::scope::ScopeRule {
+                    protocol: crate::scope::ScopeProtocol::Https,
+                    host: "^corp\\.test$".into(),
+                    port: "^8443$".into(),
+                    file: "^/api/".into(),
+                    ..crate::scope::ScopeRule::new("")
+                });
+                // and one the engine cannot compile, which the table marks up
+                a.target_scope.exclude.push(crate::scope::ScopeRule {
+                    host: "^(unclosed".into(),
+                    ..crate::scope::ScopeRule::new("")
+                });
+            }),
             Scene("Sequencer > Analysis", |a| { a.tab = Tab::Sequencer; a.seq_sub = 1; }),
             Scene("the Intruder attack window", |a| { a.tab = Tab::Intruder; a.show_attack = true; }),
             Scene("the settings window", |a| a.show_settings = true),

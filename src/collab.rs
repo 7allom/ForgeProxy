@@ -491,7 +491,7 @@ mod tests {
 
         let success_cases = [
             ParseSuccessCase {
-                name: "Burp Collaborator standard responses envelope (DNS, HTTP POST, SMTP)",
+                name: "OAST Collaborator standard responses envelope (DNS, HTTP POST, SMTP)",
                 body: r#"{
                     "responses": [
                         {

@@ -1,14 +1,59 @@
 //! Target scope: include and exclude rules, and the in-scope test every tool uses.
 //!
-//! A rule's prefix can be a full URL prefix (`https://example.com/app`), an origin
+//! Simple rules match on a prefix: a full URL prefix (`https://example.com/app`), an origin
 //! (`http://127.0.0.1:8080`), a hostname (`example.com`, any scheme and port) or a domain
 //! (`*.example.com` / `.example.com`, the domain and its subdomains). Matching compares scheme,
 //! host, port and path separately, so `https://example.com` does not match
-//! `https://example.com.evil.net`. In advanced mode each prefix is a regular expression tested
-//! against the whole URL instead.
+//! `https://example.com.evil.net`.
+//!
+//! Advanced rules match on four parts of the address instead -- protocol, host, port and file
+//! (the path with its query) -- the last three as regular expressions, each one empty to match
+//! anything. The expressions are searched, not anchored, so `example` matches anywhere in the
+//! host unless the pattern says `^example$`. A rule that sets none of the four but carries a
+//! prefix is matched the way advanced rules worked before they had parts: the prefix as one
+//! regular expression over the whole URL. That keeps scopes saved by earlier versions doing
+//! what they did.
+//!
+//! An unparseable expression matches nothing, so a broken include rule includes nothing and a
+//! broken exclude rule excludes nothing. Patterns are compiled through [`crate::regex_cache`],
+//! so filtering a table per frame recompiles nothing.
 
 use serde::{Deserialize, Serialize};
 
+/// The protocol an advanced rule asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeProtocol {
+    #[default]
+    Any,
+    Http,
+    Https,
+}
+
+impl ScopeProtocol {
+    pub const ALL: [ScopeProtocol; 3] = [ScopeProtocol::Any, ScopeProtocol::Http, ScopeProtocol::Https];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScopeProtocol::Any => "Any",
+            ScopeProtocol::Http => "HTTP",
+            ScopeProtocol::Https => "HTTPS",
+        }
+    }
+
+    /// The scheme this asks for, or `None` for any.
+    fn scheme(&self) -> Option<&'static str> {
+        match self {
+            ScopeProtocol::Any => None,
+            ScopeProtocol::Http => Some("http"),
+            ScopeProtocol::Https => Some("https"),
+        }
+    }
+}
+
+/// One scope rule. It carries both shapes: `prefix` (and `subdomains`) are what a simple rule
+/// matches on, `protocol`/`host`/`port`/`file` what an advanced one does, and
+/// [`TargetScope::advanced`] decides which of the two is read. Every field added after the
+/// first release defaults, so a scope written by an earlier version loads unchanged.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScopeRule {
     pub enabled: bool,
@@ -16,12 +61,56 @@ pub struct ScopeRule {
     /// Also match subdomains of the rule's host.
     #[serde(default)]
     pub subdomains: bool,
+    #[serde(default)]
+    pub protocol: ScopeProtocol,
+    /// Host pattern; empty matches any host.
+    #[serde(default)]
+    pub host: String,
+    /// Port pattern, matched against the port in digits; empty matches any port.
+    #[serde(default)]
+    pub port: String,
+    /// Pattern for the path and query together; empty matches any.
+    #[serde(default)]
+    pub file: String,
 }
 
 impl ScopeRule {
+    /// A simple rule matching `prefix`.
     pub fn new(prefix: impl Into<String>) -> Self {
-        ScopeRule { enabled: true, prefix: prefix.into(), subdomains: false }
+        ScopeRule {
+            enabled: true,
+            prefix: prefix.into(),
+            subdomains: false,
+            protocol: ScopeProtocol::default(),
+            host: String::new(),
+            port: String::new(),
+            file: String::new(),
+        }
     }
+
+    /// Does this rule name any of the four parts an advanced rule matches on?
+    pub fn has_parts(&self) -> bool {
+        self.protocol != ScopeProtocol::Any
+            || !self.host.trim().is_empty()
+            || !self.port.trim().is_empty()
+            || !self.file.trim().is_empty()
+    }
+
+    /// The patterns on this rule that are not valid regular expressions, named for the UI.
+    pub fn bad_patterns(&self) -> Vec<&'static str> {
+        [("Host", &self.host), ("Port", &self.port), ("File", &self.file)]
+            .into_iter()
+            .filter(|(_, pattern)| !pattern.trim().is_empty() && crate::regex_cache::get(pattern.trim()).is_none())
+            .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+/// Does `pattern` match `text`? An empty pattern matches anything; one that will not compile
+/// matches nothing.
+fn pattern_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.trim();
+    pattern.is_empty() || crate::regex_cache::get(pattern).is_some_and(|re| re.is_match(text))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -75,12 +164,15 @@ fn parse(s: &str) -> Target {
 
 impl ScopeRule {
     fn matches(&self, url: &str, advanced: bool) -> bool {
-        let prefix = self.prefix.trim();
-        if !self.enabled || prefix.is_empty() {
+        if !self.enabled {
             return false;
         }
         if advanced {
-            return crate::regex_cache::get(prefix).is_some_and(|re| re.is_match(url));
+            return self.matches_parts(url);
+        }
+        let prefix = self.prefix.trim();
+        if prefix.is_empty() {
+            return false;
         }
         let rule = parse(prefix);
         let t = parse(url);
@@ -104,23 +196,48 @@ impl ScopeRule {
         let path_ok = rule.path.is_empty() || rule.path == "/" || t.path.starts_with(&rule.path);
         host_ok && scheme_ok && port_ok && path_ok
     }
+
+    /// Advanced matching: protocol, host, port and file, each part that the rule leaves empty
+    /// matching anything. A rule that names no part at all falls back to its prefix as one
+    /// expression over the whole URL, which is what advanced rules meant before they had parts.
+    fn matches_parts(&self, url: &str) -> bool {
+        if !self.has_parts() {
+            let prefix = self.prefix.trim();
+            return !prefix.is_empty() && crate::regex_cache::get(prefix).is_some_and(|re| re.is_match(url));
+        }
+        let t = parse(url);
+        // an address with no scheme of its own (a bare host) cannot contradict the rule
+        let protocol_ok = match (self.protocol.scheme(), t.scheme.as_deref()) {
+            (Some(want), Some(have)) => want == have,
+            (Some(_), None) | (None, _) => true,
+        };
+        let port = t.port.map(|p| p.to_string()).unwrap_or_default();
+        protocol_ok
+            && pattern_matches(&self.host, &t.host)
+            && pattern_matches(&self.port, &port)
+            && pattern_matches(&self.file, &t.path)
+    }
 }
 
 impl TargetScope {
     /// In scope: matches an enabled include rule (or there are none) and no enabled exclude
     /// rule. Exclusions always win.
     pub fn is_in_scope(&self, url_or_host: &str) -> bool {
-        let any_include = self.include.iter().any(|r| r.enabled && !r.prefix.trim().is_empty());
+        let any_include = self
+            .include
+            .iter()
+            .any(|r| r.enabled && (!r.prefix.trim().is_empty() || (self.advanced && r.has_parts())));
         let included = !any_include || self.include.iter().any(|r| r.matches(url_or_host, self.advanced));
         included && !self.exclude.iter().any(|r| r.matches(url_or_host, self.advanced))
     }
 
     /// "Add to scope": include `prefix` (unless an identical rule exists) and drop any
-    /// identical exclusion.
+    /// identical exclusion. The rule is filled in for both ways of matching, so the same
+    /// right-click action does what it says whichever mode the scope is in.
     pub fn add(&mut self, prefix: &str) {
         self.exclude.retain(|r| r.prefix.trim() != prefix);
         if !self.include.iter().any(|r| r.prefix.trim() == prefix) {
-            self.include.push(ScopeRule::new(prefix));
+            self.include.push(rule_for(prefix));
         }
     }
 
@@ -129,8 +246,37 @@ impl TargetScope {
     pub fn remove(&mut self, prefix: &str, url: &str) {
         self.include.retain(|r| r.prefix.trim() != prefix);
         if self.is_in_scope(url) && !self.exclude.iter().any(|r| r.prefix.trim() == prefix) {
-            self.exclude.push(ScopeRule::new(prefix));
+            self.exclude.push(rule_for(prefix));
         }
+    }
+}
+
+/// A rule covering `prefix` both ways: the prefix as written for simple matching, and the
+/// parts read out of it for advanced matching. The host and file are escaped, so a dot in a
+/// host name stays a dot rather than becoming "any character".
+fn rule_for(prefix: &str) -> ScopeRule {
+    let t = parse(prefix);
+    let protocol = match t.scheme.as_deref() {
+        Some("http") => ScopeProtocol::Http,
+        Some("https") => ScopeProtocol::Https,
+        _ => ScopeProtocol::Any,
+    };
+    let host = match t.host.strip_prefix("*.").or_else(|| t.host.strip_prefix('.')) {
+        // the domain and its subdomains
+        Some(domain) => format!(r"(^|\.){}$", regex::escape(domain)),
+        None if t.host.is_empty() => String::new(),
+        None => format!("^{}$", regex::escape(&t.host)),
+    };
+    let file = match t.path.as_str() {
+        "" | "/" => String::new(),
+        path => format!("^{}", regex::escape(path)),
+    };
+    ScopeRule {
+        protocol,
+        host,
+        port: t.port.map(|p| format!("^{p}$")).unwrap_or_default(),
+        file,
+        ..ScopeRule::new(prefix)
     }
 }
 
@@ -144,6 +290,141 @@ mod tests {
             include: include.iter().map(|p| ScopeRule::new(*p)).collect(),
             exclude: exclude.iter().map(|p| ScopeRule::new(*p)).collect(),
             advanced: false,
+        }
+    }
+
+    /// An advanced rule built from its four parts.
+    fn part_rule(protocol: ScopeProtocol, host: &str, port: &str, file: &str) -> ScopeRule {
+        ScopeRule { protocol, host: host.into(), port: port.into(), file: file.into(), ..ScopeRule::new("") }
+    }
+
+    /// An advanced scope with these include and exclude rules.
+    fn part_scope(include: Vec<ScopeRule>, exclude: Vec<ScopeRule>) -> TargetScope {
+        TargetScope { include, exclude, advanced: true }
+    }
+
+    /// Advanced rules match on protocol, host, port and file. A part the rule leaves empty
+    /// matches anything, the three patterns are regular expressions, and an exclusion still
+    /// beats every inclusion.
+    #[test]
+    fn advanced_scope_part_matching_matrix() {
+        use ScopeProtocol::{Any, Http, Https};
+        struct Case<'a> {
+            name: &'a str,
+            scope: TargetScope,
+            url: &'a str,
+            expected: bool,
+        }
+        let only_http = || part_scope(vec![part_rule(Http, "", "", "")], vec![]);
+        let only_8443 = || part_scope(vec![part_rule(Any, "", "^8443$", "")], vec![]);
+        let api_of_corp = || {
+            part_scope(
+                vec![part_rule(Https, r"^([a-z]+\.)?corp\.test$", "", "^/api/")],
+                vec![part_rule(Any, "", "", "^/api/internal")],
+            )
+        };
+
+        let cases = [
+            // protocol
+            Case { name: "an HTTP rule takes a plaintext address", scope: only_http(), url: "http://example.com/", expected: true },
+            Case { name: "and turns away an encrypted one", scope: only_http(), url: "https://example.com/", expected: false },
+            Case { name: "an address with no scheme of its own cannot contradict it", scope: only_http(), url: "example.com", expected: true },
+            Case { name: "Any takes either", scope: part_scope(vec![part_rule(Any, "^example\\.com$", "", "")], vec![]), url: "https://example.com/", expected: true },
+            // port, as digits rather than text
+            Case { name: "a port rule matches the port named", scope: only_8443(), url: "https://a.test:8443/x", expected: true },
+            Case { name: "and not the scheme's default", scope: only_8443(), url: "https://a.test/x", expected: false },
+            Case { name: "nor a port it merely ends with", scope: only_8443(), url: "https://a.test:18443/x", expected: false },
+            Case { name: "a plaintext default port is 80", scope: part_scope(vec![part_rule(Any, "", "^80$", "")], vec![]), url: "http://a.test/", expected: true },
+            // host
+            Case { name: "a host pattern matches the host", scope: api_of_corp(), url: "https://corp.test/api/orders", expected: true },
+            Case { name: "and a subdomain the pattern allows for", scope: api_of_corp(), url: "https://shop.corp.test/api/orders", expected: true },
+            Case { name: "but not a lookalike domain", scope: api_of_corp(), url: "https://corp.test.evil.net/api/orders", expected: false },
+            // file: the path and its query together
+            Case { name: "a file pattern matches the path", scope: api_of_corp(), url: "https://corp.test/api/orders?page=2", expected: true },
+            Case { name: "and turns away a path it does not cover", scope: api_of_corp(), url: "https://corp.test/admin", expected: false },
+            Case { name: "a query-only pattern reaches the query", scope: part_scope(vec![part_rule(Any, "", "", r"\?page=")], vec![]), url: "https://a.test/x?page=2", expected: true },
+            // exclusions win
+            Case { name: "an exclusion beats the include that matched", scope: api_of_corp(), url: "https://corp.test/api/internal/keys", expected: false },
+            Case { name: "the protocol is checked on exclusions too", scope: part_scope(vec![], vec![part_rule(Https, "", "", "")]), url: "http://a.test/", expected: true },
+            Case { name: "and an exclusion alone leaves everything else in", scope: part_scope(vec![], vec![part_rule(Https, "", "", "")]), url: "https://a.test/", expected: false },
+            // a rule naming no part at all
+            Case { name: "an empty advanced rule leaves the scope open", scope: part_scope(vec![part_rule(Any, "", "", "")], vec![]), url: "https://anything.test/", expected: true },
+            // a pattern that will not compile matches nothing, rather than panicking
+            Case { name: "a broken include pattern includes nothing", scope: part_scope(vec![part_rule(Any, "^(unclosed", "", "")], vec![]), url: "https://a.test/", expected: false },
+            Case { name: "a broken exclude pattern excludes nothing", scope: part_scope(vec![], vec![part_rule(Any, "^(unclosed", "", "")]), url: "https://a.test/", expected: true },
+            // a disabled rule is not a rule
+            Case {
+                name: "a disabled include rule leaves the scope open",
+                scope: part_scope(vec![ScopeRule { enabled: false, ..part_rule(Https, "^corp\\.test$", "", "") }], vec![]),
+                url: "https://elsewhere.test/",
+                expected: true,
+            },
+        ];
+
+        assert_table!(cases, |idx, Case { name, scope, url, expected }| {
+            assert_eq!(scope.is_in_scope(url), expected, "case #{idx} ({name}): {url}");
+        });
+    }
+
+    /// A scope written by a version that had no parts still works: its rules match the way
+    /// they did, as one expression over the whole URL, and simple rules are untouched.
+    #[test]
+    fn scopes_from_earlier_versions_still_match_as_they_did_matrix() {
+        let old_advanced = r#"{"include":[{"enabled":true,"prefix":"^https://[a-z]+\\.corp\\.test/"}],
+            "exclude":[{"enabled":true,"prefix":"/logout"}],"advanced":true}"#;
+        let old_simple = r#"{"include":[{"enabled":true,"prefix":"https://a.test/","subdomains":true}],"exclude":[]}"#;
+
+        let cases: [(&str, &str, &str, bool); 7] = [
+            ("the whole-URL expression still includes", old_advanced, "https://shop.corp.test/orders", true),
+            ("and still turns away what it never matched", old_advanced, "https://other.test/orders", false),
+            ("its exclusion still wins", old_advanced, "https://shop.corp.test/logout", false),
+            ("a simple rule is unaffected", old_simple, "https://a.test/x", true),
+            ("including its subdomains flag", old_simple, "https://www.a.test/x", true),
+            ("and what it leaves out", old_simple, "https://b.test/x", false),
+            ("a rule stored without the new fields reads as an empty one", old_simple, "https://a.test/", true),
+        ];
+        assert_table!(cases, |idx, (what, raw_json, url, expected)| {
+            let scope: TargetScope = serde_json::from_str(raw_json).unwrap();
+            assert_eq!(scope.is_in_scope(url), expected, "case #{idx} ({what})");
+        });
+
+        // the fields a rule gains default, and a rule round-trips through the project file
+        let rule: ScopeRule = serde_json::from_str(r#"{"enabled":true,"prefix":"a.test"}"#).unwrap();
+        assert_eq!((rule.protocol, rule.host.as_str(), rule.port.as_str(), rule.file.as_str()), (ScopeProtocol::Any, "", "", ""));
+        assert!(!rule.has_parts(), "so it is matched on its prefix, not as four empty patterns");
+        let back: ScopeRule = serde_json::from_str(&serde_json::to_string(&part_rule(ScopeProtocol::Https, "^a$", "^443$", "^/x")).unwrap()).unwrap();
+        assert_eq!(back, part_rule(ScopeProtocol::Https, "^a$", "^443$", "^/x"));
+    }
+
+    /// "Add host to scope" has to mean the same thing in either mode, so the rule it leaves
+    /// behind carries both the prefix and the parts read out of it.
+    #[test]
+    fn a_scope_action_fills_in_both_ways_of_matching_matrix() {
+        let cases: [(&str, &str, &str, bool); 8] = [
+            ("the host it was given", "https://shop.test", "https://shop.test/cart", true),
+            ("not another host", "https://shop.test", "https://other.test/cart", false),
+            ("not a lookalike of it", "https://shop.test", "https://shop.test.evil.net/", false),
+            ("the protocol it was given", "https://shop.test", "http://shop.test/cart", false),
+            ("a port it was given", "http://127.0.0.1:8080", "http://127.0.0.1:8080/x", true),
+            ("and not another port", "http://127.0.0.1:8080", "http://127.0.0.1:9090/x", false),
+            ("a path prefix it was given", "https://shop.test/api", "https://shop.test/api/orders", true),
+            ("and not a path outside it", "https://shop.test/api", "https://shop.test/admin", false),
+        ];
+        assert_table!(cases, |idx, (what, added, url, expected)| {
+            for advanced in [false, true] {
+                let mut s = TargetScope { advanced, ..TargetScope::default() };
+                s.add(added);
+                assert_eq!(s.is_in_scope(url), expected, "case #{idx} ({what}), advanced {advanced}");
+            }
+        });
+
+        // a domain rule covers the domain and its subdomains in both modes
+        for advanced in [false, true] {
+            let mut s = TargetScope { advanced, ..TargetScope::default() };
+            s.add("*.corp.test");
+            assert!(s.is_in_scope("https://shop.corp.test/"), "subdomain, advanced {advanced}");
+            assert!(s.is_in_scope("https://corp.test/"), "the domain itself, advanced {advanced}");
+            assert!(!s.is_in_scope("https://corp.test.evil.net/"), "a lookalike, advanced {advanced}");
         }
     }
 
