@@ -332,6 +332,10 @@ pub struct App {
     pub site_map: crate::target::SiteMap,
     /// How many history entries have already been filed into `site_map`.
     pub site_map_cursor: usize,
+    /// Site map filter bar: show only what the target scope covers.
+    pub site_map_scope_only: bool,
+    /// Site map filter bar: plain-text search over node names and URLs.
+    pub site_map_search: String,
     /// The site map node (its `full_url`) whose requests are shown, if any.
     pub target_selected_node: Option<String>,
     /// The history id open in the site map's request/response viewer, if any.
@@ -573,6 +577,8 @@ impl App {
             target_scope: crate::scope::TargetScope::default(),
             site_map: crate::target::SiteMap::default(),
             site_map_cursor: 0,
+            site_map_scope_only: false,
+            site_map_search: String::new(),
             target_selected_node: None,
             target_selected_history_id: None,
             scope_sel: None,

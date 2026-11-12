@@ -78,19 +78,26 @@ fn apply_node_action(app: &mut App, all: &[std::sync::Arc<crate::http::HttpEntry
 }
 
 /// One tree node and its subtree. Branches are `CollapsingHeader`s; leaves are selectable rows.
-/// Out-of-scope nodes are dimmed. Clicking a node selects its branch for the right pane.
+/// Out-of-scope nodes are dimmed, or left out altogether when the filter bar says so. Clicking
+/// a node selects its branch for the right pane.
 #[allow(clippy::too_many_arguments)]
 fn draw_node(
     ui: &mut Ui,
     p: &Palette,
     node: &SiteMapNode,
-    scope: &crate::scope::TargetScope,
+    filter: crate::target::SiteMapFilter<'_>,
     selected: &Option<String>,
     default_open: bool,
     pick: &mut Option<String>,
     menu: &mut Option<NodeAction>,
 ) {
-    let col = if scope.is_in_scope(&node.full_url) { p.strong } else { p.disabled };
+    if !filter.keeps(node) {
+        return;
+    }
+    // everything under a node that matched the search text is shown, so searching for a host
+    // does not then hide that host's own paths
+    let below = if filter.hits(node) { filter.below_a_match() } else { filter };
+    let col = if filter.scope.is_in_scope(&node.full_url) { p.strong } else { p.disabled };
     let is_sel = selected.as_deref() == Some(node.full_url.as_str());
     let label = RichText::new(&node.name).size(12.5).color(col).monospace();
     if node.children.is_empty() {
@@ -109,7 +116,7 @@ fn draw_node(
             .default_open(default_open)
             .show(ui, |ui| {
                 for child in node.children.values() {
-                    draw_node(ui, p, child, scope, selected, false, pick, menu);
+                    draw_node(ui, p, child, below, selected, false, pick, menu);
                 }
             });
         if header.header_response.clicked() {
@@ -123,6 +130,40 @@ fn draw_node(
     }
 }
 
+/// The site map's filter bar: a search box with a clear button, and a "Scope only" toggle.
+/// Both narrow the tree and the requests listed beside it; neither touches what has been
+/// recorded, and folders keep whatever expansion state they had.
+fn filter_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
+    egui::Frame::new().fill(p.header).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add(
+                egui::TextEdit::singleline(&mut app.site_map_search)
+                    .id_salt("site_map_search")
+                    .hint_text("Filter site map...")
+                    .desired_width(230.0),
+            )
+            .on_hover_text("Matches a host or path segment, and the full address, ignoring case");
+            if ui
+                .add_enabled(!app.site_map_search.is_empty(), egui::Button::new("×").frame(false))
+                .on_hover_text("Clear the filter")
+                .clicked()
+            {
+                app.site_map_search.clear();
+            }
+            ui.separator();
+            if theme::pill(ui, p, "Scope only", app.site_map_scope_only)
+                .on_hover_text("Hide hosts and folders with nothing inside Target > Scope under them")
+                .clicked()
+            {
+                app.site_map_scope_only = !app.site_map_scope_only;
+            }
+        });
+    });
+    ui.add_space(4.0);
+}
+
 /// Site map request columns, as (minimum width, share of the spare width): #, Time, Method,
 /// Host, Path, Status code, Length. Path takes the slack; below these minimums the table
 /// scrolls sideways instead of cutting the last columns off. Status code is as wide as it is
@@ -134,6 +175,12 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
     let all = app.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut pick_node: Option<String> = None;
     let mut menu: Option<NodeAction> = None;
+
+    filter_bar(app, ui, p);
+    // the panels below take `app` mutably, so the filter reads from copies taken here; the
+    // rules are a handful of short strings, beside the history snapshot already cloned above
+    let (scope, query) = (app.target_scope.clone(), app.site_map_search.clone());
+    let filter = crate::target::SiteMapFilter { scope: &scope, scope_only: app.site_map_scope_only, query: &query };
 
     // the tree gives way as the window narrows: it keeps at most 60% of whatever width there
     // is, so the requests beside it always have room, and the splitter cannot be dragged past
@@ -153,8 +200,12 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                 if app.site_map.roots.is_empty() {
                     ui.label(RichText::new("No requests recorded yet.").size(12.0).color(p.disabled));
                 }
+                let shown = app.site_map.roots.values().filter(|r| filter.keeps(r)).count();
                 for root in app.site_map.roots.values() {
-                    draw_node(ui, p, root, &app.target_scope, &app.target_selected_node, true, &mut pick_node, &mut menu);
+                    draw_node(ui, p, root, filter, &app.target_selected_node, true, &mut pick_node, &mut menu);
+                }
+                if shown == 0 && !app.site_map.roots.is_empty() {
+                    ui.label(RichText::new("Nothing here matches the filter.").size(12.0).color(p.disabled));
                 }
             });
         });
@@ -166,8 +217,12 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
             .as_ref()
             .map(|n| app.site_map.collect_history_ids(n))
             .unwrap_or_default();
-        let rows: Vec<std::sync::Arc<crate::http::HttpEntry>> =
-            ids.iter().filter_map(|id| all.iter().find(|e| e.id == *id)).cloned().collect();
+        let rows: Vec<std::sync::Arc<crate::http::HttpEntry>> = ids
+            .iter()
+            .filter_map(|id| all.iter().find(|e| e.id == *id))
+            .filter(|e| filter.keeps_url(&actions::entry_url(e)))
+            .cloned()
+            .collect();
 
         // the detail viewer for the selected row, pinned to the bottom
         let detail = app
