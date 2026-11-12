@@ -377,7 +377,7 @@ pub struct App {
     pub int_sort: crate::intruder::IntruderSort,
 
     // sequencer
-    /// Capture / Analysis sub-tab.
+    /// Which sub-tab is showing: 0 Capture, 1 Manual load, 2 Analysis.
     pub seq_sub: u8,
     /// The raw request sent repeatedly to collect tokens, and its origin for sending.
     pub seq_template: String,
@@ -388,6 +388,8 @@ pub struct App {
     pub seq_samples: Vec<String>,
     pub seq_running: bool,
     pub seq_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// "Manual load": the pasted or loaded text waiting to be read as tokens.
+    pub seq_paste: String,
     /// Status line under the capture controls (last miss, or an error).
     pub seq_message: String,
     pub seq_analysis: Option<crate::sequencer::SequencerAnalysis>,
@@ -612,6 +614,7 @@ impl App {
             seq_samples: Vec::new(),
             seq_running: false,
             seq_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seq_paste: String::new(),
             seq_message: String::new(),
             seq_analysis: None,
             dec_blocks: vec![DecBlock { text: String::new(), hex: false, label: None, color: Color32::TRANSPARENT }],

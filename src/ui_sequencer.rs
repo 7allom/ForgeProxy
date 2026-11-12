@@ -1,6 +1,7 @@
-//! Sequencer: two tabs. "Capture" sends a request repeatedly and collects a token from each
-//! response; "Analysis" scores how random the collected tokens are. The statistics engine and
-//! the detailed FIPS report are in [`crate::sequencer`].
+//! Sequencer: three tabs. "Capture" sends a request repeatedly and collects a token from each
+//! response, "Manual load" takes tokens pasted in or read from a file instead, and "Analysis"
+//! scores how random the collected tokens are. Both ways of collecting fill the same sample
+//! buffer. The statistics engine and the detailed FIPS report are in [`crate::sequencer`].
 
 use crate::editor;
 use crate::sequencer::{self, TokenFormat, TokenLocation};
@@ -10,15 +11,114 @@ use crate::ui_core::sub_tabs;
 use eframe::egui;
 use egui::{FontId, RichText, Ui};
 
+/// The sub-tabs, in the order they are shown; `App::seq_sub` is an index into this.
+const TABS: [&str; 3] = ["Capture", "Manual load", "Analysis"];
+const TAB_MANUAL: u8 = 1;
+const TAB_ANALYSIS: u8 = 2;
+
 pub fn sequencer(app: &mut App, ui: &mut Ui, p: &Palette) {
-    sub_tabs(ui, p, &["Capture", "Analysis"], &mut app.seq_sub);
+    sub_tabs(ui, p, &TABS, &mut app.seq_sub);
     ui.add_space(8.0);
-    if app.seq_sub == 1 {
-        analysis(app, ui, p);
-    } else {
-        capture(app, ui, p);
+    match app.seq_sub {
+        TAB_MANUAL => manual_load(app, ui, p),
+        TAB_ANALYSIS => analysis(app, ui, p),
+        _ => capture(app, ui, p),
     }
 }
+/// "Manual load": tokens pasted in or read from a file, rather than captured from a live
+/// target. They go into the same sample buffer a capture fills, so the format detection and
+/// the statistics that follow are the same either way.
+fn manual_load(app: &mut App, ui: &mut Ui, p: &Palette) {
+    theme::section_title(ui, p, "Manual load", "Paste tokens here, one per line, or load them from a text file. Blank lines and surrounding whitespace are ignored. Loading them replaces or adds to the sample that Analysis works on.");
+    ui.add_space(6.0);
+
+    let running = app.seq_running;
+    if running {
+        ui.label(RichText::new("A capture is running; stop it before loading tokens by hand.").size(12.0).color(p.high));
+        ui.add_space(4.0);
+    }
+
+    ui.horizontal(|ui| {
+        if theme::plain_button(ui, p, "Load from file...", !running).on_hover_text("Read a text file with one token per line").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Text", &["txt"])
+                .add_filter("All files", &["*"])
+                .pick_file()
+            {
+                app.seq_message = match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let found = sequencer::tokens_from_text(&text).len();
+                        if !app.seq_paste.is_empty() && !app.seq_paste.ends_with('\n') {
+                            app.seq_paste.push('\n');
+                        }
+                        app.seq_paste.push_str(&text);
+                        format!("Read {found} tokens from {}", path.display())
+                    }
+                    Err(e) => format!("Couldn't read {}: {e}", path.display()),
+                };
+            }
+        }
+        if theme::plain_button(ui, p, "Clear", !app.seq_paste.is_empty()).on_hover_text("Empty the box below; the sample itself is left alone").clicked() {
+            app.seq_paste.clear();
+            app.seq_message.clear();
+        }
+        // what the box holds right now, counted the way the tokens will be read
+        let found = sequencer::tokens_from_text(&app.seq_paste).len();
+        ui.label(RichText::new(match found {
+            0 => "No tokens yet".to_string(),
+            1 => "1 token".to_string(),
+            n => format!("{n} tokens"),
+        }).size(12.0).color(if found == 0 { p.disabled } else { p.text }));
+        if found >= sequencer::MAX_TOKENS {
+            ui.label(RichText::new(format!("(the first {} are used)", sequencer::MAX_TOKENS)).size(12.0).color(p.disabled));
+        }
+    });
+
+    ui.add_space(6.0);
+    // the box fills what is left above the buttons, and scrolls once the text outgrows it
+    let box_height = (ui.available_height() - 46.0).max(60.0);
+    egui::ScrollArea::vertical().id_salt("seq_paste").max_height(box_height).auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_enabled(
+            !running,
+            egui::TextEdit::multiline(&mut app.seq_paste)
+                .id_salt("seq_paste_box")
+                .font(FontId::monospace(12.5))
+                .desired_width(f32::INFINITY)
+                .desired_rows(12)
+                .hint_text("One token per line"),
+        );
+    });
+
+    ui.add_space(6.0);
+    let found = sequencer::tokens_from_text(&app.seq_paste);
+    let have = !found.is_empty() && !running;
+    ui.horizontal(|ui| {
+        let analyse = ui.add_enabled_ui(have, |ui| theme::primary_button(ui, p, "Analyse now")).inner;
+        if analyse.on_hover_text("Replace the sample with these tokens, analyse them and show the result").clicked() {
+            app.seq_samples = found.clone();
+            app.seq_analysis = sequencer::analyze_tokens_with_format(&app.seq_samples, app.seq_format);
+            app.seq_message = format!("Analysed {} tokens", app.seq_samples.len());
+            app.seq_sub = TAB_ANALYSIS;
+        }
+        if theme::plain_button(ui, p, "Append to sample", have).on_hover_text("Add these tokens to the ones already collected").clicked() {
+            let before = app.seq_samples.len();
+            app.seq_samples.extend(found.iter().cloned());
+            app.seq_samples.truncate(sequencer::MAX_TOKENS);
+            let added = app.seq_samples.len() - before;
+            app.seq_analysis = sequencer::analyze_tokens_with_format(&app.seq_samples, app.seq_format);
+            app.seq_message = format!("Added {added} tokens; the sample now holds {}", app.seq_samples.len());
+        }
+        ui.label(RichText::new(format!("Sample: {} tokens", app.seq_samples.len())).size(12.0).color(p.disabled));
+        if app.seq_samples.len() < sequencer::MIN_TOKENS {
+            ui.label(RichText::new(format!("(the statistics need {} to be worth reading)", sequencer::MIN_TOKENS)).size(12.0).color(p.disabled));
+        }
+    });
+    if !app.seq_message.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(&app.seq_message).size(12.0).color(p.text));
+    }
+}
+
 
 fn capture(app: &mut App, ui: &mut Ui, p: &Palette) {
     theme::section_title(ui, p, "Live capture request", "Send a request here from HTTP history, the site map or Repeater (\"Send to Sequencer\"), then edit it directly below — strip cookies or adjust headers before capturing. It is sent repeatedly and a token is taken from each response.");

@@ -106,6 +106,20 @@ impl TokenFormat {
     }
 }
 
+/// Tokens read from pasted or loaded text: one per line, whitespace trimmed off each, blank
+/// lines dropped, and no more of them than a capture is allowed to collect. The result goes
+/// into the same sample buffer a live capture fills, so everything downstream -- format
+/// detection, the statistics and the bit-level report -- is the same code either way.
+pub fn tokens_from_text(text: &str) -> Vec<String> {
+    // `lines` splits on \n and takes \r\n with it, so both line endings arrive clean
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .take(MAX_TOKENS)
+        .collect()
+}
+
 /// Structured randomness statistics over a set of captured tokens: lengths, Shannon entropy
 /// (overall and per character position) and the FIPS monobit ratio. The detailed FIPS
 /// bit-level report is [`analyse`].
@@ -511,6 +525,71 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Text pasted in or read from a file becomes one token per line: whitespace around a
+    /// token is dropped, blank lines are not tokens, and both line endings are understood.
+    #[test]
+    fn tokens_read_from_text_matrix() {
+        let cases: [(&str, &str, Vec<&str>); 10] = [
+            ("one per line", "a1b2\nc3d4\ne5f6", vec!["a1b2", "c3d4", "e5f6"]),
+            ("blank lines are skipped", "a1b2\n\n\nc3d4\n", vec!["a1b2", "c3d4"]),
+            ("lines of whitespace are blank too", "a1b2\n   \n\t\nc3d4", vec!["a1b2", "c3d4"]),
+            ("whitespace around a token comes off", "  a1b2  \n\tc3d4\t", vec!["a1b2", "c3d4"]),
+            ("carriage returns come off with it", "a1b2\r\nc3d4\r\n", vec!["a1b2", "c3d4"]),
+            ("a file with no closing newline", "a1b2\nc3d4", vec!["a1b2", "c3d4"]),
+            ("a single token", "a1b2", vec!["a1b2"]),
+            ("nothing but blank lines", "\n\n  \n", vec![]),
+            ("an empty box", "", vec![]),
+            // a token is a line, so spaces inside one are kept as written
+            ("spaces inside a token are part of it", "a1 b2\nc3d4", vec!["a1 b2", "c3d4"]),
+        ];
+        assert_table!(cases, |idx, (what, text, expected)| {
+            assert_eq!(tokens_from_text(text), expected, "case #{idx} ({what})");
+        });
+
+        // no more than a capture is allowed to collect
+        let too_many = (0..MAX_TOKENS + 50).map(|i| format!("t{i}")).collect::<Vec<_>>().join("\n");
+        let read = tokens_from_text(&too_many);
+        assert_eq!(read.len(), MAX_TOKENS, "the sample is capped");
+        assert_eq!(read[0], "t0", "and taken from the top");
+    }
+
+    /// Tokens loaded by hand go through the same analysis a capture's do: the format is
+    /// detected the same way and the statistics come out the same, so where the sample came
+    /// from makes no difference to what Analysis reports.
+    #[test]
+    fn loaded_tokens_analyse_as_captured_ones_do_matrix() {
+        const HEX_16: &[u8] = b"0123456789abcdef";
+        let captured = prng_tokens(200, 32, HEX_16, 0x2545F4914F6CDD1D);
+        // the same tokens as a user would paste them, with stray blank lines and indentation
+        let pasted = captured.iter().map(|t| format!("  {t}  ")).collect::<Vec<_>>().join("\n\n");
+
+        let loaded = tokens_from_text(&pasted);
+        assert_eq!(loaded, captured, "the sample is the tokens themselves, cleanly");
+
+        let from_capture = analyze_tokens_with_format(&captured, TokenFormat::Auto).expect("captured tokens analyse");
+        let from_paste = analyze_tokens_with_format(&loaded, TokenFormat::Auto).expect("loaded tokens analyse");
+        assert_eq!(from_paste, from_capture, "and analysing it gives the same answer");
+
+        // and that answer is a real reading, not an empty shell
+        assert_eq!(from_paste.sample_count, 200);
+        assert_eq!((from_paste.min_len, from_paste.max_len), (32, 32));
+        assert_eq!(from_paste.detected_format, TokenFormat::Hex, "hex is recognised, as it is for a capture");
+        assert!(from_paste.fips_applicable, "so the bit-level checks apply");
+        assert!(from_paste.overall_entropy > 3.5, "entropy near the 4 bits per hex character: {}", from_paste.overall_entropy);
+        assert!(from_paste.overall_entropy <= from_paste.max_possible_entropy);
+        assert_eq!(from_paste.per_char_entropy.len(), 32, "one reading per character position");
+        assert!((0.4..0.6).contains(&from_paste.monobit_ratio), "ones and zeros roughly even: {}", from_paste.monobit_ratio);
+        assert_eq!(from_paste.char_distribution.len(), 16, "every hex character turned up");
+
+        // the detailed report reads the sample too, once it is long enough to be worth it
+        assert!(loaded.len() >= MIN_TOKENS);
+        let report = analyse_with_format(&loaded, TokenFormat::Auto);
+        assert!(report.contains("200"), "the report counts the loaded tokens: {report}");
+
+        // text holding no tokens leaves nothing to analyse, rather than a bogus reading
+        assert_eq!(analyze_tokens_with_format(&tokens_from_text("\n  \n"), TokenFormat::Auto), None);
     }
 
     #[test]

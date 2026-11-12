@@ -447,7 +447,12 @@ mod layout_tests {
                     ..crate::scope::ScopeRule::new("")
                 });
             }),
-            Scene("Sequencer > Analysis", |a| { a.tab = Tab::Sequencer; a.seq_sub = 1; }),
+            Scene("Sequencer > Manual load", |a| {
+                a.tab = Tab::Sequencer;
+                a.seq_sub = 1;
+                a.seq_paste = "a1b2\n\nc3d4\n".into();
+            }),
+            Scene("Sequencer > Analysis", |a| { a.tab = Tab::Sequencer; a.seq_sub = 2; }),
             Scene("the Intruder attack window", |a| { a.tab = Tab::Intruder; a.show_attack = true; }),
             Scene("the settings window", |a| a.show_settings = true),
             Scene("the command palette", |a| a.show_palette = true),
