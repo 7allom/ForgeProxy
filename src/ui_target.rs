@@ -454,6 +454,15 @@ mod layout_tests {
             }),
             Scene("Sequencer > Analysis", |a| { a.tab = Tab::Sequencer; a.seq_sub = 2; }),
             Scene("the Intruder attack window", |a| { a.tab = Tab::Intruder; a.show_attack = true; }),
+            Scene("the comparison window", |a| {
+                a.tab = Tab::Comparer;
+                let item = |id: usize, text: &str| crate::comparer::ComparerItem::from_text(id, format!("Item {id}"), text);
+                a.comparer_active_diff = Some(crate::comparer::DiffView::new(
+                    item(1, "{\"id\": 101}"),
+                    item(2, "{\"id\": 102, \"debug\": 1}"),
+                    crate::comparer::DiffMode::Bytes,
+                ));
+            }),
             Scene("the settings window", |a| a.show_settings = true),
             Scene("the command palette", |a| a.show_palette = true),
         ];

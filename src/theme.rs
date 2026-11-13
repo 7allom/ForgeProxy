@@ -545,12 +545,180 @@ pub fn columns<R>(ui: &mut Ui, count: usize, add: impl FnOnce(&mut [Ui]) -> R) -
     let count = count.max(1);
     let needed = MIN_COLUMN * count as f32 + ui.spacing().item_spacing.x * (count as f32 - 1.0);
     if ui.available_width() >= needed {
-        return ui.columns(count, add);
+        return ui.columns(count, |columns| {
+            // a column is whatever width it was handed: nothing inside one may decide that
+            // the window has to stay wider than it is
+            for column in columns.iter_mut() {
+                column.set_min_width(0.0);
+            }
+            add(columns)
+        });
     }
     egui::ScrollArea::horizontal().show(ui, |ui| {
         ui.set_max_width(needed);
         ui.columns(count, add)
     }).inner
+}
+
+/// Space left around a resizable window when it first opens, so no border of it is flush
+/// against the edge of the screen and every one can be taken hold of.
+const WINDOW_MARGIN: f32 = 48.0;
+/// The smallest a resizable window's contents may be squeezed to. Small enough that the
+/// window is never held open by what is inside it.
+const WINDOW_MIN: egui::Vec2 = egui::vec2(360.0, 240.0);
+/// Kept clear between the largest a window may grow to and the edge of the screen.
+const WINDOW_SLACK: f32 = 16.0;
+
+/// What a window adds around the area its contents are given: the frame's margins and
+/// outline, and across the top the title bar and the hairline under it.
+///
+/// Every bound a window is given -- the minimum, the maximum -- applies to its contents, and
+/// the chrome is added outside them. egui works this sum out for itself when it caps a window
+/// to the screen, but leaves the frame's margins out of that one, so a window held back by
+/// egui's cap alone still comes out a little larger than the display it is on. Taking the
+/// chrome off here is what keeps the whole of the window inside the screen.
+///
+/// It is measured from the window itself, by [`show_resizable_window`], since only the window
+/// knows how tall its own title bar came out. Until it has been drawn once, a deliberate
+/// over-estimate stands in: a window a few pixels smaller than it could be, and never one too
+/// large to fit.
+fn window_chrome(ctx: &egui::Context, id: egui::Id) -> egui::Vec2 {
+    ctx.data(|d| d.get_temp(chrome_id(id))).unwrap_or_else(|| {
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        // a row of text in the frame's margins, with the frame's hairline under it
+        let title_bar = style.spacing.interact_size.y.max(24.0) + frame.inner_margin.sum().y + frame.stroke.width;
+        frame.total_margin().sum() + egui::vec2(0.0, title_bar)
+    })
+}
+
+/// Where a window's measured chrome is kept between frames.
+fn chrome_id(id: egui::Id) -> egui::Id {
+    id.with("window_chrome")
+}
+
+/// The smallest the contents of a resizable window may be on this screen.
+fn window_min(ctx: &egui::Context) -> egui::Vec2 {
+    // never negative: a window can be asked for on a screen smaller than the margins
+    let room = (ctx.screen_rect().size() - egui::Vec2::splat(WINDOW_MARGIN * 2.0)).max(egui::Vec2::splat(80.0));
+    WINDOW_MIN.min(room)
+}
+
+/// A floating window the user can resize, with bounds worked out from the screen it opens on:
+/// about 85% of it, centred, leaving a margin on every side so all four resize borders are on
+/// screen and can be taken hold of. The minimum is small and does not depend on what is inside,
+/// so dragging the left or top border shrinks the window instead of pushing it sideways. The
+/// maximum is the screen less the chrome and a hair, worked out again on every frame, so no
+/// sequence of drags can leave a window larger than the display it is on.
+///
+/// No anchor is set, on purpose. An anchor pins one corner every frame, so dragging the
+/// opposite border moves the whole window rather than resizing it. `constrain` takes its
+/// place: it keeps the window inside the screen, and egui also uses it to cap a window that
+/// was left larger than the screen it now opens on, which is what brings a window saved on a
+/// bigger display back into view.
+pub fn resizable_window<'a>(ctx: &egui::Context, id: egui::Id, title: impl Into<egui::WidgetText>) -> egui::Window<'a> {
+    let screen = ctx.screen_rect();
+    let min = window_min(ctx);
+    let room = (screen.size() - egui::Vec2::splat(WINDOW_MARGIN * 2.0)).max(egui::Vec2::splat(80.0));
+    let size = (screen.size() * 0.85).min(room);
+    // the room left for the contents once the chrome has taken its share, less a hair so the
+    // window is never flush with the edge of the screen. The floor wins on a screen too
+    // small to hold even that: a maximum below the minimum is not a size at all.
+    let max = (screen.size() - window_chrome(ctx, id) - egui::Vec2::splat(WINDOW_SLACK)).max(min);
+    egui::Window::new(title)
+        .id(id)
+        .default_rect(egui::Rect::from_center_size(screen.center(), size))
+        .min_width(min.x)
+        .min_height(min.y)
+        .max_width(max.x)
+        .max_height(max.y)
+        .resizable(true)
+        .constrain(true)
+}
+
+/// Show a window built by [`resizable_window`], keeping the far border still when the near
+/// one is dragged past a size the window cannot be drawn at.
+///
+/// A border drag puts the dragged edge under the pointer and leaves the opposite one where it
+/// is, which is right for as long as the size between them is one the window can take. Once
+/// it is not -- smaller than the window can shrink to, or larger than the screen allows --
+/// the size stops following the pointer and the position does not: egui puts the near edge
+/// under the pointer anyway, the far edge travels with it, and the window walks off across
+/// the screen. Dragging the near border inwards walks the far one out of the far side of the
+/// screen; carrying on outwards walks the near one off its own side, title bar and all.
+///
+/// So on those frames the window is held where it stood on the last frame that still resized
+/// it, and taken out of the drag for as long as the pointer stays past the border. What does
+/// the taking out is `movable`: it is what decides whether the left and top borders can be
+/// dragged at all -- the right and bottom ones stay live either way -- and, unlike the
+/// resizable flag, it belongs to the window's position and not to the state that remembers
+/// the size a drag is asking for. That state is left alone, so letting the border go, or
+/// dragging it back the other way, carries on from the size that is on screen rather than
+/// from one the window had several frames ago.
+///
+/// Where the drag has got to is worked out before the window is drawn, so there is no frame
+/// on which the window is drawn slid over and put back afterwards.
+pub fn show_resizable_window<R>(
+    ctx: &egui::Context,
+    id: egui::Id,
+    title: impl Into<egui::WidgetText>,
+    open: &mut bool,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> Option<egui::InnerResponse<Option<R>>> {
+    let previous_id = id.with("previous_rect");
+    let previous: Option<egui::Rect> = ctx.data(|d| d.get_temp(previous_id));
+    let pointer = ctx.input(|i| i.pointer.interact_pos());
+
+    // Which border the pointer has hold of. The ids are the ones egui gives a window's resize
+    // borders, and which one is being dragged is read from the pointer rather than from the
+    // borders themselves, so it is still there to be read on the frames when the near
+    // borders are not registered at all. A drag of the title bar is neither of them, and
+    // moves the whole window as it should.
+    let border = egui::Id::new(egui::LayerId::new(egui::Order::Middle, id)).with("edge_drag");
+    let dragged = ctx.dragged_id();
+    let dragging = |names: [&str; 3]| {
+        dragged.is_some_and(|held| names.iter().any(|name| held == border.with(name)))
+    };
+    let from_left = dragging(["left", "left_top", "left_bottom"]);
+    let from_top = dragging(["top", "left_top", "right_top"]);
+
+    // The smallest and largest the window is ever drawn at, chrome and all.
+    let chrome = window_chrome(ctx, id);
+    let floor = window_min(ctx) + chrome;
+    let ceiling = (ctx.screen_rect().size() - egui::Vec2::splat(WINDOW_SLACK)).max(floor);
+    // Keeping the far edge where it is, the near one can be put anywhere between the two: no
+    // closer than the floor leaves it, no further than the ceiling allows. A pointer outside
+    // that is asking for a window that cannot be drawn, so the window is held still instead.
+    let hold = previous
+        .zip(pointer)
+        .filter(|(was, at)| {
+            (from_left && (at.x < was.right() - ceiling.x || at.x > was.right() - floor.x))
+                || (from_top && (at.y < was.bottom() - ceiling.y || at.y > was.bottom() - floor.y))
+        })
+        .map(|(was, _)| was);
+
+    let mut window = resizable_window(ctx, id, title).open(open);
+    if let Some(was) = hold {
+        window = window.current_pos(was.left_top()).movable(false);
+    }
+    // what the contents took, which is what the window was drawn around: the difference
+    // between the two is the chrome, for the next frame to work its bounds out from
+    let mut content = None;
+    let shown = window.show(ctx, |ui| {
+        let inner = add(ui);
+        content = Some(ui.min_rect().size());
+        inner
+    });
+    match (shown.as_ref(), content) {
+        (Some(response), Some(content)) => ctx.data_mut(|d| {
+            let rect = response.response.rect;
+            d.insert_temp(previous_id, rect);
+            d.insert_temp(chrome_id(id), (rect.size() - content).max(egui::Vec2::ZERO));
+        }),
+        // closed, or collapsed, or faded out: nothing to measure, and nowhere it has to stay
+        _ => ctx.data_mut(|d| d.remove::<egui::Rect>(previous_id)),
+    }
+    shown
 }
 
 /// Dark well behind a table body, filling the given height and the available width.

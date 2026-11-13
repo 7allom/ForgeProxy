@@ -94,13 +94,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let search_id = egui::Id::new("settings_search");
     let mut search: String = ctx.data(|d| d.get_temp(search_id)).unwrap_or_default();
     let mut open = true;
-    egui::Window::new(bold("Settings", 14.0).color(p.strong))
-        .id(egui::Id::new("settings_window"))
-        .open(&mut open)
-        .default_size([1040.0, 640.0])
-        .min_size([760.0, 380.0])
-        .resizable(true)
-        .show(ctx, |ui| {
+    theme::show_resizable_window(ctx, egui::Id::new("settings_window"), bold("Settings", 14.0).color(p.strong), &mut open, |ui| {
             // Fixed rectangles for the two panes, then claim exactly the window's area: the
             // window keeps its size (and can be resized) instead of growing with its content.
             let rect = ui.available_rect_before_wrap();

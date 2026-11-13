@@ -595,11 +595,12 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let total = app.int_total.max(done);
     // a row's right-click choice: (history id, where to send it)
     let mut attack_pick: Option<(usize, actions::SendTo)> = None;
-    egui::Window::new(bold(format!("Intruder attack — {}", app.int_target.trim()), 14.0).color(p.strong))
-        .id(egui::Id::new("intruder_attack"))
-        .open(&mut open)
-        .default_size([880.0, 480.0])
-        .show(ctx, |ui| {
+    theme::show_resizable_window(ctx, egui::Id::new("intruder_attack"), bold(format!("Intruder attack — {}", app.int_target.trim()), 14.0).color(p.strong), &mut open, |ui| {
+            // the area the window gives its contents. The panels below lay out inside it but
+            // do not report it back, so the window would otherwise shrink to the few rows
+            // above them and open far smaller than it was asked to; claiming it at the end
+            // keeps the window the size it was given and leaves it free to be resized.
+            let window_area = ui.available_rect_before_wrap();
             ui.horizontal(|ui| {
                 let state = if app.int_running { "Running" } else if done < total { "Stopped" } else { "Finished" };
                 ui.label(bold(format!("{} attack: {state}", app.int_attack.label()), 13.0).color(p.strong));
@@ -705,6 +706,7 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
             if let Some(col) = sort_click {
                 app.int_sort.click_column(col);
             }
+            ui.allocate_rect(window_area, egui::Sense::hover());
         });
     if let Some((id, to)) = attack_pick {
         let entry = app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).cloned();

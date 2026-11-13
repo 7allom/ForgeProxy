@@ -545,3 +545,344 @@ pub fn sub_tabs(ui: &mut Ui, p: &Palette, labels: &[&str], sel: &mut u8) {
 pub fn method_color(p: &Palette, m: &str) -> Color32 {
     match m { "GET" | "OPTIONS" => p.get, "POST" => p.post, _ => p.other_method }
 }
+
+#[cfg(test)]
+mod window_tests {
+    use crate::state::{App, Tab};
+    use crate::test_utils::{assert_table, MockAppBuilder};
+    use eframe::egui;
+
+    const VIEWPORT: egui::Vec2 = egui::vec2(1400.0, 900.0);
+
+    /// Which border of a window is being dragged.
+    #[derive(Clone, Copy, Debug)]
+    enum Edge {
+        Left,
+        Right,
+        Top,
+        Bottom,
+    }
+
+    impl Edge {
+        /// A point on this border of `rect`, halfway along it.
+        fn grip(self, rect: egui::Rect) -> egui::Pos2 {
+            match self {
+                Edge::Left => egui::pos2(rect.left(), rect.center().y),
+                Edge::Right => egui::pos2(rect.right(), rect.center().y),
+                Edge::Top => egui::pos2(rect.center().x, rect.top()),
+                Edge::Bottom => egui::pos2(rect.center().x, rect.bottom()),
+            }
+        }
+
+        /// Dragging this border inwards by `d`, which shrinks the window.
+        fn inwards(self, d: f32) -> egui::Vec2 {
+            match self {
+                Edge::Left => egui::vec2(d, 0.0),
+                Edge::Right => egui::vec2(-d, 0.0),
+                Edge::Top => egui::vec2(0.0, d),
+                Edge::Bottom => egui::vec2(0.0, -d),
+            }
+        }
+    }
+
+    /// One frame of the whole app with these input events.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, VIEWPORT)),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| crate::ui_core::frame(app, ctx));
+    }
+
+    /// Where the window `id` is drawn, as of the last frame.
+    fn window_rect(ctx: &egui::Context, id: egui::Id) -> egui::Rect {
+        egui::AreaState::load(ctx, id).map(|s| s.rect()).unwrap_or_else(|| panic!("no window {id:?} on screen"))
+    }
+
+    /// Press `edge`, drag it by `delta` and let go, a frame at a time as a hand would.
+    fn drag_edge(ctx: &egui::Context, app: &mut App, id: egui::Id, edge: Edge, delta: egui::Vec2) -> egui::Rect {
+        frame(ctx, app, vec![]);
+        let from = edge.grip(window_rect(ctx, id));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(ctx, app, vec![egui::Event::PointerMoved(from)]);
+        frame(ctx, app, vec![button(from, true)]);
+        // in steps, so the drag reads as a drag rather than a jump
+        for step in 1..=4 {
+            let to = from + delta * (step as f32 / 4.0);
+            frame(ctx, app, vec![egui::Event::PointerMoved(to)]);
+        }
+        frame(ctx, app, vec![button(from + delta, false)]);
+        frame(ctx, app, vec![]);
+        window_rect(ctx, id)
+    }
+
+    /// The app with one of the resizable windows open.
+    fn app_with(window: &str) -> (egui::Context, App) {
+        let (ctx, mut app) = MockAppBuilder::new().with_light_theme(true).build_with_ctx();
+        match window {
+            "intruder_attack" => {
+                app.tab = Tab::Intruder;
+                app.show_attack = true;
+                app.int_total = 3;
+                // an attack window is only ever open with results in it
+                app.int_results = (1..=3)
+                    .map(|request| crate::state::IntResult {
+                        request,
+                        payload: format!("value-{request}"),
+                        status: "200 OK".into(),
+                        length: 128,
+                        error: String::new(),
+                        history_id: request,
+                    })
+                    .collect();
+            }
+            "comparer_diff" => {
+                app.tab = Tab::Comparer;
+                let item = |id: usize, text: &str| crate::comparer::ComparerItem::from_text(id, format!("Item {id}"), text);
+                app.comparer_active_diff = Some(crate::comparer::DiffView::new(
+                    item(1, "GET /api/v1/users HTTP/1.1\nHost: shop.internal\n\n"),
+                    item(2, "GET /api/v1/users/42?role=admin HTTP/1.1\nHost: shop.internal\n\n"),
+                    crate::comparer::DiffMode::Words,
+                ));
+            }
+            "settings_window" => app.show_settings = true,
+            other => panic!("no such window: {other}"),
+        }
+        (ctx, app)
+    }
+
+
+    /// Any border dragged all the way in, past the size the window can shrink to, and then
+    /// dragged straight back out past the edge of the screen must leave the window on the
+    /// screen at every frame of both halves of that drag -- and must still have shrunk the
+    /// window on the way in and grown it again on the way out.
+    ///
+    /// Both halves have their own way of going wrong. On the way in, the size stops following
+    /// the pointer at the window's own floor while the position carries on, so the far border
+    /// is pushed out of the far side of the screen. On the way out, a window is held back only
+    /// by a cap egui works out from the screen, and that one is the size of the contents, with
+    /// the frame's margins and the title bar still to be added outside it -- so a border
+    /// dragged past the edge of the screen leaves the window larger than the display.
+    #[test]
+    fn a_window_dragged_in_to_its_minimum_and_back_out_stays_on_screen_matrix() {
+        /// How far each step of the drag moves the pointer.
+        const STEP: f32 = 25.0;
+        /// How close to the opposite border the inward drag goes, and how far past the edge
+        /// of the screen the outward drag carries on.
+        const STOP_SHORT: f32 = 20.0;
+        const OVERSHOOT: f32 = 40.0;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, VIEWPORT);
+        let windows = ["intruder_attack", "comparer_diff", "settings_window"];
+        assert_table!(windows, |idx, name| {
+            for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
+                let (ctx, mut app) = app_with(name);
+                let id = egui::Id::new(name);
+                frame(&ctx, &mut app, vec![]);
+                let start = window_rect(&ctx, id);
+                let grip = edge.grip(start);
+                let vertical = matches!(edge, Edge::Top | Edge::Bottom);
+                // the one coordinate the drag moves along, and a pointer position on it
+                let along = |p: egui::Pos2| if vertical { p.y } else { p.x };
+                let at = |v: f32| if vertical { egui::pos2(grip.x, v) } else { egui::pos2(v, grip.y) };
+                // which way along it is inwards, towards the border opposite
+                let inwards = if matches!(edge, Edge::Left | Edge::Top) { 1.0 } else { -1.0 };
+
+                // all the way in to the opposite border, which is far past the size the
+                // window can shrink to, then all the way back out past the edge of the screen
+                let far = if inwards > 0.0 { along(start.max) } else { along(start.min) };
+                let inward_to = far - inwards * STOP_SHORT;
+                let outward_to = if inwards > 0.0 { -OVERSHOOT } else { along(screen.max) + OVERSHOOT };
+                let mut path = Vec::new();
+                let mut cursor = along(grip);
+                // a step of the drag, stopping exactly on the far end rather than past it
+                let advance = |cursor: f32, to: f32| {
+                    if (to - cursor).abs() < STEP { to } else { cursor + STEP * (to - cursor).signum() }
+                };
+                while cursor != inward_to {
+                    cursor = advance(cursor, inward_to);
+                    path.push(cursor);
+                }
+                let shrinking = path.len();
+                while cursor != outward_to {
+                    cursor = advance(cursor, outward_to);
+                    path.push(cursor);
+                }
+
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let check = |ctx: &egui::Context, what: &str| -> egui::Rect {
+                    let now = window_rect(ctx, id);
+                    let case = format!("case #{idx} ({name}, {edge:?} edge), {what}");
+                    assert!(
+                        now.width() <= screen.width(),
+                        "{case}: {}px wide on a {}px screen ({now:?})",
+                        now.width(), screen.width()
+                    );
+                    assert!(
+                        now.height() <= screen.height(),
+                        "{case}: {}px tall on a {}px screen ({now:?})",
+                        now.height(), screen.height()
+                    );
+                    assert!(
+                        screen.contains_rect(now),
+                        "{case}: the window is off the screen ({now:?} is not inside {screen:?})"
+                    );
+                    now
+                };
+                // the side the drag is pulling on, which is the one that should be changing
+                let span = |r: egui::Rect| if vertical { r.height() } else { r.width() };
+
+                frame(&ctx, &mut app, vec![egui::Event::PointerMoved(grip)]);
+                frame(&ctx, &mut app, vec![button(grip, true)]);
+                let mut shrunk = start;
+                for (step, &to) in path.iter().enumerate() {
+                    frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at(to))]);
+                    let half = if step < shrinking { "shrinking" } else { "expanding" };
+                    let now = check(&ctx, &format!("{half}, pointer at {to}"));
+                    if step + 1 == shrinking {
+                        shrunk = now;
+                    }
+                }
+                frame(&ctx, &mut app, vec![button(at(cursor), false)]);
+                check(&ctx, "the moment the border is let go");
+                frame(&ctx, &mut app, vec![]);
+                let grown = check(&ctx, "the frame after the border is let go");
+
+                // and holding the window still where a drag asks for a size it cannot be
+                // drawn at must not hold it still anywhere else: it shrank, and it grew again
+                let case = format!("case #{idx} ({name}, {edge:?} edge)");
+                assert!(
+                    span(shrunk) <= span(start) / 2.0,
+                    "{case}: dragged all the way in and still {} of its {} ({shrunk:?})",
+                    span(shrunk), span(start)
+                );
+                assert!(
+                    span(grown) >= span(shrunk) + 200.0,
+                    "{case}: dragged back out from {} and only reached {} ({grown:?})",
+                    span(shrunk), span(grown)
+                );
+            }
+        });
+    }
+
+    /// The title bar moves the whole window: both edges travel the same way and the size is
+    /// left alone. Nothing put in the way of a border drag may cost the window that.
+    #[test]
+    fn the_title_bar_still_moves_the_whole_window_matrix() {
+        let windows = ["intruder_attack", "comparer_diff", "settings_window"];
+        assert_table!(windows, |idx, name| {
+            let (ctx, mut app) = app_with(name);
+            let id = egui::Id::new(name);
+            frame(&ctx, &mut app, vec![]);
+            let before = window_rect(&ctx, id);
+            // a point on the title bar, clear of the close button and of either border
+            let grip = egui::pos2(before.center().x, before.top() + 12.0);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(&ctx, &mut app, vec![egui::Event::PointerMoved(grip)]);
+            frame(&ctx, &mut app, vec![button(grip, true)]);
+            let shift = egui::vec2(40.0, 25.0);
+            for step in 1..=4 {
+                frame(&ctx, &mut app, vec![egui::Event::PointerMoved(grip + shift * (step as f32 / 4.0))]);
+            }
+            frame(&ctx, &mut app, vec![button(grip + shift, false)]);
+            frame(&ctx, &mut app, vec![]);
+            let after = window_rect(&ctx, id);
+            assert!(
+                (after.min - before.min).length() > 20.0,
+                "case #{idx} ({name}): the window moved with the title bar ({before:?} -> {after:?})"
+            );
+            assert!(
+                (after.size() - before.size()).length() <= 1.0,
+                "case #{idx} ({name}): and kept its size ({before:?} -> {after:?})"
+            );
+        });
+    }
+
+    /// A window has to be able to shrink to its own small minimum. egui will not let a window
+    /// become narrower than the widest child that cannot scroll, so a toolbar or a pane laid
+    /// out at its natural width silently pins the window open -- and then dragging the left or
+    /// top border pushes the window sideways instead of resizing it.
+    #[test]
+    fn every_resizable_window_shrinks_to_its_own_minimum_matrix() {
+        /// What the windows are asked to shrink to, and the slack allowed for frame chrome.
+        const SMALL: egui::Vec2 = egui::vec2(380.0, 280.0);
+        const SLACK: f32 = 60.0;
+        let windows = ["intruder_attack", "comparer_diff", "settings_window"];
+        assert_table!(windows, |idx, name| {
+            let (ctx, mut app) = app_with(name);
+            let id = egui::Id::new(name);
+            frame(&ctx, &mut app, vec![]);
+            let before = window_rect(&ctx, id);
+            let narrow = drag_edge(&ctx, &mut app, id, Edge::Right, egui::vec2(SMALL.x - before.width(), 0.0));
+            assert!(
+                narrow.width() <= SMALL.x + SLACK,
+                "case #{idx} ({name}): {}px wide after being dragged in to {}px -- something inside is holding it open",
+                narrow.width(), SMALL.x
+            );
+            let short = drag_edge(&ctx, &mut app, id, Edge::Bottom, egui::vec2(0.0, SMALL.y - narrow.height()));
+            assert!(
+                short.height() <= SMALL.y + SLACK,
+                "case #{idx} ({name}): {}px tall after being dragged in to {}px",
+                short.height(), SMALL.y
+            );
+        });
+    }
+
+    /// Every resizable window has to resize from the border the pointer takes hold of, and
+    /// only from that border: dragging the right edge moves the right edge and leaves the
+    /// top-left corner where it was, and dragging the left or top edge moves that edge and
+    /// leaves the opposite corner where it was. A window pinned to a wide child widget, or
+    /// held by an anchor, fails this by sliding the whole window instead.
+    #[test]
+    fn every_resizable_window_resizes_from_the_edge_that_is_dragged_matrix() {
+        let windows = ["intruder_attack", "comparer_diff", "settings_window"];
+        assert_table!(windows, |idx, name| {
+            for edge in [Edge::Right, Edge::Bottom, Edge::Left, Edge::Top] {
+                let (ctx, mut app) = app_with(name);
+                let id = egui::Id::new(name);
+                frame(&ctx, &mut app, vec![]);
+                let before = window_rect(&ctx, id);
+                let after = drag_edge(&ctx, &mut app, id, edge, edge.inwards(60.0));
+                let what = format!("case #{idx} ({name}, {edge:?} edge)");
+                let moved = |a: f32, b: f32| (a - b).abs() > 1.0;
+                match edge {
+                    Edge::Right => {
+                        assert!(moved(after.max.x, before.max.x), "{what}: the right edge moved ({before:?} -> {after:?})");
+                        assert!(!moved(after.min.x, before.min.x), "{what}: the left edge stayed ({before:?} -> {after:?})");
+                        assert!(!moved(after.min.y, before.min.y), "{what}: the top stayed");
+                    }
+                    Edge::Left => {
+                        assert!(moved(after.min.x, before.min.x), "{what}: the left edge moved ({before:?} -> {after:?})");
+                        assert!(!moved(after.max.x, before.max.x), "{what}: the right edge stayed ({before:?} -> {after:?})");
+                        assert!(!moved(after.max.y, before.max.y), "{what}: the bottom stayed");
+                    }
+                    Edge::Top => {
+                        assert!(moved(after.min.y, before.min.y), "{what}: the top moved ({before:?} -> {after:?})");
+                        assert!(!moved(after.max.y, before.max.y), "{what}: the bottom stayed ({before:?} -> {after:?})");
+                        assert!(!moved(after.max.x, before.max.x), "{what}: the right edge stayed");
+                    }
+                    Edge::Bottom => {
+                        assert!(moved(after.max.y, before.max.y), "{what}: the bottom moved ({before:?} -> {after:?})");
+                        assert!(!moved(after.min.y, before.min.y), "{what}: the top stayed ({before:?} -> {after:?})");
+                        assert!(!moved(after.min.x, before.min.x), "{what}: the left edge stayed");
+                    }
+                }
+            }
+        });
+    }
+}

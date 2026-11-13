@@ -133,6 +133,17 @@ struct PaneStyle<'a> {
     on_color: Color32,
 }
 
+/// An item's label with its size, unless the label already ends with it: a manual item is
+/// named "Manual item (142 bytes)" when it is created, and saying so twice reads as a bug.
+fn labelled(label: &str, length: usize) -> String {
+    let size = format!("({length} bytes)");
+    if label.trim_end().ends_with(&size) {
+        label.to_string()
+    } else {
+        format!("{label} {size}")
+    }
+}
+
 /// The comparison window: summary bar, mode switch, difference navigation and the two panes.
 pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let theme = app.eff().theme;
@@ -144,12 +155,7 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let (colors, on_color) = diff_colors(theme);
     let mut open = true;
     let title = match view.mode { DiffMode::Words => "Word comparison", DiffMode::Bytes => "Byte comparison" };
-    egui::Window::new(bold(format!("Comparer: {title}"), 14.0).color(p.strong))
-        .id(egui::Id::new("comparer_diff"))
-        .open(&mut open)
-        .default_size([1100.0, 620.0])
-        .min_size([600.0, 300.0])
-        .show(ctx, |ui| {
+    theme::show_resizable_window(ctx, egui::Id::new("comparer_diff"), bold(format!("Comparer: {title}"), 14.0).color(p.strong), &mut open, |ui| {
             // one row height for the whole window: every row -- content, modified or filler,
             // text or line number, in either pane -- is exactly this tall
             let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -161,14 +167,19 @@ pub fn diff_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
             // the height left for them is known
             let mut centre_on: Option<f32> = None;
             // summary bar
+            // truncating labels: an item with a long name shortens instead of holding the
+            // window open at the width of its own name
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("A:").color(p.disabled));
-                ui.label(RichText::new(format!("{} ({} bytes)", view.a.label, view.a.length)).color(p.strong));
+                ui.add(egui::Label::new(RichText::new(labelled(&view.a.label, view.a.length)).color(p.strong)).truncate());
                 ui.add_space(10.0);
                 ui.label(RichText::new("B:").color(p.disabled));
-                ui.label(RichText::new(format!("{} ({} bytes)", view.b.label, view.b.length)).color(p.strong));
+                ui.add(egui::Label::new(RichText::new(labelled(&view.b.label, view.b.length)).color(p.strong)).truncate());
             });
-            ui.horizontal(|ui| {
+            // wrapped, so the strip folds onto a second line in a narrow window instead of
+            // running under the legend on the right -- and so it can never be what decides
+            // how narrow the window is allowed to get
+            ui.horizontal_wrapped(|ui| {
                 for (mode, label) in [(DiffMode::Words, "Words"), (DiffMode::Bytes, "Bytes")] {
                     if ui.selectable_label(view.mode == mode, label).clicked() && view.mode != mode {
                         view.set_mode(mode);
