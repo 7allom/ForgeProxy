@@ -31,6 +31,11 @@ pub const ORGANIZER_HIDE_EXTENSIONS: [&str; 10] =
 /// Sequencer live capture.
 pub const SEQUENCER_THREADS: usize = 5;
 
+/// How many recorded requests the traffic store keeps. Once it is full the oldest go first,
+/// so a capture left running for hours costs a bounded amount of memory instead of growing
+/// until there is none left.
+pub const MAX_RECORDED_REQUESTS: usize = 50_000;
+
 /// `SKIP_EXTENSIONS` as the editable list a new project starts with.
 pub fn default_skip_extensions() -> Vec<String> {
     SKIP_EXTENSIONS.iter().map(|s| s.to_string()).collect()

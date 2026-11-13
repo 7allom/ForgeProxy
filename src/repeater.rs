@@ -301,7 +301,7 @@ mod tests {
         let e = crate::http::HttpEntry {
             id: 7, tool: "Proxy".into(), method: "GET".into(), host: "a.test".into(), path: "/x".into(), status: "200 OK".into(),
             length: 0, mime: String::new(), request: "GET /x HTTP/1.1\nHost: a.test\n\n".into(), response: String::new(),
-            url: "http://a.test/x".into(), truncated: false, time: 0,
+            url: "http://a.test/x".into(), truncated: false, time: 0, elapsed_ms: 0,
         };
         crate::actions::send_to(&mut app, &e, crate::actions::SendTo::Repeater);
         assert_eq!((titles(&app), app.active_repeater_tab), (vec!["1", "2", "3"], 2));
@@ -314,15 +314,15 @@ mod tests {
         app.add_blank_repeater_tab();
         let first = app.repeater_tabs[0].id;
         app.active_repeater_tab = 1;
-        let r = crate::http::SendResult { status: "404 Not Found".into(), body: "nope".into(), headers: "Server: x".into(), length: 4, mime: String::new(), error: None };
+        let r = crate::http::SendResult { status: "404 Not Found".into(), version: "HTTP/1.1".into(), body: "nope".into(), headers: "Server: x\n".into(), length: 4, mime: String::new(), error: None };
         app.tx.send(crate::state::Job::Repeater { tab: first, result: r, elapsed_ms: 12 }).unwrap();
         let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()));
         let t = &app.repeater_tabs[0];
-        assert_eq!(t.response.as_deref(), Some("404 Not Found\nServer: x\n\nnope"));
+        assert_eq!(t.response.as_deref(), Some("HTTP/1.1 404 Not Found\nServer: x\n\nnope"));
         assert_eq!((t.response_status, t.response_time_ms, t.response_bytes), (Some(404), Some(12), Some(4)));
         assert!(app.repeater_tabs[1].response.is_none(), "the shown tab is untouched");
         // a response for a tab closed meanwhile is dropped
-        app.tx.send(crate::state::Job::Repeater { tab: 999, result: crate::http::SendResult { status: String::new(), body: String::new(), headers: String::new(), length: 0, mime: String::new(), error: Some("x".into()) }, elapsed_ms: 1 }).unwrap();
+        app.tx.send(crate::state::Job::Repeater { tab: 999, result: crate::http::SendResult { status: String::new(), version: String::new(), body: String::new(), headers: String::new(), length: 0, mime: String::new(), error: Some("x".into()) }, elapsed_ms: 1 }).unwrap();
         let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()));
         assert_eq!(app.repeater_tabs.len(), 2);
     }

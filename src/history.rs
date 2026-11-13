@@ -230,9 +230,12 @@ mod tests {
 
     #[test]
     fn history_log_operations_matrix() {
-        // 1. Entry ID sequencing & FIFO / ring buffer trimming invariants
-        let counter = Arc::new(std::sync::Mutex::new(0usize));
-        let seq_ids: Vec<usize> = (0..5).map(|_| crate::actions::next_id(&counter)).collect();
+        // 1. Entry ID sequencing & FIFO / ring buffer trimming invariants, as the store does
+        // them: ids count up for the life of the project, whatever has been dropped since
+        let store = crate::http::Recorder::new(5);
+        let seq_ids: Vec<usize> = (0..5)
+            .map(|_| store.record(|id| entry(id, "http://a.test/", "200 OK")).expect("recorded"))
+            .collect();
         assert_eq!(seq_ids, vec![1, 2, 3, 4, 5]);
 
         struct BufferOpCase {
@@ -268,19 +271,26 @@ mod tests {
         ];
 
         assert_table!(buffer_cases, |case| {
-            let mut log: Vec<Arc<HttpEntry>> = Vec::new();
-            for id in 1..=case.insert_count {
-                log.push(Arc::new(entry(id, "http://a.test/", "200 OK")));
-                if log.len() > case.capacity {
-                    let excess = log.len() - case.capacity;
-                    log.drain(0..excess);
-                }
+            let store = crate::http::Recorder::new(case.capacity);
+            for _ in 0..case.insert_count {
+                store.record(|id| entry(id, "http://a.test/", "200 OK"));
             }
+            let mut log = store.history.lock().unwrap().clone();
             if case.clear_after {
-                log.clear();
+                store.history.lock().unwrap().clear();
+                log = store.history.lock().unwrap().clone();
             }
             assert_eq!(ids(&log), case.expected_ids, "case '{}'", case.name);
         });
+
+        // and nothing is recorded at all, nor any id spent, while capture is paused
+        let store = crate::http::Recorder::new(5);
+        assert_eq!(store.record(|id| entry(id, "http://a.test/", "200 OK")), Some(1));
+        store.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(store.record(|id| entry(id, "http://a.test/", "200 OK")), None, "paused: not recorded");
+        store.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(store.record(|id| entry(id, "http://a.test/", "200 OK")), Some(2), "and no id was spent while paused");
+        assert_eq!(ids(&store.history.lock().unwrap()), vec![1, 2]);
 
         // 2. Filter reset preserves active sort column and sort direction
         let mut f = HistoryFilter {

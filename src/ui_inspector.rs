@@ -537,7 +537,7 @@ mod ui_tests {
         app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: "/".into(),
             status: "200 OK".into(), length: response.len(), mime: "application/octet-stream".into(),
-            request: request.into(), response: response.into(), url: "http://shop.test/".into(), truncated: false, time: 0,
+            request: request.into(), response: response.into(), url: "http://shop.test/".into(), truncated: false, time: 0, elapsed_ms: 0,
         }));
         app.history_sel = Some(1);
         (ctx, app)

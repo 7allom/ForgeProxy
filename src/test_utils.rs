@@ -272,6 +272,7 @@ impl HttpFixture {
             url,
             truncated: false,
             time: 0,
+            elapsed_ms: 0,
         }
     }
 }

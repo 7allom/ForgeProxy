@@ -25,6 +25,11 @@ pub struct HttpEntry {
     /// When it was recorded: Unix time in milliseconds (0 in projects saved before this).
     #[serde(default)]
     pub time: u64,
+    /// How long the request took, from the moment it was sent to the last byte of the
+    /// response, in milliseconds. 0 when it was not timed: entries recorded by a tunnel,
+    /// and those read from a project saved before this was kept.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 /// Now, as Unix time in milliseconds (an `HttpEntry::time`).
@@ -158,14 +163,108 @@ pub fn sync_content_length(raw: String) -> String {
 /// copying pointers, never request or response bodies.
 pub type History = Arc<Mutex<Vec<Arc<HttpEntry>>>>;
 
+/// The traffic store every tool records into -- Proxy, Repeater, Intruder, Scanner and
+/// Sequencer -- with the ids it hands out and the switch that pauses recording. Workers are
+/// given a clone of it and keep it for as long as they run.
+#[derive(Clone)]
+pub struct Recorder {
+    pub history: History,
+    /// Hands out entry ids, counting up for the life of the project.
+    pub next_id: Arc<Mutex<usize>>,
+    /// Logger's capture switch. While it is set nothing is recorded at all, and every tool
+    /// goes on sending exactly as it was: pausing stops the record, not the work.
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    /// How many entries the store keeps before the oldest are dropped.
+    pub limit: usize,
+}
+
+impl Recorder {
+    /// A store nothing else can reach, for a tool that is being tested on its own.
+    #[cfg(test)]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            history: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(Mutex::new(0)),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            limit,
+        }
+    }
+
+    /// Is recording paused?
+    pub fn paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record one request and whatever came back, if anything. The entry is built with the id
+    /// it is given, so a paused store spends none, and the oldest entry is dropped once the
+    /// store is full. Returns the id the entry was recorded under, or `None` when it was not
+    /// recorded at all.
+    pub fn record(&self, entry: impl FnOnce(usize) -> HttpEntry) -> Option<usize> {
+        if self.paused() {
+            return None;
+        }
+        let id = {
+            let mut next = self.next_id.lock().unwrap_or_else(|e| e.into_inner());
+            *next += 1;
+            *next
+        };
+        let mut kept = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        // a ring buffer by index: the oldest entries go first, and only once the store is
+        // full, so an ordinary session never copies the whole of it
+        if kept.len() >= self.limit {
+            let over = kept.len() + 1 - self.limit;
+            kept.drain(..over);
+        }
+        kept.push(Arc::new(entry(id)));
+        Some(id)
+    }
+}
+
 pub struct SendResult {
+    /// The status line without its version -- "404 Not Found" -- which is the form the
+    /// history table, the result rows and [`status_code`] all read.
     pub status: String,
+    /// The version the response named itself by, as its status line spells it ("HTTP/1.1",
+    /// "HTTP/1.0"). Empty when no response came back at all.
+    pub version: String,
     pub body: String,
+    /// The response's header block, one `name: value` line each, as the response is recorded
+    /// rather than as it arrived: see [`SendResult::raw_response`] for what that means.
     pub headers: String,
     pub length: usize,
     pub mime: String,
     /// Set when no response came back (connection, TLS or timeout failure).
     pub error: Option<String>,
+}
+
+impl SendResult {
+    /// The response as one message, which is how every tool records and shows it: the status
+    /// line, the header block, a blank line, then the body.
+    ///
+    /// It is the response as it was read rather than byte for byte as it arrived. The body
+    /// has been de-chunked, and unpacked if it was compressed, so the header block is made
+    /// to agree with the body that follows it: a `transfer-encoding` that framed the body in
+    /// chunks is gone, since there are no chunks left to frame, and a `content-length` that
+    /// counts the body as it stands is there in its place. A message that says one thing and
+    /// carries another cannot be read, replayed or compared with any confidence.
+    ///
+    /// A failed connection has no version and no headers, and its "body" is the note
+    /// [`send`] leaves in place of a response.
+    pub fn raw_response(&self) -> String {
+        let mut head = if self.version.is_empty() {
+            self.status.clone()
+        } else {
+            format!("{} {}", self.version, self.status)
+        };
+        // the header block keeps a newline after its last line; the blank line that ends the
+        // head is added here, so the body starts on the line straight after it
+        let headers = self.headers.trim_end_matches('\n');
+        if !headers.is_empty() {
+            head.push('\n');
+            head.push_str(headers);
+        }
+        format!("{head}\n\n{}", self.body)
+    }
 }
 
 /// Largest response body read (10 MiB, the same cap ureq's into_string uses).
@@ -245,6 +344,7 @@ pub fn send(
         Ok(a) => a,
         Err(e) => return SendResult {
             status: "— (transport error)".into(),
+            version: String::new(),
             body: format!("Request not sent: {e}"),
             headers: String::new(),
             length: 0,
@@ -266,12 +366,24 @@ pub fn send(
     match resp {
         Ok(r) | Err(ureq::Error::Status(_, r)) => {
             let status = format!("{} {}", r.status(), r.status_text());
+            let version = r.http_version().to_string();
             let mime = r.content_type().to_string();
+            // The header block as the response is recorded. A `transfer-encoding` that framed
+            // the body in chunks is left out: the body is read whole and de-chunked below, so
+            // there are no chunks left for it to describe, and a reader told to expect them
+            // would look for a length in front of the body and find none. Any other
+            // `transfer-encoding` is kept -- it says something about the body that is still
+            // true. Header names arrive from the client lowercased, so they compare as they
+            // are and the block reads in one case throughout.
             let mut hdr = String::new();
+            let mut has_length = false;
             for name in r.headers_names() {
-                if let Some(v) = r.header(&name) {
-                    hdr.push_str(&format!("{}: {}\n", name, v));
+                let Some(v) = r.header(&name) else { continue };
+                if name == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                    continue;
                 }
+                has_length |= name == "content-length";
+                hdr.push_str(&format!("{name}: {v}\n"));
             }
             let encoding = r.header("content-encoding").unwrap_or("").trim().to_ascii_lowercase();
             let mut raw = Vec::new();
@@ -283,10 +395,17 @@ pub fn send(
             }
             let text = String::from_utf8_lossy(&raw).into_owned();
             let length = raw.len();
-            SendResult { status, body: text, headers: hdr, length, mime, error: None }
+            if !has_length {
+                // the body as this message carries it, which is the text above: bytes that
+                // were not UTF-8 stand in it as the replacement character, while `length`
+                // keeps the count of what actually came off the wire
+                hdr.push_str(&format!("content-length: {}\n", text.len()));
+            }
+            SendResult { status, version, body: text, headers: hdr, length, mime, error: None }
         }
         Err(e) => SendResult {
             status: "— (transport error)".into(),
+            version: String::new(),
             body: format!("Request failed: {e}"),
             headers: String::new(),
             length: 0,
@@ -613,6 +732,7 @@ mod tests {
 #[cfg(test)]
 mod client_tests {
     use super::*;
+    use crate::test_utils::assert_table;
     use crate::upstream::{mock, NetConfig, UpstreamProxyConfig, UpstreamProxyType};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -724,5 +844,123 @@ mod client_tests {
         assert!(lines.lock().unwrap().is_empty(), "not sent directly instead");
         // proxy off, or "Direct": a plain agent
         assert!(agent(false, &opts(true, UpstreamProxyConfig { enabled: true, proxy_type: UpstreamProxyType::Direct, ..Default::default() })).is_ok());
+    }
+
+    /// Answers every request with exactly these bytes, whatever they are. It is the only way
+    /// to put a response of a chosen shape in front of the client: a version of its own, a
+    /// body framed in chunks, a header block with or without a length.
+    fn raw_response_server(response: &'static str) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let mut s = s;
+                let _ = s.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// The value of one header of a reconstructed message's head, and how many lines name it.
+    fn header_of(head: &str, name: &str) -> (Option<String>, usize) {
+        let named: Vec<String> = head
+            .lines()
+            .skip(1) // the status line
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .collect();
+        (named.first().cloned(), named.len())
+    }
+
+    /// A reconstructed response has to read as an HTTP message. Its first line is a status
+    /// line naming the version the response gave itself, and its header block describes the
+    /// body printed under it -- which is the body as it was read, not as it was framed. The
+    /// client reads a chunked body whole and de-chunks it on the way in, so a
+    /// `transfer-encoding: chunked` left in the block would frame chunks that are no longer
+    /// there and leave the message with no length at all; an accurate `content-length` takes
+    /// its place.
+    #[test]
+    fn a_reconstructed_response_reads_as_an_http_message_matrix() {
+        struct Case {
+            name: &'static str,
+            /// The response the server puts on the wire, byte for byte.
+            response: &'static str,
+            first_line: &'static str,
+            body: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "a chunked body is de-chunked and given a length of its own",
+                response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n\
+                           5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                first_line: "HTTP/1.1 200 OK",
+                body: "hello world",
+            },
+            Case {
+                name: "an error response says so on its status line",
+                response: "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot there",
+                first_line: "HTTP/1.1 404 Not Found",
+                body: "not there",
+            },
+            Case {
+                name: "the version is the response's own, not one assumed for it",
+                response: "HTTP/1.0 203 Non-Authoritative Information\r\nContent-Length: 4\r\nConnection: close\r\n\r\nmeh!",
+                first_line: "HTTP/1.0 203 Non-Authoritative Information",
+                body: "meh!",
+            },
+            Case {
+                name: "a chunked response with nothing in it still gets a length",
+                response: "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                first_line: "HTTP/1.1 204 No Content",
+                body: "",
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            let port = raw_response_server(case.response);
+            let r = send("GET", &format!("http://127.0.0.1:{port}/p"), &[], "", false, true, &opts(true, Default::default()));
+            let message = r.raw_response();
+            let what = format!("case #{idx} ({})", case.name);
+            assert_eq!(r.error, None, "{what}: {message:?}");
+
+            assert_eq!(message.lines().next(), Some(case.first_line), "{what}: the status line ({message:?})");
+            let (head, body) = message.split_once("\n\n").unwrap_or_else(|| panic!("{what}: head and body are separated by a blank line ({message:?})"));
+            assert_eq!(body, case.body, "{what}: the body ({message:?})");
+
+            assert_eq!(header_of(head, "transfer-encoding").0, None, "{what}: the chunked framing is gone ({head:?})");
+            assert_eq!(
+                header_of(head, "content-length"),
+                (Some(case.body.len().to_string()), 1),
+                "{what}: one accurate length, counting the body that is there ({head:?})"
+            );
+
+            // and what the rest of the app reads of the same response is unchanged: the
+            // status without its version, for the tables and for `status_code`
+            assert_eq!(r.status, case.first_line.split_once(' ').map(|(_, rest)| rest).unwrap_or_default(), "{what}: the status field");
+            assert_eq!(r.version, case.first_line.split_once(' ').map(|(v, _)| v).unwrap_or_default(), "{what}: the version field");
+            assert_eq!(r.length, case.body.len(), "{what}: the recorded byte count");
+            assert_eq!(status_code(&r.status), Some(case.first_line.split_whitespace().nth(1).unwrap().parse().unwrap()), "{what}: and the code read back out of it");
+        });
+    }
+
+    /// A request that never got a response has no status line to print and no headers to
+    /// print either: what stands in its place is the note saying what went wrong, on its own
+    /// first line, with the detail under it.
+    #[test]
+    fn a_failed_connection_reconstructs_as_the_note_in_its_place() {
+        // a port nothing is listening on: bound, read for its number, then dropped
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let r = send("GET", &format!("http://127.0.0.1:{dead}/p"), &[], "", false, true, &opts(true, Default::default()));
+        assert!(r.error.is_some(), "the connection failed");
+        let message = r.raw_response();
+        assert!(!message.starts_with("HTTP/"), "no version is invented for a response that never came: {message:?}");
+        let (head, body) = message.split_once("\n\n").expect("head and body are still separated");
+        assert_eq!(head, "— (transport error)", "the head is the note alone, with no empty header line under it");
+        assert!(body.starts_with("Request failed:"), "and the detail is the body: {body:?}");
     }
 }

@@ -144,7 +144,8 @@ pub fn to_har(entries: &[HttpEntry]) -> Result<String, serde_json::Error> {
             }
             serde_json::json!({
                 "startedDateTime": iso_8601(e.time),
-                "time": 0,
+                // how long the request took, which is 0 for an entry that was never timed
+                "time": e.elapsed_ms,
                 "request": request,
                 "response": {
                     "status": status,
@@ -158,7 +159,10 @@ pub fn to_har(entries: &[HttpEntry]) -> Result<String, serde_json::Error> {
                     "bodySize": e.length,
                 },
                 "cache": {},
-                "timings": { "send": 0, "wait": 0, "receive": 0 },
+                // the whole exchange is one span here: the tools time the send and the read
+                // together, and splitting that into three made-up numbers would say more
+                // than is known
+                "timings": { "send": -1, "wait": e.elapsed_ms, "receive": -1 },
             })
         })
         .collect();

@@ -332,7 +332,7 @@ mod tests {
         let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
         app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "h".into(), path: "/".into(), status: "200 OK".into(),
-            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: String::new(), truncated: false, time: 0,
+            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: String::new(), truncated: false, time: 0, elapsed_ms: 0,
         }));
         *app.next_id.lock().unwrap() = 1;
         app.target_scope.add("https://shop.test");

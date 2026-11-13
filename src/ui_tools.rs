@@ -671,9 +671,11 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                                 (r.length.to_string(), cols[3].1, None),
                                 (r.error.clone(), cols[4].1, Some(p.high)),
                             ];
+                            // 0 when capture was paused and the exchange was not recorded:
+                            // there is no entry to show for that row, so it does not select
                             let id = r.history_id;
-                            let row = theme::table_row(ui, p, &cells, app.int_result_sel == Some(id), i % 2 == 1);
-                            if row.clicked() {
+                            let row = theme::table_row(ui, p, &cells, id != 0 && app.int_result_sel == Some(id), i % 2 == 1);
+                            if row.clicked() && id != 0 {
                                 row_click = Some(id);
                             }
                             row.context_menu(|ui| {
@@ -1639,12 +1641,24 @@ fn jwt_inspector(app: &mut App, ui: &mut Ui, p: &Palette) {
 
 // ---- Logger (picture-22) ------------------------------------------------
 pub fn logger(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let paused = app.capture_paused.load(std::sync::atomic::Ordering::Relaxed);
     egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
+            // one switch for every tool: while it is off nothing new is recorded, and the
+            // tools go on sending exactly as they were
+            if theme::plain_button(ui, p, if paused { "Resume capture" } else { "Pause capture" }, true).clicked() {
+                app.capture_paused.store(!paused, std::sync::atomic::Ordering::Relaxed);
+            }
+            ui.add_space(6.0);
             let mib = |n: u64| n >> 20;
+            let state = if paused {
+                "Capture is paused: requests are still being sent, and none of them are being recorded. ".to_string()
+            } else {
+                format!("The last {} requests are kept in memory. ", crate::rules::MAX_RECORDED_REQUESTS)
+            };
             ui.label(RichText::new(format!(
-                "Everything is kept in memory. Proxy: request bodies up to {} MiB; responses over {} MiB reach the browser but are recorded cut short. Tools read responses up to {} MiB.",
+                "{state}Proxy: request bodies up to {} MiB; responses over {} MiB reach the browser but are recorded cut short. Tools read responses up to {} MiB.",
                 mib(crate::proxy::MAX_REQUEST_BODY), mib(crate::proxy::MAX_BUFFERED), mib(crate::http::MAX_BODY))).size(11.5).color(p.text));
         });
     });
@@ -2616,5 +2630,59 @@ mod sort_header_tests {
         assert_table!(cases, |idx, (what, x, want)| {
             assert_eq!(click_header(x), want, "case #{idx} ({what})");
         });
+    }
+}
+
+#[cfg(test)]
+mod logger_tests {
+    use crate::state::{App, Tab};
+    use crate::test_utils::MockAppBuilder;
+    use eframe::egui;
+    use std::sync::atomic::Ordering;
+
+    /// One full frame of the app with these input events; returns the accessibility update.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> Option<egui::accesskit::TreeUpdate> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+    }
+
+    /// Centre of the widget labelled `label`, from a frame's accessibility tree.
+    fn find(update: &Option<egui::accesskit::TreeUpdate>, label: &str) -> egui::Pos2 {
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let r = nodes.iter().find(|(_, n)| n.label() == Some(label)).and_then(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("no widget labelled {label:?}"));
+        egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32)
+    }
+
+    /// Click `label` (press and release over a frame each), the way a user would.
+    fn click(ctx: &egui::Context, app: &mut App, label: &str) {
+        frame(ctx, app, vec![]);
+        let at = find(&frame(ctx, app, vec![]), label);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(ctx, app, vec![button(false)]);
+        frame(ctx, app, vec![]);
+    }
+
+    /// The capture switch is one button over the whole store, and the button says which way
+    /// round it is. Nothing else in the app reads a copy of the flag, so what the tools' own
+    /// threads see is what this toggles.
+    #[test]
+    fn the_capture_switch_pauses_and_resumes_recording() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Logger).build_with_ctx();
+        ctx.enable_accesskit();
+        assert!(!app.capture_paused.load(Ordering::Relaxed), "recording out of the box");
+
+        click(&ctx, &mut app, "Pause capture");
+        assert!(app.capture_paused.load(Ordering::Relaxed), "the switch is on");
+        assert!(app.recorder().paused(), "and the store the tools record through is paused");
+
+        click(&ctx, &mut app, "Resume capture");
+        assert!(!app.capture_paused.load(Ordering::Relaxed), "and off again");
+        assert!(!app.recorder().paused());
     }
 }

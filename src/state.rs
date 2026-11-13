@@ -103,7 +103,8 @@ pub struct IntResult {
     pub status: String,
     pub length: usize,
     pub error: String,
-    /// The request/response as recorded in history.
+    /// The request/response as recorded in history, or 0 when it was not recorded because
+    /// Logger's capture was paused.
     pub history_id: usize,
 }
 
@@ -295,6 +296,9 @@ pub struct App {
     pub tab: Tab,
     pub history: History,
     pub next_id: Arc<Mutex<usize>>,
+    /// Logger's capture switch: while it is set, no tool records what it sends. Shared with
+    /// the proxy's threads and with every background sender, so one toggle covers them all.
+    pub capture_paused: Arc<std::sync::atomic::AtomicBool>,
     pub tx: Sender<Job>,
     pub rx: Receiver<Job>,
 
@@ -525,6 +529,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let history: crate::http::History = Arc::new(Mutex::new(Vec::new()));
         let next_id = Arc::new(Mutex::new(0usize));
+        let capture_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let events: crate::proxy::Events = Arc::new(Mutex::new(Default::default()));
         let start_proxy = shot_path.is_none();
         let mut app = Self {
@@ -533,6 +538,7 @@ impl App {
             tab: start_tab.unwrap_or(Tab::Dashboard),
             history: history.clone(),
             next_id: next_id.clone(),
+            capture_paused: capture_paused.clone(),
             tx, rx,
             project_dialog: None,
             project_name: String::new(),
@@ -547,6 +553,7 @@ impl App {
             proxy: crate::proxy::Shared {
                 history: history.clone(),
                 next_id: next_id.clone(),
+                capture_paused: capture_paused.clone(),
                 intercept: Arc::new(std::sync::atomic::AtomicBool::new(rules::INTERCEPT_AT_STARTUP)),
                 held: Arc::new(Mutex::new(Vec::new())),
                 rules: Arc::new(Mutex::new(rewrite::defaults())),
@@ -756,6 +763,17 @@ impl App {
 
     pub fn p(&self) -> Palette { theme::palette(self.eff().theme) }
 
+    /// The traffic store, as a background sender takes it: a clone it can keep for as long as
+    /// it runs, through which everything it sends reaches Logger.
+    pub fn recorder(&self) -> crate::http::Recorder {
+        crate::http::Recorder {
+            history: self.history.clone(),
+            next_id: self.next_id.clone(),
+            paused: self.capture_paused.clone(),
+            limit: crate::rules::MAX_RECORDED_REQUESTS,
+        }
+    }
+
     /// How the tools send requests now: timeout, upstream proxy, certificate checking.
     pub fn send_options(&self) -> crate::http::SendOptions {
         let s = self.eff();
@@ -934,7 +952,7 @@ impl eframe::App for App {
                     if let Some(i) = self.repeater_tab_index(tab) {
                         let t = &mut self.repeater_tabs[i];
                         t.status_text = r.error.clone().unwrap_or_else(|| r.status.clone());
-                        t.response = Some(format!("{}\n{}\n\n{}", r.status, r.headers, r.body));
+                        t.response = Some(r.raw_response());
                         t.response_status = r.status.get(..3).and_then(|c| c.parse().ok()).filter(|_| r.error.is_none());
                         t.response_time_ms = Some(elapsed_ms);
                         t.response_bytes = Some(r.length);
@@ -1062,7 +1080,7 @@ mod close_tests {
 
     fn entry() -> crate::http::HttpEntry {
         crate::http::HttpEntry { id: 1, tool: "Proxy".into(), method: "GET".into(), host: "a.test".into(), path: "/".into(), status: "200 OK".into(),
-            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: "http://a.test/".into(), truncated: false, time: 0 }
+            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: "http://a.test/".into(), truncated: false, time: 0, elapsed_ms: 0 }
     }
 
     #[test]

@@ -465,7 +465,7 @@ mod filter_tests {
     fn entry(url: &str, status: &str) -> HttpEntry {
         let (host, path) = crate::http::split_url(url);
         HttpEntry { id: 0, tool: "Proxy".into(), method: "GET".into(), host, path, status: status.into(), length: 0,
-            mime: "text/html".into(), request: String::new(), response: String::new(), url: url.into(), truncated: false, time: 0 }
+            mime: "text/html".into(), request: String::new(), response: String::new(), url: url.into(), truncated: false, time: 0, elapsed_ms: 0 }
     }
 
     #[test]
@@ -620,7 +620,7 @@ mod tests {
             let (host, path) = ("shop.test".to_string(), path.to_string());
             app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
                 id, tool: "Proxy".into(), method: "GET".into(), url: format!("http://{host}{path}"), host, path, status: status.into(), length,
-                mime: "HTML".into(), request: String::new(), response: String::new(), truncated: false, time: id as u64 * 1000,
+                mime: "HTML".into(), request: String::new(), response: String::new(), truncated: false, time: id as u64 * 1000, elapsed_ms: 0,
             }));
         }
         frame(&ctx, &mut app, vec![]);

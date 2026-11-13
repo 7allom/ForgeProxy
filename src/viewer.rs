@@ -49,7 +49,9 @@ pub fn pretty_message(raw: &str) -> (String, BodyKind) {
     (out, kind)
 }
 
-/// A request or status line first ("GET / HTTP/1.1", "HTTP/1.1 200 OK", Repeater's "200 OK").
+/// A request or status line first ("GET / HTTP/1.1", "HTTP/1.1 200 OK"). The version-less
+/// form ("200 OK") is taken too: that is how the tools recorded a response before they began
+/// writing the version, so it is what projects saved back then hold.
 fn looks_like_head(s: &str) -> bool {
     let first = s.lines().next().unwrap_or("");
     let mut t = first.split_whitespace();

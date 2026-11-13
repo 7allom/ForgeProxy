@@ -1,18 +1,13 @@
 //! Request sending, the Intruder runner, and small parsing/diff helpers.
 
-use crate::http::{self, History, HttpEntry};
+use crate::http::{self, HttpEntry};
 use crate::intruder;
 use crate::rewrite;
 use crate::rules;
 use crate::scan;
 use crate::state::{App, IntResult, Job, Task, TaskKind};
-use std::sync::{Arc, Mutex};
-
-pub fn next_id(nid: &Arc<Mutex<usize>>) -> usize {
-    let mut g = nid.lock().unwrap_or_else(|e| e.into_inner());
-    *g += 1;
-    *g
-}
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Send the active Repeater tab's request; the response comes back to that tab (by id),
 /// whichever tab is showing by then.
@@ -39,16 +34,16 @@ pub fn send_repeater(app: &mut App) {
     let unpack = app.rep_unpack;
     let opts = app.send_options();
     let tx = app.tx.clone();
-    let hist = app.history.clone();
-    let nid = app.next_id.clone();
+    let rec = app.recorder();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let mut r = http::send(&method, &url, &hv, &body2, follow, unpack, &opts);
-        let elapsed_ms = started.elapsed().as_millis();
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis();
         let (rh, rb) = rewrite::apply(&rules_copy, false, &r.headers, &r.body);
         r.headers = rh;
         r.body = rb;
-        let _ = record_bg_full(&hist, &nid, "Repeater", &method, &url, req_sent, &r);
+        let _ = record_bg_full(&rec, "Repeater", &method, &url, req_sent, elapsed, &r);
         let _ = tx.send(Job::Repeater { tab: tab_id, result: r, elapsed_ms });
     });
 }
@@ -135,7 +130,7 @@ pub fn start_attack(app: &mut App) {
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for _ in 0..workers {
         let (plan, next, done, origin, stop) = (plan.clone(), next.clone(), done.clone(), origin.clone(), stop.clone());
-        let (tx, hist, nid) = (app.tx.clone(), app.history.clone(), app.next_id.clone());
+        let (tx, rec) = (app.tx.clone(), app.recorder());
         let opts = opts.clone();
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -150,10 +145,11 @@ pub fn start_attack(app: &mut App) {
                 let headers = intruder::dispatch_headers(&raw, update_host);
                 let path = if path.starts_with('/') { path } else { format!("/{path}") };
                 let full = format!("{origin}{path}");
+                let started = std::time::Instant::now();
                 let r = http::send(&method, &full, &headers, &body, false, true, &opts);
                 // keep the full substituted request (line, headers, body) so the results
                 // inspector and "Copy as cURL" show exactly what was generated for this payload
-                let history_id = record_bg_full(&hist, &nid, "Intruder", &method, &full, raw, &r);
+                let history_id = record_bg_full(&rec, "Intruder", &method, &full, raw, started.elapsed(), &r);
                 let result = IntResult {
                     request: i + 1,
                     payload: label,
@@ -187,7 +183,7 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
     });
     app.task_sel = task;
     app.task_sub = 0;
-    let (tx, hist, nid) = (app.tx.clone(), app.history.clone(), app.next_id.clone());
+    let (tx, rec) = (app.tx.clone(), app.recorder());
     let opts = app.send_options();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -201,8 +197,9 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
                 break;
             }
             requests += 1;
+            let sent_at = std::time::Instant::now();
             let r = http::send("GET", &page, &[], "", rules::AUDIT_FOLLOW_REDIRECTS, true, &opts);
-            let _ = record_bg(&hist, &nid, "Scanner", "GET", &page, &r);
+            let _ = record_bg(&rec, "Scanner", "GET", &page, sent_at.elapsed(), &r);
             let (host, path) = http::split_url(&page);
             findings.extend(scan::passive_checks(&host, &path, page.starts_with("https"), &r.headers, &r.body));
             let _ = tx.send(Job::ScanProgress { task, requests, line: format!("GET {page} — {}", r.status) });
@@ -217,9 +214,10 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
         let (host, path) = http::split_url(&url);
         let marker = "fpx9q7z";
         let probe = if url.contains('?') { format!("{url}&q={marker}") } else { format!("{url}?q={marker}") };
+        let probe_at = std::time::Instant::now();
         let pr = http::send("GET", &probe, &[], "", rules::AUDIT_FOLLOW_REDIRECTS, true, &opts);
         requests += 1;
-        let _ = record_bg(&hist, &nid, "Scanner", "GET", &probe, &pr);
+        let _ = record_bg(&rec, "Scanner", "GET", &probe, probe_at.elapsed(), &pr);
         let _ = tx.send(Job::ScanProgress { task, requests, line: format!("GET {probe} — {}", pr.status) });
         if scan::reflects_marker(&pr.body, marker) {
             findings.push(scan::Finding::new(scan::INPUT_REFLECTED, scan::Confidence::Certain, &host, &path,
@@ -389,18 +387,30 @@ pub fn parse_headers(s: &str) -> Vec<(String, String)> {
     s.lines().filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect()
 }
 
-/// Record a request sent by a tool; returns its history id.
-pub fn record_bg(hist: &History, nid: &Arc<Mutex<usize>>, tool: &str, method: &str, url: &str, r: &http::SendResult) -> usize {
-    record_bg_full(hist, nid, tool, method, url, format!("{method} {url}"), r)
+/// Record a request sent by a tool; returns its history id, or 0 when capture is paused and
+/// it was not recorded.
+pub fn record_bg(rec: &http::Recorder, tool: &str, method: &str, url: &str, elapsed: Duration, r: &http::SendResult) -> usize {
+    record_bg_full(rec, tool, method, url, format!("{method} {url}"), elapsed, r)
 }
 
 /// As [`record_bg`], but stores `request` verbatim: the full raw HTTP request (request line,
 /// headers and body) actually sent, so the history viewer shows exactly what went over the
 /// wire rather than just "METHOD url".
-pub fn record_bg_full(hist: &History, nid: &Arc<Mutex<usize>>, tool: &str, method: &str, url: &str, request: String, r: &http::SendResult) -> usize {
+///
+/// This is the one path every background sender records through -- Repeater, Intruder, the
+/// scan workers and Sequencer's live capture -- so Logger's capture switch and the store's
+/// limit hold for all of them alike.
+pub fn record_bg_full(
+    rec: &http::Recorder,
+    tool: &str,
+    method: &str,
+    url: &str,
+    request: String,
+    elapsed: Duration,
+    r: &http::SendResult,
+) -> usize {
     let (host, path) = http::split_url(url);
-    let id = next_id(nid);
-    hist.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(HttpEntry {
+    rec.record(|id| HttpEntry {
         id,
         tool: tool.into(),
         method: method.into(),
@@ -410,12 +420,15 @@ pub fn record_bg_full(hist: &History, nid: &Arc<Mutex<usize>>, tool: &str, metho
         length: r.length,
         mime: r.mime.clone(),
         request,
-        response: format!("{}\n{}\n\n{}", r.status, r.headers, r.body),
+        // the status line, the headers, then the body after a blank line -- and, when the
+        // connection failed instead, the note `http::send` puts in place of a response
+        response: r.raw_response(),
         url: url.to_string(),
         truncated: false,
         time: http::now_ms(),
-    }));
-    id
+        elapsed_ms: elapsed.as_millis() as u64,
+    })
+    .unwrap_or(0)
 }
 
 /// "Send to Decoder": the text becomes the Decoder's input (a JWT is also loaded into the
@@ -790,6 +803,11 @@ pub fn scope_prefix(e: &HttpEntry) -> String {
 
 /// Sequencer live capture: send the chosen request repeatedly with the configured number of
 /// threads (ProjectDefaults: 5) and collect a token from each response.
+///
+/// Every request is recorded in the traffic store under the Sequencer's own name, whatever
+/// came of it: the ones a token was read from, the ones that answered with something the
+/// token is not in (a 404, a response without the header being read), and the ones whose
+/// connection failed. A capture stopped part way through keeps everything it sent up to then.
 pub fn start_sequencer(app: &mut App) {
     if app.seq_template.trim().is_empty() {
         return;
@@ -805,14 +823,22 @@ pub fn start_sequencer(app: &mut App) {
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let threads = app.sequencer_threads.max(1);
     let opts = app.send_options();
+    // the request as the user wrote it, which is what was parsed and sent: recorded verbatim,
+    // as Repeater records its own
+    let raw = app.seq_template.clone();
     for _ in 0..threads {
         let (tx, stop, count, done) = (app.tx.clone(), app.seq_stop.clone(), count.clone(), done.clone());
         let (method, url, headers, body, location) = (method.clone(), url.clone(), headers.clone(), body.clone(), location.clone());
+        let (rec, raw) = (app.recorder(), raw.clone());
         let opts = opts.clone();
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::SeqCst) && count.load(std::sync::atomic::Ordering::SeqCst) < target {
+                let sent_at = std::time::Instant::now();
                 let r = http::send(&method, &url, &headers, &body, false, true, &opts);
-                let full = format!("{}\n{}\n\n{}", r.status, r.headers, r.body);
+                // recorded before the token is looked for, so a response the token is not in
+                // is in Logger all the same -- that is the one the user needs to read
+                let _ = record_bg_full(&rec, "Sequencer", &method, &url, raw.clone(), sent_at.elapsed(), &r);
+                let full = r.raw_response();
                 match crate::sequencer::extract_token(&location, &full) {
                     Some(t) => {
                         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1306,5 +1332,219 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ---- Sequencer live capture: what it sends is recorded ----
+
+    /// A minimal HTTP/1.1 server that answers every request with `head` (its status line and
+    /// header lines, CRLF separated) after waiting `delay`, and counts what it has served.
+    /// `{n}` anywhere in `head` becomes the number of requests served so far, so each answer
+    /// can carry a token of its own.
+    fn canned_server(head: &'static str, delay: Duration) -> (u16, Arc<Mutex<usize>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let served = Arc::new(Mutex::new(0usize));
+        let count = served.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let count = count.clone();
+                std::thread::spawn(move || {
+                    let mut s = s;
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap_or(0) == 1 {
+                        buf.push(byte[0]);
+                    }
+                    let n = {
+                        let mut c = count.lock().unwrap();
+                        *c += 1;
+                        *c
+                    };
+                    std::thread::sleep(delay);
+                    let body = "page body";
+                    let head = head.replace("{n}", &n.to_string());
+                    let _ = s.write_all(
+                        format!("{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes(),
+                    );
+                });
+            }
+        });
+        (port, served)
+    }
+
+    /// An app set up to capture `samples` tokens from a local server, one thread at a time so
+    /// what is recorded is exactly what was asked for.
+    fn capture_app(port: u16, samples: usize) -> (egui::Context, App) {
+        let (ctx, mut app) = test_app();
+        app.seq_origin = format!("http://127.0.0.1:{port}");
+        app.seq_template = format!("GET /login HTTP/1.1\nHost: 127.0.0.1:{port}\nAccept: */*\n\n");
+        app.seq_location = crate::sequencer::TokenLocation::Cookie("sid".into());
+        app.seq_target_samples = samples;
+        app.sequencer_threads = 1;
+        (ctx, app)
+    }
+
+    /// Run update frames until the capture has finished (or a generous timeout).
+    fn drain_capture(ctx: &egui::Context, app: &mut App) {
+        for _ in 0..600 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest()));
+            if !app.seq_running {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The recorded entries, in the order they were recorded.
+    fn recorded(app: &App) -> Vec<HttpEntry> {
+        app.history.lock().unwrap().iter().map(|e| (**e).clone()).collect()
+    }
+
+    /// Recorded entries as one line each, for an assertion that fails to say what it found.
+    fn summary(log: &[HttpEntry]) -> Vec<String> {
+        log.iter().map(|e| format!("#{} {} {} {} -- {}", e.id, e.tool, e.method, e.url, e.status)).collect()
+    }
+
+    /// Live capture records every request it sends under its own name, whether or not the
+    /// response turned out to hold a token: a response the token is not in is the one the
+    /// user most needs to read afterwards.
+    #[test]
+    fn live_capture_records_what_it_sends_matrix() {
+        struct Case {
+            name: &'static str,
+            head: &'static str,
+            status: &'static str,
+            /// Tokens the capture should come away with.
+            tokens: usize,
+        }
+        let cases = [
+            Case {
+                name: "a response the token is read from",
+                head: "HTTP/1.1 200 OK\r\nSet-Cookie: sid=token{n}; Path=/",
+                status: "200 OK",
+                tokens: 2,
+            },
+            Case {
+                name: "a response with no token in it at all",
+                head: "HTTP/1.1 404 Not Found",
+                status: "404 Not Found",
+                tokens: 0,
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            // answered slowly enough that the recorded duration cannot be mistaken for zero
+            let (port, served) = canned_server(case.head, Duration::from_millis(12));
+            let (ctx, mut app) = capture_app(port, 2);
+            start_sequencer(&mut app);
+            drain_capture(&ctx, &mut app);
+            let what = format!("case #{idx} ({})", case.name);
+
+            assert_eq!(app.seq_samples.len(), case.tokens, "{what}: tokens collected");
+            let sent = *served.lock().unwrap();
+            assert!(sent > 0, "{what}: the capture sent nothing");
+            let log = recorded(&app);
+            assert_eq!(log.len(), sent, "{what}: every request it sent was recorded ({:?})", summary(&log));
+
+            let e = log.first().expect("an entry");
+            assert_eq!(e.tool, "Sequencer", "{what}: recorded under its own name");
+            assert_eq!(e.method, "GET", "{what}: method");
+            assert_eq!(e.host, format!("127.0.0.1:{port}"), "{what}: host");
+            assert_eq!(e.path, "/login", "{what}: path");
+            assert_eq!(e.url, format!("http://127.0.0.1:{port}/login"), "{what}: url");
+            assert_eq!(e.status, case.status, "{what}: status");
+            assert_eq!(e.length, "page body".len(), "{what}: response length");
+            assert_eq!(e.request, app.seq_template, "{what}: the raw request it sent");
+            assert_eq!(
+                e.response.lines().next(),
+                Some(format!("HTTP/1.1 {}", case.status).as_str()),
+                "{what}: the recorded response opens with a wire-format status line ({:?})",
+                e.response
+            );
+            assert!(e.response.ends_with("page body"), "{what}: the response body ({:?})", e.response);
+            assert!(e.time > 0, "{what}: recorded with the time it happened");
+            assert!(
+                (10..60_000).contains(&e.elapsed_ms),
+                "{what}: the exchange took {}ms, and the server waited 12ms before answering",
+                e.elapsed_ms
+            );
+            if case.tokens > 0 {
+                let tokens: Vec<&str> = app.seq_samples.iter().map(String::as_str).collect();
+                assert_eq!(tokens, ["token1", "token2"], "{what}: the tokens are the ones the responses carried");
+            } else {
+                assert!(app.seq_message.contains("No token found"), "{what}: the miss is reported ({})", app.seq_message);
+            }
+        });
+    }
+
+    /// The audit worker records what it sends too, under its own name: the page it fetches
+    /// and the marker probe that follows it. This is the other background sender that reaches
+    /// a target of its own, and it must not be the one tool whose traffic goes unrecorded.
+    #[test]
+    fn the_audit_worker_records_the_requests_it_sends() {
+        let (port, served) = canned_server("HTTP/1.1 200 OK", Duration::ZERO);
+        let (ctx, mut app) = test_app();
+        // the task the scan is given, after the live passive one a project starts with
+        let task = app.tasks.len();
+        start_scan(&mut app, format!("http://127.0.0.1:{port}/shop"), false);
+        for _ in 0..600 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()));
+            if !app.tasks[task].running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.tasks[task].running, "the audit finished ({:?})", app.tasks[task].log);
+        let log = recorded(&app);
+        assert_eq!(log.len(), *served.lock().unwrap(), "every request it sent was recorded ({:?})", summary(&log));
+        assert!(log.iter().all(|e| e.tool == "Scanner"), "recorded under its own name ({:?})", summary(&log));
+        assert!(log.iter().any(|e| e.path == "/shop"), "the page it audited ({:?})", summary(&log));
+        assert!(log.iter().any(|e| e.path.contains("?q=")), "and the marker probe ({:?})", summary(&log));
+    }
+
+    /// Pausing capture stops the record and nothing else: the tool goes on sending and goes on
+    /// collecting its tokens, and recording picks up again the moment capture is resumed.
+    #[test]
+    fn pausing_capture_stops_the_record_and_not_the_sequencer() {
+        let (port, served) = canned_server("HTTP/1.1 200 OK\r\nSet-Cookie: sid=token{n}; Path=/", Duration::ZERO);
+        let (ctx, mut app) = capture_app(port, 3);
+        app.capture_paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        start_sequencer(&mut app);
+        drain_capture(&ctx, &mut app);
+        assert_eq!(app.seq_samples.len(), 3, "the capture ran to the end while paused");
+        assert_eq!(*served.lock().unwrap(), 3, "and the requests really were sent");
+        assert!(recorded(&app).is_empty(), "nothing was recorded while capture was paused");
+        assert_eq!(*app.next_id.lock().unwrap(), 0, "and no entry id was spent");
+
+        // resumed: the next capture is recorded as usual
+        app.capture_paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        app.seq_samples.clear();
+        app.seq_target_samples = 2;
+        start_sequencer(&mut app);
+        drain_capture(&ctx, &mut app);
+        let log = recorded(&app);
+        assert_eq!(log.len(), 2, "recording picked up again ({:?})", summary(&log));
+        assert!(log.iter().all(|e| e.tool == "Sequencer"), "under the Sequencer's name");
+    }
+
+    /// Stopping a capture part way through keeps what it has already sent.
+    #[test]
+    fn stopping_a_capture_keeps_the_requests_it_already_sent() {
+        let (port, _served) = canned_server("HTTP/1.1 200 OK\r\nSet-Cookie: sid=token{n}; Path=/", Duration::from_millis(20));
+        let (ctx, mut app) = capture_app(port, 50);
+        start_sequencer(&mut app);
+        // one frame at a time until the first token is in, then stop as the Stop button does
+        for _ in 0..600 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest()));
+            if !app.seq_samples.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.seq_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drain_capture(&ctx, &mut app);
+        let log = recorded(&app);
+        assert!(!log.is_empty(), "the requests sent before the stop are still recorded");
+        assert!(log.len() < 50, "and the capture did stop early ({} recorded)", log.len());
+        assert!(log.iter().all(|e| e.tool == "Sequencer" && e.status == "200 OK"), "{:?}", summary(&log));
     }
 }

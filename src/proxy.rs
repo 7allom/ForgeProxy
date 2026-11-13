@@ -43,6 +43,9 @@ pub fn next_held_id() -> u64 {
 pub struct Shared {
     pub history: History,
     pub next_id: Arc<Mutex<usize>>,
+    /// Logger's capture switch, shared with the rest of the app: while it is set the proxy
+    /// forwards traffic as usual and records none of it.
+    pub capture_paused: Arc<AtomicBool>,
     pub intercept: Arc<AtomicBool>,
     pub held: Arc<Mutex<Vec<Held>>>,
     pub rules: Arc<Mutex<Vec<Rule>>>,
@@ -183,10 +186,16 @@ pub fn start(shared: Shared, addr: String) -> Result<(), String> {
     Ok(())
 }
 
-fn next_id(nid: &Arc<Mutex<usize>>) -> usize {
-    let mut g = nid.lock().unwrap_or_else(|e| e.into_inner());
-    *g += 1;
-    *g
+impl Shared {
+    /// The traffic store, as the recording path takes it.
+    fn recorder(&self) -> crate::http::Recorder {
+        crate::http::Recorder {
+            history: self.history.clone(),
+            next_id: self.next_id.clone(),
+            paused: self.capture_paused.clone(),
+            limit: crate::rules::MAX_RECORDED_REQUESTS,
+        }
+    }
 }
 
 /// Largest request/response head the proxy reads (all header lines together).
@@ -574,8 +583,8 @@ fn tunnel(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, targe
             let _ = client.write_all(format!("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").as_bytes());
             log_error(&sh.events, format!("Tunnel to {target} failed: {e}"));
             // recorded without a status: the target never answered (the 502 is ours)
-            sh.history.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(HttpEntry {
-                id: next_id(&sh.next_id),
+            sh.recorder().record(|id| HttpEntry {
+                id,
                 tool: "Proxy".into(),
                 method: "CONNECT".into(),
                 host: host.clone(),
@@ -588,13 +597,14 @@ fn tunnel(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, targe
                 url: format!("https://{host}/"),
                 truncated: false,
                 time: crate::http::now_ms(),
-            }));
+                // the connection failed: there was nothing to time
+                elapsed_ms: 0,
+            });
             return;
         }
     };
     let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
-    let id = next_id(&sh.next_id);
-    sh.history.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(HttpEntry {
+    sh.recorder().record(|id| HttpEntry {
         id,
         tool: "Proxy".into(),
         method: "CONNECT".into(),
@@ -609,7 +619,9 @@ fn tunnel(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, targe
         url: format!("https://{host}/"),
         truncated: false,
         time: crate::http::now_ms(),
-    }));
+        // the tunnel stays open after this: what it carries is not one exchange to time
+        elapsed_ms: 0,
+    });
     let (Ok(mut up_r), Ok(mut up_w)) = (upstream.try_clone(), upstream.try_clone()) else { return };
     let mut client_r = reader.into_inner();
     let mut client_w2 = client.try_clone().ok();
@@ -786,6 +798,7 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
     // `remainder`: the unread rest of a response too large to buffer
     // `resp_latin1`: the response head wasn't UTF-8 and is held as Latin-1 (sent back as the same bytes)
     #[allow(clippy::type_complexity)]
+    let sent_at = std::time::Instant::now();
     let (status, resp_head, resp_body, mime, remainder, resp_latin1): (String, String, Vec<u8>, String, Option<Box<dyn Read + Send>>, bool) =
         match send_upstream(sh, at, &wire) {
             Ok(Upstream::Complete(text)) => {
@@ -846,14 +859,15 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
     } else {
         String::from_utf8_lossy(&resp_body).into_owned()
     };
-    let id = next_id(&sh.next_id);
     // `at.url` spells the authority the socket went to; an edited Host header replaces it
     let url = if host == at.host && edited_port.is_none() {
         at.url(&path)
     } else {
         Target { https: at.https, host: host.clone(), port: edited_port.unwrap_or(at.port) }.url(&path)
     };
-    sh.history.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(HttpEntry {
+    // the whole exchange with the target, up to the last byte of the response the proxy read
+    let elapsed_ms = sent_at.elapsed().as_millis() as u64;
+    sh.recorder().record(|id| HttpEntry {
         id,
         tool: "Proxy".into(),
         method,
@@ -869,7 +883,8 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         url,
         truncated,
         time: crate::http::now_ms(),
-    }));
+        elapsed_ms,
+    });
     // a streamed response ended the connection (it had no length to frame it by)
     written && !truncated
 }
@@ -883,6 +898,7 @@ mod tests {
         Shared {
             history: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(Mutex::new(0)),
+            capture_paused: Arc::new(AtomicBool::new(false)),
             intercept: Arc::new(AtomicBool::new(false)),
             held: Arc::new(Mutex::new(Vec::new())),
             rules: Arc::new(Mutex::new(Vec::new())),
@@ -1102,6 +1118,32 @@ mod tests {
         assert_eq!(h[0].status, "200 OK");
         assert_eq!(h[0].path, "/hello?x=1");
         assert!(!h[0].request.to_ascii_lowercase().contains("proxy-connection"));
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Logger's capture switch holds for the proxy as it does for the tools: while it is on,
+    /// traffic is forwarded exactly as before and none of it is recorded. `upstream` answers
+    /// two requests, which is one paused and one recorded.
+    #[test]
+    fn paused_capture_forwards_traffic_without_recording_it() {
+        let up = upstream();
+        let sh = shared();
+        sh.capture_paused.store(true, Ordering::SeqCst);
+        let pp = free_port();
+        start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let resp = through_proxy(pp, &format!("http://127.0.0.1:{up}/while-paused"));
+        assert!(resp.contains("got GET /while-paused HTTP/1.1"), "the browser still got its response: {resp}");
+        assert!(sh.history.lock().unwrap().is_empty(), "and nothing was recorded");
+        assert_eq!(*sh.next_id.lock().unwrap(), 0, "nor was an entry id spent");
+
+        sh.capture_paused.store(false, Ordering::SeqCst);
+        let resp = through_proxy(pp, &format!("http://127.0.0.1:{up}/after-resuming"));
+        assert!(resp.contains("got GET /after-resuming HTTP/1.1"), "{resp}");
+        let h = sh.history.lock().unwrap();
+        assert_eq!(h.len(), 1, "recording picked up again");
+        assert_eq!(h[0].path, "/after-resuming");
+        drop(h);
         sh.stop.store(true, Ordering::SeqCst);
     }
 
