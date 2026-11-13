@@ -352,6 +352,49 @@ struct Build {
     line_b: usize,
 }
 
+/// The characters that structure data and addresses. Each is a token of its own, so a value
+/// is compared against the next value rather than against the punctuation stuck to it: without
+/// this, `101,` and `102,` are one token each and `true}` against `true, "debug": 1}` reads as
+/// a change to the whole tail instead of an addition after `true`.
+const DELIMITERS: [char; 17] =
+    ['{', '}', '[', ']', '(', ')', ':', ';', ',', '"', '\'', '/', '?', '&', '=', '<', '>'];
+
+/// Split a line into the tokens the word comparison comparison works on: a run of whitespace,
+/// a run of anything else, or a single delimiter. Concatenating the tokens gives the line back
+/// exactly, which is what lets the panes be rebuilt from them.
+fn word_tokens(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    // whether the run being gathered is whitespace; None when no run is open
+    let mut gathering: Option<bool> = None;
+    for (i, c) in line.char_indices() {
+        if DELIMITERS.contains(&c) {
+            if start < i {
+                out.push(&line[start..i]);
+            }
+            out.push(&line[i..i + c.len_utf8()]);
+            start = i + c.len_utf8();
+            gathering = None;
+            continue;
+        }
+        let whitespace = c.is_whitespace();
+        match gathering {
+            // the run changed kind: close it here and start the next
+            Some(was) if was != whitespace => {
+                out.push(&line[start..i]);
+                start = i;
+            }
+            Some(_) => {}
+            None => start = i,
+        }
+        gathering = Some(whitespace);
+    }
+    if start < line.len() {
+        out.push(&line[start..]);
+    }
+    out
+}
+
 /// Append `text` to `spans`, extending the last span when it is part of the same difference.
 fn append(spans: &mut Vec<Span>, change: Change, hunk: Option<usize>, text: &str) {
     match spans.last_mut() {
@@ -421,12 +464,11 @@ impl Build {
     /// of changed tokens is its own difference and keeps its own kind, so a token only A has
     /// stays a deletion even though the line around it was modified.
     fn modified(&mut self, ta: &str, tb: &str) {
-        let diff = similar::TextDiff::configure().algorithm(similar::Algorithm::Patience).diff_words(ta, tb);
-        let (old, new) = (diff.old_slices(), diff.new_slices());
+        let (old, new) = (word_tokens(ta), word_tokens(tb));
         // one row each, however many token runs changed inside it
         let (mut sa, mut sb) = (Vec::new(), Vec::new());
-        for op in diff.ops() {
-            match *op {
+        for op in similar::capture_diff_slices(similar::Algorithm::Patience, &old, &new) {
+            match op {
                 similar::DiffOp::Equal { old_index, new_index, len } => {
                     for k in 0..len {
                         append(&mut sa, Change::Same, None, old[old_index + k]);
@@ -512,7 +554,67 @@ pub fn diff_words(a: &str, b: &str) -> Option<WordDiff> {
 
 pub const BYTES_PER_ROW: usize = 16;
 
+/// Buffers up to this size (1 MiB each) are aligned with a sequence diff, so a byte inserted
+/// in the middle shifts what follows instead of making every byte after it look changed.
+/// Beyond it the comparison falls back to offset against offset, which is linear and keeps
+/// the window responsive on payloads a sequence diff would labour over.
+pub const MAX_BYTE_ALIGN_SIZE: usize = 1024 * 1024;
+
+/// How long the aligned comparison may take before it settles for what it has. A sequence
+/// diff over two buffers with little in common can cost far more than their length, and a
+/// comparison window that stops drawing is worse than a coarser answer.
+const BYTE_ALIGN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub fn diff_bytes(a: &[u8], b: &[u8]) -> ByteDiff {
+    if a.len() > MAX_BYTE_ALIGN_SIZE || b.len() > MAX_BYTE_ALIGN_SIZE {
+        return diff_bytes_by_offset(a, b);
+    }
+    let mut out = ByteDiff { a: Vec::with_capacity(a.len()), b: Vec::with_capacity(b.len()), differing: 0, diff_rows: Vec::new() };
+    let deadline = std::time::Instant::now() + BYTE_ALIGN_BUDGET;
+    let ops = similar::capture_diff_slices_deadline(similar::Algorithm::Myers, a, b, Some(deadline));
+    let mut rows: Vec<usize> = Vec::new();
+    // a difference is noted at the row it falls on in each item, since one may sit further
+    // down its own dump than the other once bytes have been added or taken away
+    let note = |out: &ByteDiff, rows: &mut Vec<usize>| {
+        for row in [out.a.len().saturating_sub(1) / BYTES_PER_ROW, out.b.len().saturating_sub(1) / BYTES_PER_ROW] {
+            if rows.last() != Some(&row) {
+                rows.push(row);
+            }
+        }
+    };
+    for op in ops {
+        match op {
+            similar::DiffOp::Equal { len, .. } => {
+                out.a.extend(std::iter::repeat_n(Change::Same, len));
+                out.b.extend(std::iter::repeat_n(Change::Same, len));
+            }
+            similar::DiffOp::Delete { old_len, .. } => {
+                out.a.extend(std::iter::repeat_n(Change::Deleted, old_len));
+                out.differing += old_len;
+                note(&out, &mut rows);
+            }
+            similar::DiffOp::Insert { new_len, .. } => {
+                out.b.extend(std::iter::repeat_n(Change::Inserted, new_len));
+                out.differing += new_len;
+                note(&out, &mut rows);
+            }
+            similar::DiffOp::Replace { old_len, new_len, .. } => {
+                out.a.extend(std::iter::repeat_n(Change::Modified, old_len));
+                out.b.extend(std::iter::repeat_n(Change::Modified, new_len));
+                out.differing += old_len.max(new_len);
+                note(&out, &mut rows);
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    out.diff_rows = rows;
+    out
+}
+
+/// The comparison for buffers too large to align: byte at offset *i* against byte at offset
+/// *i*, which cannot follow an insertion but costs one pass.
+fn diff_bytes_by_offset(a: &[u8], b: &[u8]) -> ByteDiff {
     let n = a.len().max(b.len());
     let mut out = ByteDiff { a: Vec::with_capacity(a.len()), b: Vec::with_capacity(b.len()), differing: 0, diff_rows: Vec::new() };
     for i in 0..n {
@@ -761,6 +863,183 @@ mod tests {
         expected_left_ops: Vec<(Change, &'a str)>,
         expected_right_ops: Vec<(Change, &'a str)>,
         expected_jump_rows: Vec<(usize, usize)>,
+    }
+
+    /// The text of every span of one kind, in order, for the item built from `rows`.
+    fn of_kind(rows: &[Row], want: Change) -> Vec<String> {
+        spans(rows).into_iter().filter(|s| s.change == want).map(|s| s.text).collect()
+    }
+
+    /// A value is compared against the next value, not against the punctuation stuck to it.
+    /// Without delimiter tokens, `true}` against `true, "debug": 1}` reads as a change to the
+    /// whole tail, and a path against the same path with more on the end reads as a change to
+    /// all of it.
+    #[test]
+    fn delimiters_are_tokens_of_their_own_matrix() {
+        struct Case<'a> {
+            name: &'a str,
+            a: &'a str,
+            b: &'a str,
+            /// Text that must come back as unchanged on both sides.
+            same: Vec<&'a str>,
+            modified_a: Vec<&'a str>,
+            modified_b: Vec<&'a str>,
+            added: Vec<&'a str>,
+        }
+        let cases = [
+            Case {
+                name: "a field added to the end of an object is an addition, not a rewrite",
+                a: r#"{"id": 101, "role": "user", "active": true}"#,
+                b: r#"{"id": 102, "role": "admin", "active": true, "debug": 1}"#,
+                same: vec!["true", "}"],
+                modified_a: vec!["101", "user"],
+                modified_b: vec!["102", "admin"],
+                added: vec![", \"debug\": 1"],
+            },
+            Case {
+                name: "a path with more on the end keeps the part both share",
+                a: "/api/v1/users",
+                b: "/api/v1/users/42?role=user",
+                same: vec!["/api/v1/users"],
+                modified_a: vec![],
+                modified_b: vec![],
+                added: vec!["/42?role=user"],
+            },
+            Case {
+                name: "a query string gaining a parameter",
+                a: "/search?q=shoes",
+                b: "/search?q=shoes&page=2",
+                same: vec!["/search?q=shoes"],
+                modified_a: vec![],
+                modified_b: vec![],
+                added: vec!["&page=2"],
+            },
+            Case {
+                name: "a value inside brackets, with the brackets left alone",
+                a: "items[0] = 12",
+                b: "items[0] = 34",
+                same: vec!["items[0] = "],
+                modified_a: vec!["12"],
+                modified_b: vec!["34"],
+                added: vec![],
+            },
+        ];
+
+        assert_table!(cases, |idx, Case { name, a, b, same, modified_a, modified_b, added }| {
+            let d = diff_words(a, b).expect("both items are small enough to compare");
+            let unchanged_a = of_kind(&d.a, Change::Same).join("");
+            let unchanged_b = of_kind(&d.b, Change::Same).join("");
+            for text in &same {
+                assert!(unchanged_a.contains(text), "case #{idx} ({name}): {text:?} unchanged in A, got {unchanged_a:?}");
+                assert!(unchanged_b.contains(text), "case #{idx} ({name}): {text:?} unchanged in B, got {unchanged_b:?}");
+            }
+            assert_eq!(of_kind(&d.a, Change::Modified), modified_a, "case #{idx} ({name}): amber in A");
+            assert_eq!(of_kind(&d.b, Change::Modified), modified_b, "case #{idx} ({name}): amber in B");
+            assert_eq!(of_kind(&d.b, Change::Inserted), added, "case #{idx} ({name}): green in B");
+            assert!(of_kind(&d.a, Change::Deleted).is_empty(), "case #{idx} ({name}): nothing is taken away");
+            // and the tokens still spell the items they came from
+            assert_eq!(rebuilt(&d.a), a, "case #{idx} ({name}): item A reads back");
+            assert_eq!(rebuilt(&d.b), b, "case #{idx} ({name}): item B reads back");
+        });
+    }
+
+    /// Every token the comparison works on, concatenated, is the line it came from.
+    #[test]
+    fn word_tokens_split_without_losing_anything_matrix() {
+        let cases: [(&str, &str, Vec<&str>); 7] = [
+            ("delimiters stand alone", "{\"a\": 1}", vec!["{", "\"", "a", "\"", ":", " ", "1", "}"]),
+            ("a path splits on its slashes", "/api/v1", vec!["/", "api", "/", "v1"]),
+            ("a query string splits on its punctuation", "?a=1&b=2", vec!["?", "a", "=", "1", "&", "b", "=", "2"]),
+            ("runs of whitespace are one token", "a   b", vec!["a", "   ", "b"]),
+            ("a word run is one token", "Content-Length", vec!["Content-Length"]),
+            ("leading whitespace is kept", "  x", vec!["  ", "x"]),
+            ("nothing at all", "", vec![]),
+        ];
+        assert_table!(cases, |idx, (what, line, expected)| {
+            assert_eq!(word_tokens(line), expected, "case #{idx} ({what})");
+            assert_eq!(word_tokens(line).concat(), line, "case #{idx} ({what}): the line reads back");
+        });
+    }
+
+    /// Bytes put into the middle of a payload shift what follows instead of making every byte
+    /// after them look changed: the bytes on either side stay as they are, and only the new
+    /// ones are marked.
+    #[test]
+    fn inserted_bytes_leave_the_rest_of_the_payload_alone_matrix() {
+        struct Case<'a> {
+            name: &'a str,
+            a: &'a [u8],
+            b: &'a [u8],
+            /// How many bytes of each item are marked as unchanged.
+            same_a: usize,
+            same_b: usize,
+            differing: usize,
+        }
+        let cases = [
+            Case {
+                name: "two bytes put in the middle",
+                a: b"HEADER----PAYLOAD----FOOTER",
+                b: b"HEADER----PAY!!LOAD----FOOTER",
+                same_a: 27,
+                same_b: 27,
+                differing: 2,
+            },
+            Case {
+                name: "two bytes taken out of the middle",
+                a: b"HEADER----PAY!!LOAD----FOOTER",
+                b: b"HEADER----PAYLOAD----FOOTER",
+                same_a: 27,
+                same_b: 27,
+                differing: 2,
+            },
+            Case {
+                name: "one byte put at the front",
+                a: b"0123456789abcdef0123456789abcdef",
+                b: b"X0123456789abcdef0123456789abcdef",
+                same_a: 32,
+                same_b: 32,
+                differing: 1,
+            },
+            Case {
+                name: "a byte changed in place is still a change in place",
+                a: b"0123456789abcdef",
+                b: b"0123X56789abcdef",
+                same_a: 15,
+                same_b: 15,
+                differing: 1,
+            },
+            Case {
+                name: "two payloads with nothing in common",
+                a: b"AAAAAAAA",
+                b: b"BBBBBBBB",
+                same_a: 0,
+                same_b: 0,
+                differing: 8,
+            },
+        ];
+
+        assert_table!(cases, |idx, Case { name, a, b, same_a, same_b, differing }| {
+            let d = diff_bytes(a, b);
+            assert_eq!(d.a.len(), a.len(), "case #{idx} ({name}): one mark per byte of A");
+            assert_eq!(d.b.len(), b.len(), "case #{idx} ({name}): one mark per byte of B");
+            assert_eq!(d.a.iter().filter(|c| **c == Change::Same).count(), same_a, "case #{idx} ({name}): A untouched");
+            assert_eq!(d.b.iter().filter(|c| **c == Change::Same).count(), same_b, "case #{idx} ({name}): B untouched");
+            assert_eq!(d.differing, differing, "case #{idx} ({name}): bytes counted as differing");
+            // the bytes marked unchanged in each item really are the same bytes, in order
+            let kept = |data: &[u8], marks: &[Change]| -> Vec<u8> {
+                data.iter().zip(marks).filter(|(_, c)| **c == Change::Same).map(|(byte, _)| *byte).collect()
+            };
+            assert_eq!(kept(a, &d.a), kept(b, &d.b), "case #{idx} ({name}): both items kept the same bytes");
+        });
+
+        // a buffer past the ceiling falls back to the offset-by-offset comparison, which is
+        // coarser but will not keep the window waiting
+        let big_a = vec![b'x'; MAX_BYTE_ALIGN_SIZE + 1];
+        let mut big_b = big_a.clone();
+        big_b[0] = b'y';
+        let d = diff_bytes(&big_a, &big_b);
+        assert_eq!(d.differing, 1, "the one byte that differs is still found");
+        assert_eq!(d.a.len(), big_a.len());
     }
 
     #[test]
@@ -1015,14 +1294,47 @@ mod tests {
             }
             assert_eq!(applied, right, "case #{idx} ({name}) edit script application");
 
-            // 3. Byte-level diff invariant: applying byte changes to `left` reconstructs `right`
+            // 3. Byte-level diff invariant: the two change streams describe one edit script.
+            // They are walked together -- a byte marked the same or modified is consumed from
+            // both items, a deleted one from the left only and an inserted one from the right
+            // only -- and the left item plus that script has to give the right item back. The
+            // walk is what proves the alignment: the two streams no longer share an index.
             let bd = diff_bytes(left.as_bytes(), right.as_bytes());
             let mut rebuilt_bytes = Vec::with_capacity(right.len());
-            for (i, &ch) in bd.b.iter().enumerate() {
-                match ch {
-                    Change::Same => rebuilt_bytes.push(left.as_bytes()[i]),
-                    Change::Modified | Change::Inserted => rebuilt_bytes.push(right.as_bytes()[i]),
-                    Change::Deleted => unreachable!("Deleted only appears in bd.a"),
+            let (mut ia, mut ib) = (0usize, 0usize);
+            while ia < bd.a.len() || ib < bd.b.len() {
+                match (bd.a.get(ia).copied(), bd.b.get(ib).copied()) {
+                    (Some(Change::Same), Some(Change::Same)) => {
+                        assert_eq!(
+                            left.as_bytes()[ia], right.as_bytes()[ib],
+                            "case #{idx} ({name}): a byte marked unchanged is the byte it was lined up with"
+                        );
+                        rebuilt_bytes.push(right.as_bytes()[ib]);
+                        ia += 1;
+                        ib += 1;
+                    }
+                    (Some(Change::Deleted), _) | (Some(_), None) => ia += 1,
+                    (_, Some(Change::Inserted)) | (None, Some(_)) => {
+                        rebuilt_bytes.push(right.as_bytes()[ib]);
+                        ib += 1;
+                    }
+                    // a replacement: the two runs stand for each other whatever their lengths,
+                    // so each is taken whole rather than a byte at a time
+                    (Some(Change::Modified), _) | (_, Some(Change::Modified)) => {
+                        while bd.a.get(ia) == Some(&Change::Modified) {
+                            ia += 1;
+                        }
+                        while bd.b.get(ib) == Some(&Change::Modified) {
+                            rebuilt_bytes.push(right.as_bytes()[ib]);
+                            ib += 1;
+                        }
+                    }
+                    (None, None) => break,
+                    // a deletion is only ever marked on the left item and an insertion only
+                    // on the right, so no other pairing exists
+                    (left_change, right_change) => {
+                        unreachable!("case #{idx} ({name}): {left_change:?} against {right_change:?}")
+                    }
                 }
             }
             assert_eq!(rebuilt_bytes, right.as_bytes(), "case #{idx} ({name}) byte diff reconstruction");
@@ -1097,7 +1409,9 @@ mod tests {
         assert_eq!(v.difference_count(), 1);
         assert!(v.bytes.is_none(), "bytes computed only when shown");
         v.set_mode(DiffMode::Bytes);
-        assert_eq!(v.difference_count(), 6);
+        // "alpha beta" against "alpha gamma!": the shared prefix is left alone and only the
+        // bytes the alignment cannot pair up are counted
+        assert_eq!(v.difference_count(), 5);
         assert_eq!(v.jump_targets(), [0]);
         v.set_mode(DiffMode::Words);
         assert!(!v.poll(), "already computed: not started again");
@@ -1193,8 +1507,10 @@ mod tests {
                 kinds: vec![Change::Modified, Change::Modified],
                 deleted: vec![],
                 added: vec![],
-                modified_a: vec!["GET", "/users/42"],
-                modified_b: vec!["POST", "/orders"],
+                // the leading "/" is a token of its own and is common to both targets, so
+                // only what follows it is marked
+                modified_a: vec!["GET", "users/42"],
+                modified_b: vec!["POST", "orders"],
             },
             ClassCase {
                 name: "no ghost pairing: unrelated headers on the same line of each item",
@@ -1213,8 +1529,9 @@ mod tests {
                 kinds: vec![Change::Modified, Change::Modified, Change::Deleted, Change::Inserted, Change::Inserted],
                 deleted: vec!["User-Agent: Mozilla/5.0\r\n"],
                 added: vec!["Content-Length: 48\r\n", "{\"sku\":\"A-1\",\"qty\":2}"],
-                modified_a: vec!["GET", "/users/42"],
-                modified_b: vec!["POST", "/orders"],
+                // the leading "/" is common to both targets, so only what follows it is marked
+                modified_a: vec!["GET", "users/42"],
+                modified_b: vec!["POST", "orders"],
             },
             ClassCase {
                 name: "a body line mostly the same is modified, not swapped out",
@@ -1223,8 +1540,10 @@ mod tests {
                 kinds: vec![Change::Modified],
                 deleted: vec![],
                 added: vec![],
-                modified_a: vec!["\"viewer\","],
-                modified_b: vec!["\"admin\","],
+                // the quotes and the comma around the value are tokens of their own and are
+                // common to both, so only the value itself is marked
+                modified_a: vec!["viewer"],
+                modified_b: vec!["admin"],
             },
             ClassCase {
                 name: "a body line sharing no words is a deletion and an addition",
