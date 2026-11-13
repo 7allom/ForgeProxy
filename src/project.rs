@@ -25,6 +25,10 @@ pub struct ProjectFile {
     pub history: Vec<HttpEntry>,
     pub tasks: Vec<Task>,
     pub organizer: Vec<OrgItem>,
+    /// The Organizer's collections. Absent from files saved before collections existed,
+    /// whose items all read back in the inbox.
+    #[serde(default = "crate::organizer::default_collections")]
+    pub org_collections: Vec<crate::organizer::OrgCollection>,
     pub repeater_url: String,
     pub repeater_request: String,
     pub intruder_target: String,
@@ -68,6 +72,7 @@ pub fn snapshot(app: &App) -> ProjectFile {
         history: app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| (**e).clone()).collect(),
         tasks: app.tasks.iter().cloned().map(|mut t| { t.running = false; t }).collect(),
         organizer: app.organizer.clone(),
+        org_collections: app.org_collections.clone(),
         // the active tab, also in the old fields (older versions read only those)
         repeater_url: app.rep().url.clone(),
         repeater_request: app.rep().request.clone(),
@@ -149,6 +154,12 @@ pub fn reset(app: &mut App) {
     app.new_scan_crawl = true;
     app.organizer.clear();
     app.org_sel = None;
+    app.org_collections = crate::organizer::default_collections();
+    app.org_collection = crate::organizer::INBOX;
+    app.org_view = crate::organizer::OrgView::default();
+    app.org_renaming = None;
+    app.org_new_collection = None;
+    app.org_message.clear();
     app.discover_sel = None;
     app.reset_repeater();
     app.rep_renaming = None;
@@ -177,7 +188,18 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     if !f.tasks.is_empty() {
         app.tasks = f.tasks;
     }
+    // the collections first, then the items, then the mending of anything the file was
+    // saved too early to hold: ids of their own for the items, and a collection that is
+    // really there for each of them
+    app.org_collections = f.org_collections;
     app.organizer = f.organizer;
+    crate::organizer::renumber(&mut app.organizer);
+    crate::organizer::adopt_orphans(&mut app.organizer, &mut app.org_collections);
+    app.org_collection = crate::organizer::INBOX;
+    app.org_sel = None;
+    app.org_renaming = None;
+    app.org_new_collection = None;
+    app.org_message.clear();
     // the project's Repeater tabs replace the open ones
     app.rep_renaming = None;
     if !f.repeater_tabs.is_empty() {
@@ -262,6 +284,116 @@ mod tests {
         let back: ProjectFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scope(), f.target_scope);
         assert_eq!(back.match_replace.len(), 12);
+    }
+
+    /// An app with an Organizer worth saving: two collections, an item in each, with the
+    /// statuses, highlights and notes that make a triage worth keeping.
+    fn organized_app() -> App {
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
+        crate::actions::send_to_organizer(
+            &mut app,
+            "http://shop.test/cart?id=2",
+            "GET /cart?id=2 HTTP/1.1\nHost: shop.test\n\n",
+            "HTTP/1.1 200 OK\ncontent-length: 2\n\nok",
+        );
+        crate::actions::send_to_organizer(
+            &mut app,
+            "http://api.test/v1/login",
+            "POST /v1/login HTTP/1.1\nHost: api.test\n\nuser=root",
+            "HTTP/1.1 401 Unauthorized\n\ndenied",
+        );
+        let auth = crate::organizer::add_collection(&mut app.org_collections, "Auth flows");
+        app.organizer[1].collection = auth;
+        app.organizer[0].status = crate::state::OrgStatus::Postponed;
+        app.organizer[0].highlight = Some(3);
+        app.organizer[0].note = "comes back twice\nsecond line".into();
+        app.organizer[1].status = crate::state::OrgStatus::Done;
+        app.organizer[1].note = "401 as it should".into();
+        app
+    }
+
+    /// A project file carries the whole of the Organizer: its collections, which collection
+    /// each item is in, the raw request and response, and the status, highlight and notes the
+    /// triage put on them. Work done in the Organizer is the kind nobody wants to do twice.
+    #[test]
+    fn a_project_keeps_the_organizer_whole() {
+        let app = organized_app();
+        let saved = serde_json::to_string(&snapshot(&app)).unwrap();
+        let back: ProjectFile = serde_json::from_str(&saved).unwrap();
+
+        let mut loaded = {
+            let ctx = eframe::egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx);
+            App::new(&cc, Some("/dev/null".into()), None, false)
+        };
+        apply_all(&mut loaded, back);
+
+        assert_eq!(loaded.org_collections, app.org_collections, "the collections, with their ids and names");
+        assert_eq!(loaded.organizer.len(), 2);
+        for (got, want) in loaded.organizer.iter().zip(app.organizer.iter()) {
+            let what = format!("item #{}", want.id);
+            assert_eq!((got.id, got.collection), (want.id, want.collection), "{what}: its id and the collection it is in");
+            assert_eq!((&got.method, &got.host, &got.path, &got.url), (&want.method, &want.host, &want.path, &want.url), "{what}: its address");
+            assert_eq!(got.request, want.request, "{what}: the raw request");
+            assert_eq!(got.response, want.response, "{what}: the raw response");
+            assert_eq!(got.status, want.status, "{what}: its status");
+            assert_eq!(got.highlight, want.highlight, "{what}: its highlight");
+            assert_eq!(got.note, want.note, "{what}: its notes, line breaks and all");
+        }
+        assert_eq!(loaded.organizer[0].note.lines().count(), 2, "a note of two lines comes back as two");
+        // and the table can be drawn from what came back: each collection shows its own item
+        let view = crate::organizer::OrgView::default();
+        let auth = loaded.org_collections[1].id;
+        assert_eq!(crate::organizer::rows(&loaded.organizer, crate::organizer::INBOX, &view).len(), 1);
+        assert_eq!(crate::organizer::rows(&loaded.organizer, auth, &view).len(), 1);
+    }
+
+    /// A project saved before the Organizer had collections, or ids for its items, has to
+    /// open without either -- with everything in the inbox and an id apiece, rather than a
+    /// table of items that cannot be told apart.
+    #[test]
+    fn an_organizer_from_an_older_project_opens_in_the_inbox() {
+        let old = r#"{"version":1,"name":"o","match_replace":[],"history":[],"tasks":[],
+            "organizer":[
+                {"method":"GET","host":"shop.test","path":"/cart","note":"had a look","highlight":2,"status":"Postponed"},
+                {"method":"POST","host":"api.test","path":"/login","note":"","highlight":null,"status":"New"}
+            ],
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#;
+        let f: ProjectFile = serde_json::from_str(old).expect("an older project file still reads");
+        assert_eq!(f.org_collections, crate::organizer::default_collections(), "the inbox stands in for the collections it has none of");
+
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
+        apply_all(&mut app, f);
+
+        assert_eq!(app.organizer.iter().map(|it| it.id).collect::<Vec<_>>(), [1, 2], "an id apiece");
+        assert!(app.organizer.iter().all(|it| it.collection == crate::organizer::INBOX), "everything in the inbox");
+        assert_eq!(app.organizer[0].note, "had a look", "and what the file did hold is kept");
+        assert_eq!(app.organizer[0].highlight, Some(2));
+        assert_eq!(app.organizer[0].status, crate::state::OrgStatus::Postponed);
+        // both rows are in the table, and they are two rows and not one
+        let rows = crate::organizer::rows(&app.organizer, crate::organizer::INBOX, &crate::organizer::OrgView::default());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(app.organizer[rows[0]].id, 1);
+    }
+
+    /// Saving and reading a real file on disk, rather than the JSON in between.
+    #[test]
+    fn the_organizer_survives_a_file_on_disk() {
+        let app = organized_app();
+        let dir = std::env::temp_dir().join(format!("forgeproxy-organizer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("triage.forge").display().to_string();
+        save(&app, &path).unwrap();
+        let f = read(&path).expect("the file reads back");
+        assert_eq!(f.org_collections, app.org_collections);
+        assert_eq!(f.organizer.len(), 2);
+        assert_eq!(f.organizer[1].note, "401 as it should");
+        assert_eq!(f.organizer[1].collection, app.org_collections[1].id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

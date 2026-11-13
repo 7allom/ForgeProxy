@@ -34,7 +34,7 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OrgStatus { New, InProgress, Postponed, Done, Ignored }
 impl OrgStatus {
     pub const ALL: [OrgStatus; 5] = [OrgStatus::New, OrgStatus::InProgress, OrgStatus::Postponed, OrgStatus::Done, OrgStatus::Ignored];
@@ -48,6 +48,16 @@ impl OrgStatus {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrgItem {
+    /// Identifies the item for as long as the project lives, which is what the table's
+    /// selection, its inline editors and its row actions all name. Ids are never reused, so
+    /// sorting the table or removing a row cannot leave a selection meaning another item.
+    /// Items saved before this all read back as 0 and are renumbered on load.
+    #[serde(default)]
+    pub id: usize,
+    /// The collection the item is in, by id. Items saved before collections existed read
+    /// back as [`crate::organizer::INBOX`], which is where everything arrives anyway.
+    #[serde(default)]
+    pub collection: usize,
     pub method: String,
     pub host: String,
     pub path: String,
@@ -439,10 +449,21 @@ pub struct App {
 
     // organizer
     pub organizer: Vec<OrgItem>,
+    /// The selected item, by [`OrgItem::id`] -- not by row, which sorting and filtering move
+    /// about, and not by index, which a removal shifts.
     pub org_sel: Option<usize>,
-    pub org_only_highlighted: bool,
-    pub org_only_notes: bool,
-    pub org_search: String,
+    /// The collections items are filed in, the inbox first.
+    pub org_collections: Vec<crate::organizer::OrgCollection>,
+    /// The collection whose table is showing, by id.
+    pub org_collection: usize,
+    /// The filters and the sort order of that table.
+    pub org_view: crate::organizer::OrgView,
+    /// The collection being renamed and the name being typed, while the sidebar is asking.
+    pub org_renaming: Option<(usize, String)>,
+    /// The name being typed for a new collection, while the sidebar is asking.
+    pub org_new_collection: Option<String>,
+    /// What became of the last collection that was deleted, to say where its items went.
+    pub org_message: String,
     pub discover_sel: Option<usize>,
 
     // extensions
@@ -647,9 +668,12 @@ impl App {
             comparer_paste: String::new(),
             organizer: Vec::new(),
             org_sel: None,
-            org_only_highlighted: false,
-            org_only_notes: false,
-            org_search: String::new(),
+            org_collections: crate::organizer::default_collections(),
+            org_collection: crate::organizer::INBOX,
+            org_view: crate::organizer::OrgView::default(),
+            org_renaming: None,
+            org_new_collection: None,
+            org_message: String::new(),
             discover_sel: None,
             show_settings: false,
             settings_page: SettingsPage::Proxy,

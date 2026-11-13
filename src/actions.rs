@@ -680,7 +680,10 @@ pub fn send_to_sequencer(app: &mut App, url: &str, request: &str) {
     app.tab = crate::state::Tab::Sequencer;
 }
 
-/// "Send to Organizer": stores the request/response in the Organizer inbox and switches to Organizer.
+/// "Send to Organizer": files the request/response in the Organizer's inbox, selects it and
+/// switches to Organizer. The inbox is where everything arrives, whichever collection the
+/// table happens to be showing -- an item cannot be put straight into a collection the user
+/// is not looking at without it seeming to have gone nowhere.
 pub fn send_to_organizer(app: &mut App, url: &str, request: &str, response: &str) {
     use crate::state::{OrgItem, OrgStatus, Tab};
     let fb = active_fallback_for(app, request);
@@ -689,7 +692,10 @@ pub fn send_to_organizer(app: &mut App, url: &str, request: &str, response: &str
     let full_url = format!("{}{path}", target.to_url());
     let (host, path) = http::split_url(&full_url);
     let method = request_method(request).unwrap_or_else(|| "GET".to_string());
+    let id = crate::organizer::next_item_id(&app.organizer);
     app.organizer.push(OrgItem {
+        id,
+        collection: crate::organizer::INBOX,
         method,
         host,
         path,
@@ -700,6 +706,8 @@ pub fn send_to_organizer(app: &mut App, url: &str, request: &str, response: &str
         response: response.to_string(),
         url: full_url,
     });
+    app.org_collection = crate::organizer::INBOX;
+    app.org_sel = Some(id);
     app.tab = Tab::Organizer;
 }
 

@@ -5,9 +5,8 @@ use crate::decoder_ops;
 use crate::editor;
 use crate::intruder::{self, AttackType};
 use crate::issue_defs;
-use crate::rules;
 use crate::state::{App, DecBlock, Tab};
-use crate::theme::{self, bold, EmptyIcon, Palette, HIGHLIGHTS};
+use crate::theme::{self, bold, EmptyIcon, Palette};
 use crate::ui_core::{c, method_color, sub_tabs};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Stroke, Ui};
@@ -658,7 +657,7 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 // the results keep the order they were recorded in; only the view is sorted
                 let order = app.int_sort.order(&app.int_results);
                 theme::table_well(ui, p, (ui.available_height() - 4.0).max(60.0), |ui| {
-                    sort_click = sort_header(ui, p, &cols, app.int_sort.sort_column, !app.int_sort.sort_desc);
+                    sort_click = theme::sort_header(ui, p, &cols, app.int_sort.sort_column, !app.int_sort.sort_desc);
                     egui::ScrollArea::vertical().id_salt("int_results").auto_shrink([false, false]).show(ui, |ui| {
                         if app.int_results.is_empty() {
                             ui.label(RichText::new("Waiting for the first response...").color(p.disabled));
@@ -1868,11 +1867,11 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                 use crate::history::HistorySortColumn as C;
                 let cols: &[(&str, f32, C)] = &[("#", w[0], C::Id), ("Time", w[1], C::Time), ("Tool", w[2], C::Tool), ("Method", w[3], C::Method), ("Host", w[4], C::Host),
                     ("Path", w[5], C::Path), ("Status code", w[6], C::Status), ("Length", w[7], C::Length), ("MIME type", w[8], C::Mime)];
-                if let Some(col) = sort_header(ui, p, cols, app.history_filter.sort_column, app.history_filter.sort_ascending) {
+                if let Some(col) = theme::sort_header(ui, p, cols, app.history_filter.sort_column, app.history_filter.sort_ascending) {
                     app.history_filter.click_column(col);
                 }
                 // only the rows in view are drawn (history can hold thousands)
-                egui::ScrollArea::vertical().id_salt(("traffic", view as u8)).show_rows(ui, 19.0, hist.len(), |ui, range| {
+                egui::ScrollArea::vertical().id_salt(("traffic", view as u8)).show_rows(ui, theme::ROW_HEIGHT, hist.len(), |ui, range| {
                     for (i, e) in hist.iter().enumerate().skip(range.start).take(range.len()) {
                         let cells = [
                             (e.id.to_string(), w[0], None),
@@ -1912,42 +1911,6 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
 const HISTORY_COLS: [(f32, f32); 9] = [(50.0, 0.0), (72.0, 0.0), (80.0, 0.0), (70.0, 0.0), (200.0, 0.0),
     (220.0, 1.0), (170.0, 0.0), (80.0, 0.0), (150.0, 0.0)];
 
-/// The table header with each column a button: click to sort by it, again to reverse.
-/// The column currently sorted on shows a triangle (up: ascending). Returns the column that
-/// was clicked, if any; the caller owns the sort state, so history and Intruder share this.
-fn sort_header<C: Copy + PartialEq>(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, C)], active: Option<C>, ascending: bool) -> Option<C> {
-    let mut clicked = None;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, p.header);
-    let mut x = rect.left();
-    for (i, (name, w, col)) in cols.iter().enumerate() {
-        let cell = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2((x + w).min(rect.right()), rect.bottom()));
-        let r = ui.interact(cell, ui.id().with(("sort_col", i)), egui::Sense::click());
-        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *name));
-        if r.hovered() {
-            ui.painter().rect_filled(cell, 0.0, p.hover);
-        }
-        let label = ui.painter().text(egui::pos2(x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, *name, FontId::proportional(12.5), p.text);
-        if active == Some(*col) {
-            // drawn, not a glyph: the bundled fonts have no triangles
-            let c = egui::pos2(label.right() + 8.0, rect.center().y);
-            let pts = if ascending {
-                vec![c + egui::vec2(-4.0, 2.5), c + egui::vec2(4.0, 2.5), c + egui::vec2(0.0, -3.0)]
-            } else {
-                vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.0)]
-            };
-            ui.painter().add(egui::Shape::convex_polygon(pts, p.strong, egui::Stroke::NONE));
-        }
-        if r.on_hover_text(format!("Sort by {name}")).clicked() {
-            clicked = Some(*col);
-        }
-        x += w;
-        if i + 1 < cols.len() {
-            ui.painter().line_segment([egui::pos2(x - 4.0, rect.top() + 2.0), egui::pos2(x - 4.0, rect.bottom() - 2.0)], egui::Stroke::new(1.0_f32, p.deep));
-        }
-    }
-    clicked
-}
 
 /// Carry out a message editor's right-click choice. `what` names the message for a
 /// Comparer item's label ("Repeater response", "Proxy history #3 request").
@@ -2096,160 +2059,6 @@ pub fn attach_view_context_menu(
     label: &str,
 ) {
     attach_editor_context_menu(&view.out, view.shown_text(raw_active), raw_active, app, source_tab, url, request, response, label);
-}
-
-// ---- Organizer (picture-23) ---------------------------------------------
-pub fn organizer(app: &mut App, ui: &mut Ui, p: &Palette) {
-    egui::SidePanel::left("collections").resizable(true).default_width(220.0)
-        .frame(egui::Frame::new().fill(p.deep).inner_margin(egui::Margin::same(8))).show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(bold("Collections", 14.0).color(p.strong));
-            });
-            ui.add_space(6.0);
-            ui.add(egui::TextEdit::singleline(&mut app.org_search).desired_width(f32::INFINITY).hint_text("Search address or notes"));
-            ui.add_space(6.0);
-            egui::Frame::new().fill(p.selection).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new("Inbox").color(p.strong));
-            });
-        });
-    let sel_item = app.org_sel.and_then(|i| app.organizer.get(i).cloned().map(|it| (i, it)));
-    if let Some((sel_idx, it)) = sel_item {
-        let item_url = actions::org_item_url(&it);
-        let item_req = actions::org_item_request(&it);
-        let item_resp = it.response.clone();
-        egui::TopBottomPanel::bottom("org_detail")
-            .resizable(true)
-            .default_height(240.0)
-            .min_height(100.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { top: 6, ..Default::default() }))
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(bold(format!("{} {}{}", it.method, it.host, it.path), 12.5).color(p.strong));
-                    if theme::plain_button(ui, p, "Send to Repeater", true).clicked() {
-                        actions::send_to_repeater(app, &it.method, &item_url, &item_req);
-                    }
-                    if theme::plain_button(ui, p, "Send to Intruder", true).clicked() {
-                        actions::send_to_intruder(app, &item_url, &item_req);
-                    }
-                    if theme::plain_button(ui, p, "Send to Sequencer", true).clicked() {
-                        actions::send_to_sequencer(app, &item_url, &item_req);
-                    }
-                    if theme::plain_button(ui, p, "Send to Comparer", true).clicked() {
-                        let data = if !item_resp.is_empty() { item_resp.as_bytes() } else { item_req.as_bytes() };
-                        crate::comparer::add(app, format!("Organizer #{sel_idx}"), data);
-                        app.tab = Tab::Comparer;
-                    }
-                    if theme::plain_button(ui, p, "Send to Decoder", true).clicked() {
-                        actions::send_text_to_decoder(app, item_req.clone());
-                    }
-                });
-                let h = (ui.available_height() - 22.0).max(80.0);
-                let (out_req, out_resp) = theme::columns(ui, 2, |cols| {
-                    cols[0].label(bold("Request", 12.5).color(p.strong));
-                    let req_v = editor::message_view(&mut cols[0], p, &format!("org_req_{sel_idx}"), &item_req, h);
-                    cols[1].label(bold("Response", 12.5).color(p.strong));
-                    let resp_v = editor::message_view(&mut cols[1], p, &format!("org_resp_{sel_idx}"), &item_resp, h);
-                    (req_v, resp_v)
-                });
-                attach_view_context_menu(&out_req, &item_req, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &format!("Organizer #{sel_idx} request"));
-                attach_view_context_menu(&out_resp, &item_resp, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &format!("Organizer #{sel_idx} response"));
-            });
-    }
-    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(10))).show_inside(ui, |ui| {
-        ui.horizontal(|ui| { ui.label(bold("Inbox", 14.0).color(p.strong)); });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut app.org_only_highlighted, "Only highlighted");
-            ui.checkbox(&mut app.org_only_notes, "Only items with notes");
-        });
-        ui.add_space(6.0);
-        if app.organizer.is_empty() {
-            let _ = theme::empty_state(ui, p, EmptyIcon::Organizer, "Organizer inbox is empty",
-                "To get started, send a message to Organizer from anywhere in the suite.", None);
-        } else {
-            let q = app.org_search.to_ascii_lowercase();
-            let mut remove = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("org").striped(true).num_columns(6).spacing([10.0, 4.0]).show(ui, |ui| {
-                    for h in ["Status", "Highlight", "Method", "Address", "Notes", ""] {
-                        ui.label(bold(h, 12.5).color(p.strong));
-                    }
-                    ui.end_row();
-                    let len = app.organizer.len();
-                    for i in 0..len {
-                        let (ext_hidden, matches_filter, item_url, item_req, item_resp, method, host, path, highlight) = {
-                            let it = &app.organizer[i];
-                            let ext_hidden = it.path.contains('.')
-                                && it.path.rsplit('.').next().is_some_and(|e| rules::ORGANIZER_HIDE_EXTENSIONS.contains(&e));
-                            let matches_filter = (q.is_empty() || format!("{}{} {}", it.host, it.path, it.note).to_ascii_lowercase().contains(&q))
-                                && (!app.org_only_highlighted || it.highlight.is_some())
-                                && (!app.org_only_notes || !it.note.trim().is_empty());
-                            (
-                                ext_hidden,
-                                matches_filter,
-                                actions::org_item_url(it),
-                                actions::org_item_request(it),
-                                it.response.clone(),
-                                it.method.clone(),
-                                it.host.clone(),
-                                it.path.clone(),
-                                it.highlight,
-                            )
-                        };
-                        if ext_hidden || !matches_filter {
-                            continue;
-                        }
-                        {
-                            let it = &mut app.organizer[i];
-                            egui::ComboBox::from_id_salt(("orgst", i)).width(100.0)
-                                .selected_text(RichText::new(it.status.label()).color(it.status.color(p)))
-                                .show_ui(ui, |ui| {
-                                    for st in crate::state::OrgStatus::ALL {
-                                        ui.selectable_value(&mut it.status, st, RichText::new(st.label()).color(st.color(p)));
-                                    }
-                                });
-                            egui::ComboBox::from_id_salt(("orghl", i)).width(80.0)
-                                .selected_text(it.highlight.map(|h| HIGHLIGHTS[h].0).unwrap_or("None"))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut it.highlight, None, "None");
-                                    for (h, (name, col)) in HIGHLIGHTS.iter().enumerate() {
-                                        ui.selectable_value(&mut it.highlight, Some(h), RichText::new(*name).background_color(*col).color(Color32::BLACK));
-                                    }
-                                });
-                        }
-                        let m_resp = ui.add(egui::Label::new(RichText::new(&method).color(method_color(p, &method))).sense(egui::Sense::click()));
-                        let addr = RichText::new(format!("{host}{path}"));
-                        let addr_styled = match highlight { Some(h) => addr.background_color(HIGHLIGHTS[h].1).color(Color32::BLACK), None => addr };
-                        let a_resp = ui.add(egui::Label::new(addr_styled).sense(egui::Sense::click()));
-                        if m_resp.clicked() || a_resp.clicked() {
-                            app.org_sel = if app.org_sel == Some(i) { None } else { Some(i) };
-                        }
-                        let row_label = format!("Organizer #{i} ({method} {host}{path})");
-                        m_resp.context_menu(|ui| {
-                            show_traffic_context_menu(ui, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &item_req, None, &row_label);
-                        });
-                        a_resp.context_menu(|ui| {
-                            show_traffic_context_menu(ui, app, Tab::Organizer, &item_url, &item_req, Some(&item_resp), &item_req, None, &row_label);
-                        });
-                        ui.add_sized([320.0, 20.0], egui::TextEdit::singleline(&mut app.organizer[i].note).hint_text("Add a note"));
-                        if ui.small_button("Remove").clicked() { remove = Some(i); }
-                        ui.end_row();
-                    }
-                });
-            });
-            if let Some(i) = remove {
-                app.organizer.remove(i);
-                if app.org_sel == Some(i) {
-                    app.org_sel = None;
-                } else if let Some(sel) = app.org_sel {
-                    if sel > i {
-                        app.org_sel = Some(sel - 1);
-                    }
-                }
-            }
-        }
-    });
 }
 
 // ---- Discover (picture-25, 26) ------------------------------------------
@@ -2561,7 +2370,7 @@ mod sort_header_tests {
                 crate::theme::apply(ctx, crate::theme::Look::Dark);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     origin = ui.cursor().min;
-                    clicked = sort_header(ui, &crate::theme::DARK, &COLS, Some(C::Request), true);
+                    clicked = crate::theme::sort_header(ui, &crate::theme::DARK, &COLS, Some(C::Request), true);
                 });
             });
             (origin, clicked)

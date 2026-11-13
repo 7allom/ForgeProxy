@@ -463,6 +463,26 @@ mod layout_tests {
                     crate::comparer::DiffMode::Bytes,
                 ));
             }),
+            Scene("Organizer, with a row selected and its message under it", |a| {
+                a.tab = Tab::Organizer;
+                crate::actions::send_to_organizer(
+                    a,
+                    "http://shop.test/cart?id=2",
+                    "GET /cart?id=2 HTTP/1.1\nHost: shop.test\n\n",
+                    "HTTP/1.1 200 OK\ncontent-length: 2\n\nok",
+                );
+                a.organizer[0].note = "two lines\nof notes".into();
+                a.organizer[0].highlight = Some(0);
+            }),
+            Scene("Organizer, a collection of its own", |a| {
+                a.tab = Tab::Organizer;
+                crate::actions::send_to_organizer(a, "http://shop.test/pay", "POST /pay HTTP/1.1\nHost: shop.test\n\nx=1", "");
+                let id = crate::organizer::add_collection(&mut a.org_collections, "Auth flows");
+                a.organizer[0].collection = id;
+                a.org_collection = id;
+                a.org_renaming = Some((id, "Auth".into()));
+                a.org_new_collection = Some("Later".into());
+            }),
             Scene("the settings window", |a| a.show_settings = true),
             Scene("the command palette", |a| a.show_palette = true),
         ];

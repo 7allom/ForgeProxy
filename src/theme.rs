@@ -514,9 +514,154 @@ pub fn table_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32)]) {
     }
 }
 
+/// How tall a table row is when it holds nothing but text.
+pub const ROW_HEIGHT: f32 = 19.0;
+
+/// How tall a table row is when it holds widgets of its own -- a dropdown, an editor --
+/// rather than text alone: enough room for the controls to sit in.
+pub const WIDGET_ROW_HEIGHT: f32 = 24.0;
+
+/// A table row the caller fills in: the background is painted here and the rectangle of each
+/// column comes back, for text to be drawn in with [`cell_text`] or a widget to be put in
+/// with `Ui::put`.
+///
+/// The background is the selection colour, else a wash of `tint` over the row -- a
+/// highlighted item, kept faint enough to read dark text or light text on -- else the stripe.
+/// The row senses clicks, as [`table_row`] does, and anything the caller puts in it is added
+/// afterwards and so lies on top: a click on a dropdown in a cell goes to the dropdown, and a
+/// click anywhere else in the row goes to the row.
+pub fn table_row_cells(
+    ui: &mut Ui,
+    p: &Palette,
+    id_salt: impl std::hash::Hash,
+    widths: &[f32],
+    height: f32,
+    selected: bool,
+    stripe: bool,
+    tint: Option<Color32>,
+) -> (egui::Response, Vec<egui::Rect>) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    // the row is interacted with under an id of its own, from what the row stands for rather
+    // than from where it is in the table. egui keeps a context menu, and the hover and drag
+    // it tracks, against that id: a row identified by its place loses them the moment the
+    // table is re-sorted or the panel above it changes height, which closes an open menu
+    // under the pointer.
+    let resp = ui.interact(rect, ui.id().with(id_salt), egui::Sense::click());
+    let base = if selected { p.selection } else if stripe { ui.visuals().faint_bg_color } else { p.deep };
+    // a selected row keeps the selection colour: of the two things a row can be, which one is
+    // being read matters more than which colour it was marked with
+    let bg = match tint {
+        Some(highlight) if !selected => row_tint(base, highlight),
+        _ => base,
+    };
+    ui.painter().rect_filled(rect, 0.0, bg);
+    if let Some(highlight) = tint {
+        // the bar is what does the work: solid, the full height of the row, and at the very
+        // edge the eye runs down
+        let bar = egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + ROW_ACCENT, rect.bottom()));
+        ui.painter().rect_filled(bar, 0.0, highlight);
+    }
+    let mut x = rect.left() + 6.0;
+    let cells = widths
+        .iter()
+        .map(|w| {
+            let cell = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2((x + w - 8.0).max(x), rect.bottom()));
+            x += w;
+            cell
+        })
+        .collect();
+    (resp, cells)
+}
+
+/// How much of a highlight colour is mixed into the row that carries it: about an alpha of
+/// 31 in 255, were it painted as a translucent wash.
+const ROW_TINT: f32 = 0.12;
+
+/// A row's background with a wash of its highlight colour mixed into it.
+///
+/// Faint on purpose: what marks a highlighted row out is the bar down its left edge, and the
+/// wash only has to say which colour it is. Any heavier and the coloured text in the row --
+/// the method, the status, the status code -- would be read against a different background
+/// from every other row's and lose its contrast.
+///
+/// The mixing is done here and the result painted once, opaque, rather than laying a
+/// translucent rectangle over the row: a translucent paint comes out as many times heavier as
+/// the row happens to be painted, and a row is painted more than once per frame.
+pub fn row_tint(base: Color32, highlight: Color32) -> Color32 {
+    blend(base, highlight, ROW_TINT)
+}
+
+/// `over` mixed into `under` by `amount` of its strength, as an opaque colour.
+fn blend(under: Color32, over: Color32, amount: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(mix(under.r(), over.r()), mix(under.g(), over.g()), mix(under.b(), over.b()))
+}
+
+/// How wide the bar down the left edge of a highlighted row is.
+const ROW_ACCENT: f32 = 3.0;
+
+/// A small triangle pointing down, drawn rather than written: the bundled fonts have no
+/// such glyph. It marks something that opens when it is clicked.
+pub fn caret(ui: &Ui, center: egui::Pos2, color: Color32) {
+    let pts = vec![
+        center + egui::vec2(-3.5, -1.75),
+        center + egui::vec2(3.5, -1.75),
+        center + egui::vec2(0.0, 2.25),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// Draw one cell's text, clipped to the cell so a long value cannot run into the next column.
+pub fn cell_text(ui: &Ui, cell: egui::Rect, text: &str, color: Color32) {
+    ui.painter().with_clip_rect(cell).text(
+        egui::pos2(cell.left(), cell.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(12.5),
+        color,
+    );
+}
+
+/// The table header with each column a button: click to sort by it, again to reverse.
+/// The column currently sorted on shows a triangle (up: ascending). Returns the column that
+/// was clicked, if any; the caller owns the sort state, so every sortable table shares this.
+pub fn sort_header<C: Copy + PartialEq>(ui: &mut Ui, p: &Palette, cols: &[(&str, f32, C)], active: Option<C>, ascending: bool) -> Option<C> {
+    let mut clicked = None;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, p.header);
+    let mut x = rect.left();
+    for (i, (name, w, col)) in cols.iter().enumerate() {
+        let cell = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2((x + w).min(rect.right()).max(x), rect.bottom()));
+        let r = ui.interact(cell, ui.id().with(("sort_col", i)), egui::Sense::click());
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *name));
+        if r.hovered() {
+            ui.painter().rect_filled(cell, 0.0, p.hover);
+        }
+        let label = ui.painter().text(egui::pos2(x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, *name, FontId::proportional(12.5), p.text);
+        if active == Some(*col) {
+            // drawn, not a glyph: the bundled fonts have no triangles
+            let c = egui::pos2(label.right() + 8.0, rect.center().y);
+            let pts = if ascending {
+                vec![c + egui::vec2(-4.0, 2.5), c + egui::vec2(4.0, 2.5), c + egui::vec2(0.0, -3.0)]
+            } else {
+                vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.0)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(pts, p.strong, Stroke::NONE));
+        }
+        if r.on_hover_text(format!("Sort by {name}")).clicked() {
+            clicked = Some(*col);
+        }
+        x += w;
+        if i + 1 < cols.len() {
+            ui.painter().line_segment([egui::pos2(x - 4.0, rect.top() + 2.0), egui::pos2(x - 4.0, rect.bottom() - 2.0)], Stroke::new(1.0_f32, p.deep));
+        }
+    }
+    clicked
+}
+
 /// One table row (text cells at the same widths). Returns the click response.
 pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32>)], selected: bool, stripe: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
     let bg = if selected { p.selection } else if stripe { ui.visuals().faint_bg_color } else { p.deep };
     ui.painter().rect_filled(rect, 0.0, bg);
     let mut x = rect.left() + 6.0;
