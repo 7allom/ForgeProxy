@@ -335,7 +335,11 @@ mod tests {
     fn listed_shortcuts_are_real_hotkeys() {
         for c in default_commands() {
             if let Some(sc) = c.shortcut {
-                assert!(crate::hotkeys::LIST.iter().any(|(_, k)| *k == sc), "{} advertises {sc}", c.title);
+                assert!(
+                    crate::hotkeys::ACTIONS.iter().any(|a| a.default.label() == sc),
+                    "{} advertises {sc}, which no action is bound to by default",
+                    c.title
+                );
             }
         }
     }

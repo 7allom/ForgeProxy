@@ -3,7 +3,8 @@
 //! behaviour the app can't change is shown disabled, in its fixed state, with the reason.
 //!
 //! "Project setting" cards are saved in the project file; "User setting" cards are saved in
-//! settings.json for every project; "Session setting" cards apply to the running session.
+//! settings.json and used by every project. A card marked [User | Project] is saved globally
+//! until a project overrides it.
 
 use crate::state::{App, SettingsPage};
 use crate::theme::{self, bold, Look, Palette};
@@ -55,6 +56,10 @@ const PAGES: &[PageInfo] = &[
     PageInfo { page: SettingsPage::Sequencer, group: Some("Tools"), name: "Sequencer", cards: &[
         card("Live capture", "How many requests live capture sends at once.", Home::User),
     ]},
+    PageInfo { page: SettingsPage::Collaborator, group: Some("Tools"), name: "Collaborator", cards: &[
+        card("Default relay server", "The relay a new project starts on. A project that names its own relay keeps it.", Home::User),
+        card("Polling", "How often the Collaborator tab asks its relay what has come in, while its timer is on.", Home::User),
+    ]},
     PageInfo { page: SettingsPage::NetworkConnections, group: Some("Network"), name: "Connections", cards: &[
         card("Upstream proxy", "Send outgoing traffic through another proxy: the Proxy's connections to targets (including HTTPS and pass-through tunnels) and requests from Repeater, Intruder, Scanner and Sequencer.", Home::Override),
     ]},
@@ -64,6 +69,7 @@ const PAGES: &[PageInfo] = &[
     PageInfo { page: SettingsPage::Display, group: Some("User interface"), name: "Display", cards: &[
         card("Display scaling", "Zoom the whole interface.", Home::User),
         card("Editor font size", "Text size in the HTTP request and response editors.", Home::User),
+        card("Default message view", "Which way a request or response pane opens before it is switched.", Home::User),
         card("Theme", "Light or dark colours.", Home::Override),
     ]},
     PageInfo { page: SettingsPage::Hotkeys, group: None, name: "Hotkeys", cards: &[
@@ -89,7 +95,13 @@ const SIDEBAR_W: f32 = 170.0;
 
 pub fn show(app: &mut App, ctx: &egui::Context, p: &Palette) {
     if !app.show_settings {
+        // a capture left open by a window that was closed would hold every shortcut down
+        app.hotkey_capturing = None;
         return;
+    }
+    // and so would one left behind by walking off the page it belongs to
+    if app.settings_page != SettingsPage::Hotkeys {
+        app.hotkey_capturing = None;
     }
     let search_id = egui::Id::new("settings_search");
     let mut search: String = ctx.data(|d| d.get_temp(search_id)).unwrap_or_default();
@@ -119,12 +131,15 @@ pub fn show(app: &mut App, ctx: &egui::Context, p: &Palette) {
 }
 
 fn sidebar(app: &mut App, ui: &mut Ui, p: &Palette, search: &mut String) {
-    ui.add(egui::TextEdit::singleline(search).desired_width(f32::INFINITY).hint_text("🔍 Search"));
+    ui.add(egui::TextEdit::singleline(search).desired_width(f32::INFINITY).hint_text("Search"));
     ui.add_space(8.0);
     let mut groups: Vec<Option<&str>> = Vec::new();
     for i in PAGES {
         if !groups.contains(&i.group) { groups.push(i.group); }
     }
+    // the tree scrolls: a window dragged short used to clip the pages at the bottom of it
+    // with no way to reach them
+    egui::ScrollArea::vertical().id_salt("settings_nav").auto_shrink([false, false]).show(ui, |ui| {
     for group in groups {
         let pages: Vec<&PageInfo> = PAGES.iter().filter(|i| i.group == group && page_visible(i, search)).collect();
         if pages.is_empty() {
@@ -139,6 +154,7 @@ fn sidebar(app: &mut App, ui: &mut Ui, p: &Palette, search: &mut String) {
             None => for i in pages { nav_item(app, ui, p, i); },
         }
     }
+    });
 }
 
 /// Sidebar row with the blue highlight pill when it's the open page.
@@ -426,6 +442,58 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
                 }
             });
         }
+        (SettingsPage::Collaborator, "Default relay server") => {
+            ui.horizontal(|ui| {
+                ui.label("Relay:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.settings.collab_default_server)
+                        .desired_width(240.0)
+                        .hint_text("relay.example.com"),
+                );
+                if theme::plain_button(ui, p, "Clear", !app.settings.collab_default_server.is_empty()).clicked() {
+                    app.settings.collab_default_server.clear();
+                }
+            });
+            ui.label(
+                RichText::new("Used when a project names no relay of its own. The open project is left as it is; change its relay on the Collaborator tab.")
+                    .size(11.5)
+                    .color(p.disabled),
+            );
+        }
+        (SettingsPage::Collaborator, "Polling") => {
+            ui.horizontal(|ui| {
+                ui.label("Poll every:");
+                ui.add(
+                    egui::DragValue::new(&mut app.settings.collab_poll_secs)
+                        .range(crate::state::UserSettings::COLLAB_POLL_RANGE)
+                        .speed(0.25)
+                        .suffix(" s"),
+                );
+                let changed = app.settings.collab_poll_secs != crate::state::DEFAULT_COLLAB_POLL_SECS;
+                if theme::plain_button(ui, p, "Reset", changed).clicked() {
+                    app.settings.collab_poll_secs = crate::state::DEFAULT_COLLAB_POLL_SECS;
+                }
+            });
+            ui.label(
+                RichText::new("Only while the tab's Auto-poll is on. Longer intervals suit a relay that limits how often it answers.")
+                    .size(11.5)
+                    .color(p.disabled),
+            );
+        }
+        (SettingsPage::Display, "Default message view") => {
+            let mut mode = app.settings.default_message_view;
+            ui.horizontal(|ui| {
+                for m in crate::viewer::MessageViewMode::ALL {
+                    ui.radio_value(&mut mode, m, m.label());
+                }
+            });
+            app.settings.default_message_view = mode;
+            ui.label(
+                RichText::new("A pane that has already been switched keeps whichever view it was switched to.")
+                    .size(11.5)
+                    .color(p.disabled),
+            );
+        }
         (SettingsPage::Display, "Theme") => {
             let mut look = app.eff().theme;
             ui.horizontal(|ui| {
@@ -437,15 +505,7 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
                 theme::apply(ui.ctx(), look);
             }
         }
-        (SettingsPage::Hotkeys, _) => {
-            const COLS: [(f32, f32); 2] = [(200.0, 0.6), (120.0, 0.4)];
-            theme::fitted_table(ui, p, "hotkeys_table", (crate::hotkeys::LIST.len() as f32 + 1.0) * 19.0 + 6.0, &COLS, |ui, w| {
-                theme::table_header(ui, p, &[("Action", w[0]), ("Shortcut", w[1])]);
-                for (i, (action, key)) in crate::hotkeys::LIST.iter().enumerate() {
-                    let _ = theme::table_row(ui, p, &[(action.to_string(), w[0], None), (key.to_string(), w[1], Some(p.strong))], false, i % 2 == 1);
-                }
-            });
-        }
+        (SettingsPage::Hotkeys, _) => hotkeys_editor(app, ui, p),
         _ => {}
     }
 }
@@ -666,6 +726,128 @@ fn tls_passthrough(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 }
 
+/// Settings > Hotkeys: every action, the keys it carries, and the means to change them.
+///
+/// One row per action from `hotkeys::ACTIONS`, so the table and the dispatch cannot disagree.
+/// Clicking a row's keys starts listening; the next key press that is usable becomes the
+/// binding, Escape gives up, and a binding already taken by another action is refused with
+/// the reason rather than quietly stealing it.
+fn hotkeys_editor(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let mut capturing: Option<String> = app.hotkey_capturing.clone();
+    let note_id = egui::Id::new("hotkey_note");
+    let mut note: String = ui.data(|d| d.get_temp(note_id)).unwrap_or_default();
+
+    // the key press that ends a capture, taken before the table draws so the row it belongs
+    // to sees it on this frame
+    let pressed = capturing.as_ref().and_then(|_| {
+        ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => Some(crate::hotkeys::Binding {
+                    ctrl: modifiers.command || modifiers.ctrl,
+                    alt: modifiers.alt,
+                    shift: modifiers.shift,
+                    key: *key,
+                }),
+                _ => None,
+            })
+        })
+    });
+
+    ui.horizontal(|ui| {
+        let customized = !app.settings.hotkeys.is_empty();
+        if theme::plain_button(ui, p, "Reset all to defaults", customized).clicked() {
+            app.settings.hotkeys.clear();
+            note = "Every shortcut is back to its default.".into();
+            capturing = None;
+        }
+        if capturing.is_some() {
+            ui.label(RichText::new("Press keys…  (Esc to cancel)").size(11.5).color(p.accent));
+        } else if !note.is_empty() {
+            ui.label(RichText::new(&note).size(11.5).color(p.warning));
+        }
+    });
+    ui.add_space(4.0);
+
+    let clashing = crate::hotkeys::clashes(&app.settings.hotkeys);
+    let rows = crate::hotkeys::bindings(&app.settings.hotkeys);
+    const COLS: [(f32, f32); 3] = [(230.0, 0.6), (150.0, 0.4), (80.0, 0.0)];
+    let height = (rows.len() as f32 + 1.0) * theme::ROW_HEIGHT + 8.0;
+    let mut set: Option<(String, crate::hotkeys::Binding)> = None;
+    let mut reset: Option<String> = None;
+    theme::fitted_table(ui, p, "hotkeys_table", height, &COLS, |ui, w| {
+        theme::table_header(ui, p, &[("Action", w[0]), ("Shortcut", w[1]), ("", w[2])]);
+        for (i, (meta, binding)) in rows.iter().enumerate() {
+            let listening = capturing.as_deref() == Some(meta.id);
+            let clash = clashing.contains(&meta.id);
+            let (row, cells) = theme::table_row_cells(ui, p, ("hotkey", meta.id), w, theme::ROW_HEIGHT, listening, i % 2 == 1, None);
+            theme::cell_text(ui, cells[0], meta.label, if listening { p.strong } else { p.text });
+            let shown = if listening { "Press keys…".to_string() } else { binding.label() };
+            let colour = if listening {
+                p.accent
+            } else if clash {
+                p.error
+            } else {
+                p.strong
+            };
+            theme::cell_text(ui, cells[1], &shown, colour);
+            let changed = app.settings.hotkeys.contains_key(meta.id);
+            if changed {
+                let r = ui.put(cells[2], egui::Button::new(RichText::new("Reset").size(11.0)).frame(true));
+                if r.on_hover_text(format!("Back to {}", meta.default.label())).clicked() {
+                    reset = Some(meta.id.to_string());
+                }
+            }
+            row.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Button, true, listening, format!("{} ({shown})", meta.label))
+            });
+            if row.clicked() {
+                capturing = Some(meta.id.to_string());
+                note.clear();
+            }
+            if clash && !listening {
+                row.on_hover_text("Another action has these keys as well. Change one of them.");
+            }
+            // the key that finishes this row's capture
+            if listening {
+                if let Some(binding) = pressed {
+                    capturing = None;
+                    if binding.key == egui::Key::Escape {
+                        // gave up: the binding is left as it was
+                    } else if let Some(reason) = binding.refusal() {
+                        note = format!("{} cannot be used. {reason}", binding.label());
+                    } else if let Some(taken) = rows.iter().find(|(o, b)| o.id != meta.id && *b == binding) {
+                        note = format!("{} is already {}.", binding.label(), taken.0.label);
+                    } else {
+                        set = Some((meta.id.to_string(), binding));
+                        note.clear();
+                    }
+                }
+            }
+        }
+    });
+    if let Some((id, binding)) = set {
+        // a binding that matches the default is stored as no override at all, so the row
+        // stops offering to reset itself to what it already is
+        let default = crate::hotkeys::ACTIONS.iter().find(|a| a.id == id).map(|a| a.default);
+        if default == Some(binding) {
+            app.settings.hotkeys.remove(&id);
+        } else {
+            app.settings.hotkeys.insert(id, binding.label());
+        }
+    }
+    if let Some(id) = reset {
+        app.settings.hotkeys.remove(&id);
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Copy, cut, paste, undo, redo and select-all belong to the text boxes and cannot be bound here.")
+            .size(11.5)
+            .color(p.disabled),
+    );
+    app.hotkey_capturing = capturing;
+    ui.data_mut(|d| d.insert_temp(note_id, note));
+}
+
 /// Root CA: status, export (certificate only) and regenerate, under the listener table.
 fn ca_controls(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.label(bold("Root CA certificate", 13.0).color(p.strong));
@@ -673,6 +855,28 @@ fn ca_controls(app: &mut App, ui: &mut Ui, p: &Palette) {
         (Some(ca), _) => {
             ui.label(RichText::new(format!("CN={} · SHA-256 {}", crate::ca::COMMON_NAME, ca.fingerprint())).size(11.5).monospace().color(p.text));
             ui.label(RichText::new(format!("Stored in {}", crate::ca::config_dir().display())).size(11.5).color(p.disabled));
+            // read out of the certificate itself, so a root from an earlier build or one put
+            // there by hand reports the date browsers will actually act on
+            match ca.not_after() {
+                Some(expiry) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let days = expiry.days_left(now);
+                    let (text, colour) = if days < 0 {
+                        (format!("Expired on {}", expiry.date()), p.error)
+                    } else if expiry.needs_attention(now) {
+                        (format!("Expires {} — in {days} days", expiry.date()), p.warning)
+                    } else {
+                        (format!("Expires {}", expiry.date()), p.disabled)
+                    };
+                    ui.label(RichText::new(text).size(11.5).color(colour))
+                        .on_hover_text("Past this date every intercepted site shows a certificate error until a new root is generated and trusted.");
+                }
+                None => {
+                    ui.label(RichText::new("Expires: unavailable (the certificate could not be read)").size(11.5).color(p.disabled));
+                }
+            }
             if let Some(cache) = &app.tls_cache {
                 ui.label(RichText::new(format!("Host certificates issued this session: {}", cache.len())).size(11.5).color(p.disabled));
             }
@@ -697,6 +901,12 @@ fn ca_controls(app: &mut App, ui: &mut Ui, p: &Palette) {
     };
     ui.label(RichText::new(format!("{note} A trusted root lets whoever holds its key impersonate any site to that browser: only install it when you need it, and remove it afterwards.")).size(11.5).color(p.medium));
     ui.add_space(4.0);
+    ui.label(
+        RichText::new("To check it is trusted: open any HTTPS site in the proxy browser with interception on — a padlock with no warning means the root is installed.")
+            .size(11.5)
+            .color(p.disabled),
+    );
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label("Export to folder:");
         ui.add(egui::TextEdit::singleline(&mut app.ca_export_dir).desired_width((ui.available_width() - 250.0).max(160.0)));
@@ -753,8 +963,25 @@ mod tests {
 
     #[test]
     fn every_page_is_listed_once() {
-        for page in [SettingsPage::Proxy, SettingsPage::Intruder, SettingsPage::Repeater, SettingsPage::Sequencer, SettingsPage::NetworkConnections, SettingsPage::NetworkTls, SettingsPage::Display, SettingsPage::Hotkeys] {
+        // the list is written out rather than taken from PAGES, so a page added to the enum
+        // and forgotten in the sidebar is a failure here rather than a page nobody can reach
+        for page in [
+            SettingsPage::Proxy,
+            SettingsPage::Intruder,
+            SettingsPage::Repeater,
+            SettingsPage::Sequencer,
+            SettingsPage::Collaborator,
+            SettingsPage::NetworkConnections,
+            SettingsPage::NetworkTls,
+            SettingsPage::Display,
+            SettingsPage::Hotkeys,
+        ] {
             assert_eq!(PAGES.iter().filter(|i| i.page == page).count(), 1, "{page:?}");
+        }
+        // and every card on every page draws something: a card with no body is a title that
+        // promises a setting and shows none
+        for page in PAGES {
+            assert!(!page.cards.is_empty(), "{:?} has no cards", page.page);
         }
     }
 
@@ -783,5 +1010,153 @@ mod tests {
         for (page, title) in crate::ui_palette::SETTINGS_LINKS {
             assert!(info(*page).cards.iter().any(|c| c.title == *title), "{title}");
         }
+    }
+
+    /// The Collaborator page is in the sidebar and findable by what its cards are about.
+    #[test]
+    fn the_collaborator_page_is_listed_and_searchable() {
+        assert_eq!(PAGES.iter().filter(|i| i.page == SettingsPage::Collaborator).count(), 1);
+        let page = info(SettingsPage::Collaborator);
+        assert!(page_visible(page, "relay"), "found by what its card is about");
+        assert!(page_visible(page, "poll"));
+        assert!(!page_visible(page, "zoom"));
+        // and the new Display card is reachable the same way
+        assert!(page_visible(info(SettingsPage::Display), "message view"));
+    }
+
+    /// Driving the shortcut editor: a row listens, the key pressed becomes the binding, keys
+    /// the text boxes own are refused, a binding another action holds is refused, and the
+    /// resets put things back.
+    #[test]
+    fn the_shortcut_editor_captures_refuses_and_resets() {
+        use crate::state::Tab;
+        use crate::test_utils::MockAppBuilder;
+        use eframe::egui;
+
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+        ctx.enable_accesskit();
+        app.show_settings = true;
+        app.settings_page = SettingsPage::Hotkeys;
+
+        let frame = |ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 950.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+        };
+        let find = |update: &Option<egui::accesskit::TreeUpdate>, want: &str| -> Option<egui::Rect> {
+            let nodes = &update.as_ref().expect("accesskit output").nodes;
+            nodes
+                .iter()
+                .filter(|(_, n)| n.label().as_deref() == Some(want) || n.value().as_deref() == Some(want))
+                .find_map(|(_, n)| n.bounds())
+                .map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32)))
+        };
+        let key = |k: egui::Key, ctrl: bool, shift: bool| {
+            let mut modifiers = egui::Modifiers::NONE;
+            if ctrl {
+                modifiers |= egui::Modifiers::COMMAND;
+            }
+            if shift {
+                modifiers |= egui::Modifiers::SHIFT;
+            }
+            vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }]
+        };
+        let click = |ctx: &egui::Context, app: &mut App, at: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(ctx, app, vec![egui::Event::PointerMoved(at)]);
+            frame(ctx, app, vec![button(true)]);
+            frame(ctx, app, vec![button(false)]);
+            frame(ctx, app, vec![]);
+        };
+
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let row = find(&update, "Send to Repeater (Ctrl+R)").expect("the row is drawn with its keys");
+
+        // click it, then press something usable
+        click(&ctx, &mut app, row.center());
+        frame(&ctx, &mut app, key(egui::Key::J, true, true));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(
+            app.settings.hotkeys.get("send_to_repeater").map(String::as_str),
+            Some("Ctrl+Shift+J"),
+            "the keys pressed became the binding"
+        );
+
+        // keys the text boxes own are refused, and the binding is left alone
+        let update = frame(&ctx, &mut app, vec![]);
+        let row = find(&update, "Send to Repeater (Ctrl+Shift+J)").expect("the row shows its new keys");
+        click(&ctx, &mut app, row.center());
+        frame(&ctx, &mut app, key(egui::Key::C, true, false));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(
+            app.settings.hotkeys.get("send_to_repeater").map(String::as_str),
+            Some("Ctrl+Shift+J"),
+            "Ctrl+C was refused"
+        );
+
+        // so is one another action already holds
+        let update = frame(&ctx, &mut app, vec![]);
+        let row = find(&update, "Send to Repeater (Ctrl+Shift+J)").expect("the row");
+        click(&ctx, &mut app, row.center());
+        frame(&ctx, &mut app, key(egui::Key::F, true, false));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(
+            app.settings.hotkeys.get("send_to_repeater").map(String::as_str),
+            Some("Ctrl+Shift+J"),
+            "the keys that forward a held message were not taken"
+        );
+
+        // Escape gives up without changing anything
+        let update = frame(&ctx, &mut app, vec![]);
+        let row = find(&update, "Send to Repeater (Ctrl+Shift+J)").expect("the row");
+        click(&ctx, &mut app, row.center());
+        frame(&ctx, &mut app, key(egui::Key::Escape, false, false));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.settings.hotkeys.get("send_to_repeater").map(String::as_str), Some("Ctrl+Shift+J"));
+
+        // and the reset puts every shortcut back
+        let update = frame(&ctx, &mut app, vec![]);
+        let reset_all = find(&update, "Reset all to defaults").expect("the reset button");
+        click(&ctx, &mut app, reset_all.center());
+        assert!(app.settings.hotkeys.is_empty(), "every override is gone");
+        let update = frame(&ctx, &mut app, vec![]);
+        assert!(find(&update, "Send to Repeater (Ctrl+R)").is_some(), "the row is back on its default");
+    }
+
+    /// A capture is never left holding the shortcuts down: closing the window, or walking off
+    /// the page, gives the keys back to the app.
+    #[test]
+    fn a_capture_does_not_outlive_the_page_it_was_started_on() {
+        use crate::state::Tab;
+        use crate::test_utils::MockAppBuilder;
+        use eframe::egui;
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+        let draw = |ctx: &egui::Context, app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| crate::ui_core::frame(app, ctx));
+        };
+
+        // the window is closed while a row is listening
+        app.show_settings = true;
+        app.settings_page = SettingsPage::Hotkeys;
+        app.hotkey_capturing = Some("send_to_repeater".into());
+        app.show_settings = false;
+        draw(&ctx, &mut app);
+        assert!(app.hotkey_capturing.is_none(), "closing the window ended the capture");
+
+        // or the page is changed while a row is listening
+        app.show_settings = true;
+        app.settings_page = SettingsPage::Hotkeys;
+        app.hotkey_capturing = Some("send_to_repeater".into());
+        app.settings_page = SettingsPage::Display;
+        draw(&ctx, &mut app);
+        assert!(app.hotkey_capturing.is_none(), "leaving the page ended it too");
     }
 }

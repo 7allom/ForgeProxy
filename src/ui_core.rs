@@ -13,6 +13,7 @@ pub fn c(hex: u32) -> Color32 { Color32::from_rgb((hex >> 16) as u8, (hex >> 8) 
 pub fn frame(app: &mut App, ctx: &egui::Context) {
     let p = app.p();
     crate::editor::set_font_size(ctx, app.settings.editor_font_size);
+    crate::editor::set_default_view_mode(ctx, app.settings.default_message_view);
     // another tab or sub-tab: the Auto-Decoder starts empty there
     crate::editor::decoder_context(ctx, "view", format!("{}/{}/{}", app.tab.label(), app.proxy_sub, app.target_sub));
     top_menu(app, ctx, &p);

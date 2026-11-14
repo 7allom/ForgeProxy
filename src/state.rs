@@ -11,7 +11,7 @@ use egui::Color32;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard, Target, Proxy, Intruder, Repeater, Collaborator, Sequencer,
     Decoder, Comparer, Logger, Organizer,
@@ -150,6 +150,7 @@ pub enum SettingsPage {
     Sequencer,
     NetworkConnections,
     NetworkTls,
+    Collaborator,
     Display,
     Hotkeys,
 }
@@ -171,6 +172,14 @@ pub const DEFAULT_HTTP_TIMEOUT: u64 = 15;
 pub const DEFAULT_PROXY_READ_TIMEOUT: u64 = 120;
 /// The user settings file, in the config directory next to the CA.
 pub const SETTINGS_FILE: &str = "settings.json";
+
+/// How often the Collaborator tab polls, before anyone changes it.
+pub const DEFAULT_COLLAB_POLL_SECS: u64 = 10;
+
+/// How long after the last change the user settings are written out. Long enough that a drag
+/// of a number field is one write rather than one per frame, short enough that the work is
+/// already on disk by the time anyone reaches for the window's close button.
+pub const SETTINGS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Settings kept across restarts in `settings.json` (every project uses them). Missing or
 /// unknown fields fall back to the defaults; out-of-range values are clamped on load.
@@ -197,6 +206,17 @@ pub struct UserSettings {
     pub rep_follow: bool,
     pub rep_unpack: bool,
     pub sequencer_threads: usize,
+    /// The relay a new project starts on, when the project file names none of its own.
+    pub collab_default_server: String,
+    /// Seconds between polls while the Collaborator tab's timer is on.
+    pub collab_poll_secs: u64,
+    /// Which way a message pane opens before anyone has switched it.
+    pub default_message_view: crate::viewer::MessageViewMode,
+    /// The folder the Root CA was last exported to.
+    pub ca_export_dir: String,
+    /// Shortcuts the user has changed, as action id -> phrase ("Ctrl+Shift+R"). Anything in
+    /// here that this build does not recognise is passed over, and the default stands.
+    pub hotkeys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for UserSettings {
@@ -218,12 +238,19 @@ impl Default for UserSettings {
             rep_follow: crate::rules::REPEATER_FOLLOW_REDIRECTS,
             rep_unpack: true,
             sequencer_threads: crate::rules::SEQUENCER_THREADS,
+            collab_default_server: String::new(),
+            collab_poll_secs: DEFAULT_COLLAB_POLL_SECS,
+            default_message_view: crate::viewer::MessageViewMode::Raw,
+            ca_export_dir: String::new(),
+            hotkeys: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl UserSettings {
     pub const FONT_RANGE: std::ops::RangeInclusive<f32> = 9.0..=24.0;
+    /// Fast enough to feel live, slow enough not to hammer a relay that rate-limits.
+    pub const COLLAB_POLL_RANGE: std::ops::RangeInclusive<u64> = 2..=300;
     pub const HTTP_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1..=120;
     pub const PROXY_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
 
@@ -238,6 +265,8 @@ impl UserSettings {
         self.int_concurrency = self.int_concurrency.clamp(1, 50);
         self.int_delay_ms = self.int_delay_ms.min(60_000);
         self.sequencer_threads = self.sequencer_threads.clamp(1, 20);
+        let c = Self::COLLAB_POLL_RANGE;
+        self.collab_poll_secs = self.collab_poll_secs.clamp(*c.start(), *c.end());
         self
     }
 
@@ -299,6 +328,14 @@ pub fn default_tasks() -> Vec<Task> {
 }
 
 pub struct App {
+    /// The user settings as they stood on the previous frame, to notice a change against.
+    /// A change restarts the clock below, so a run of edits is written once, when it stops.
+    pub settings_last_seen: UserSettings,
+    /// When the user settings last changed, while they are still waiting to be written.
+    pub settings_dirty_at: Option<std::time::Instant>,
+    /// Set once when the settings could not be written, so the event log is told once rather
+    /// than on every attempt for the rest of the run.
+    pub settings_write_failed: bool,
     /// Theme, editor font size and timeouts, kept in settings.json across restarts. These are
     /// the global values; a project may override some of them (see `overrides` and `eff`).
     pub settings: UserSettings,
@@ -471,6 +508,10 @@ pub struct App {
     pub settings_page: SettingsPage,
     /// Card the Settings window scrolls to once (deep links from the command palette).
     pub settings_focus: Option<&'static str>,
+    /// The shortcut editor is listening for the keys to give this action. While it is, the
+    /// dispatch stands down: otherwise the keys being offered are swallowed by whatever they
+    /// are currently bound to, and a shortcut already in use could never be moved.
+    pub hotkey_capturing: Option<String>,
     /// Repeater: decompress gzip/deflate responses.
     pub rep_unpack: bool,
     /// Proxy interception state a project starts with (saved in the project file).
@@ -573,6 +614,9 @@ impl App {
         let events: crate::proxy::Events = Arc::new(Mutex::new(Default::default()));
         let start_proxy = shot_path.is_none();
         let mut app = Self {
+            settings_last_seen: settings.clone(),
+            settings_dirty_at: None,
+            settings_write_failed: false,
             settings,
             overrides: Overrides::default(),
             tab: start_tab.unwrap_or(Tab::Dashboard),
@@ -696,6 +740,7 @@ impl App {
             show_settings: false,
             settings_page: SettingsPage::Proxy,
             settings_focus: None,
+            hotkey_capturing: None,
             rep_unpack: true,
             intercept_default: rules::INTERCEPT_AT_STARTUP,
             intercept_only_in_scope: false,
@@ -793,6 +838,10 @@ impl App {
         self.sequencer_threads = s.sequencer_threads;
         self.proxy.use_rules.store(s.intercept_rules, std::sync::atomic::Ordering::SeqCst);
         self.proxy.fix_length.store(s.fix_length, std::sync::atomic::Ordering::SeqCst);
+        // an empty setting means nobody has chosen a folder yet, so the usual one stands
+        if !s.ca_export_dir.trim().is_empty() {
+            self.ca_export_dir = s.ca_export_dir.clone();
+        }
     }
 
     /// Copy the live former-session settings back into `settings` (before saving on exit).
@@ -807,6 +856,48 @@ impl App {
         self.settings.sequencer_threads = self.sequencer_threads;
         self.settings.intercept_rules = self.proxy.use_rules.load(std::sync::atomic::Ordering::SeqCst);
         self.settings.fix_length = self.proxy.fix_length.load(std::sync::atomic::Ordering::SeqCst);
+        self.settings.ca_export_dir = self.ca_export_dir.clone();
+    }
+
+    /// Notice a change to the user settings and write them out once the change has settled.
+    ///
+    /// These used to reach disk only in `on_exit`, so anything that ended the run another way
+    /// -- a crash, a signal -- took the session's settings with it. The change is found by
+    /// comparing against the previous frame rather than by a flag on every control, so a
+    /// setting changed from a menu or a toolbar is noticed exactly like one changed in the
+    /// Settings window, and a control added later needs no wiring to be saved.
+    fn flush_user_settings(&mut self, ctx: &egui::Context) {
+        // a test must not write to the person's real configuration directory, and a
+        // screenshot run deliberately leaves no trace
+        if cfg!(test) || self.shot_path.is_some() {
+            return;
+        }
+        self.collect_user_settings();
+        if self.settings != self.settings_last_seen {
+            self.settings_last_seen = self.settings.clone();
+            self.settings_dirty_at = Some(std::time::Instant::now());
+        }
+        let Some(changed_at) = self.settings_dirty_at else {
+            return;
+        };
+        let waited = changed_at.elapsed();
+        if waited < SETTINGS_DEBOUNCE {
+            // ask for the frame that will do the writing: an idle app is drawing nothing
+            ctx.request_repaint_after(SETTINGS_DEBOUNCE - waited);
+            return;
+        }
+        // cleared whatever happens next: a directory that cannot be written to must not be
+        // retried every frame for the rest of the run
+        self.settings_dirty_at = None;
+        match self.settings.save(&crate::ca::config_dir()) {
+            Ok(()) => self.settings_write_failed = false,
+            Err(e) => {
+                if !self.settings_write_failed {
+                    self.settings_write_failed = true;
+                    crate::proxy::log_error(&self.event_log, format!("Couldn't save settings: {e}"));
+                }
+            }
+        }
     }
 
     pub fn p(&self) -> Palette { theme::palette(self.eff().theme) }
@@ -1122,6 +1213,7 @@ impl eframe::App for App {
         }
         crate::actions::sync_site_map(self);
         crate::ui_core::frame(self, ctx);
+        self.flush_user_settings(ctx);
 
         if self.shot_path.is_some() {
             self.frame += 1;
@@ -1423,6 +1515,49 @@ mod settings_tests {
         assert!(!s.upstream_proxy.enabled && !s.protocol.verify_upstream_tls);
         std::fs::write(dir.join(SETTINGS_FILE), "not json").unwrap();
         assert!(UserSettings::load(&dir).unwrap_err().contains("Using default settings"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The newer workstation settings survive a write and a read, and a hand-written file with
+    /// a nonsense interval in it is brought back into range rather than used as written.
+    #[test]
+    fn the_newer_settings_round_trip_and_are_clamped() {
+        let dir = temp_dir("newer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = UserSettings::default();
+        s.collab_default_server = "relay.example.com".into();
+        s.collab_poll_secs = 45;
+        s.default_message_view = crate::viewer::MessageViewMode::Pretty;
+        s.ca_export_dir = "/tmp/forge-export".into();
+        s.hotkeys.insert("send_to_repeater".into(), "Ctrl+Alt+R".into());
+        s.save(&dir).unwrap();
+
+        let back = UserSettings::load(&dir).unwrap();
+        assert_eq!(back, s, "everything came back as written");
+
+        // a file edited by hand, with an interval nobody wants and an action that is not real
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"collab_poll_secs": 99999, "hotkeys": {"nonsense_action": "Ctrl+Q", "send_to_repeater": "not a shortcut"}}"#,
+        )
+        .unwrap();
+        let fixed = UserSettings::load(&dir).expect("a hand-edited file still loads");
+        assert_eq!(fixed.collab_poll_secs, *UserSettings::COLLAB_POLL_RANGE.end(), "brought into range");
+        assert_eq!(fixed.collab_default_server, "", "and the missing fields take their defaults");
+        assert_eq!(fixed.default_message_view, crate::viewer::MessageViewMode::Raw);
+        // the unusable shortcut entries are kept in the file but cost nothing: every action
+        // still answers to a key
+        let live = crate::hotkeys::bindings(&fixed.hotkeys);
+        assert_eq!(live.len(), crate::hotkeys::ACTIONS.len());
+        let repeater = live.iter().find(|(a, _)| a.id == "send_to_repeater").expect("the action");
+        assert_eq!(repeater.1, crate::hotkeys::Binding::ctrl(eframe::egui::Key::R), "back to its default");
+
+        // a file written before any of these fields existed
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"light"}"#).unwrap();
+        let older = UserSettings::load(&dir).unwrap();
+        assert_eq!(older.theme, Look::Light, "what it did say");
+        assert_eq!(older.collab_poll_secs, DEFAULT_COLLAB_POLL_SECS, "and defaults for what it did not");
+        assert!(older.hotkeys.is_empty() && older.ca_export_dir.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

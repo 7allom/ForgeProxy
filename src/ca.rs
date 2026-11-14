@@ -208,10 +208,54 @@ impl CertificateAuthority {
         Ok(crate::codec::base64_encode(&sha2::Sha256::digest(spki), false, true))
     }
 
+    /// When this certificate stops being valid, read out of the certificate itself.
+    ///
+    /// Read from the stored bytes rather than worked out from the validity this build would
+    /// issue: a certificate made by an earlier build, or replaced by hand, says something
+    /// different, and the date shown has to be the one browsers will act on. `None` when the
+    /// certificate cannot be parsed, which the caller shows as unavailable rather than
+    /// guessing.
+    pub fn not_after(&self) -> Option<ExpiryDate> {
+        let (_, cert) = x509_parser::parse_x509_certificate(&self.ca_cert_der).ok()?;
+        let t = cert.validity().not_after.to_datetime();
+        Some(ExpiryDate { year: t.year(), month: u8::from(t.month()), day: t.day(), unix: t.unix_timestamp() })
+    }
+
     /// The certificate's SHA-256 fingerprint, "AB:CD:...", as browsers show it.
     pub fn fingerprint(&self) -> String {
         use sha2::Digest;
         sha2::Sha256::digest(&self.ca_cert_der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+    }
+}
+
+/// The day a certificate stops being valid, and how far off that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiryDate {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    /// Seconds since the epoch, for working out how long is left.
+    pub unix: i64,
+}
+
+/// A certificate within this many days of expiring is worth saying so about: a root that
+/// lapses mid-engagement turns every intercepted site into a certificate error.
+pub const EXPIRY_WARN_DAYS: i64 = 90;
+
+impl ExpiryDate {
+    /// `2036-11-14`, which sorts and reads the same in every locale.
+    pub fn date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// Days from now until it expires; negative once it has.
+    pub fn days_left(&self, now_unix: i64) -> i64 {
+        (self.unix - now_unix) / 86_400
+    }
+
+    /// Is it gone, or close enough to going that it should be said out loud?
+    pub fn needs_attention(&self, now_unix: i64) -> bool {
+        self.days_left(now_unix) <= EXPIRY_WARN_DAYS
     }
 }
 

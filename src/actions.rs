@@ -937,8 +937,6 @@ pub fn poll_collaborator(app: &mut App) {
     });
 }
 
-/// How long the Collaborator tab waits between polls while its timer is on.
-pub const AUTO_POLL_EVERY: Duration = Duration::from_secs(10);
 
 /// Drive the Collaborator poll timer. Called once a frame from the Collaborator tab, so the
 /// timer only runs while that tab is on screen: it starts a poll off the drawing thread once
@@ -960,13 +958,15 @@ pub fn collab_auto_poll_tick(app: &mut App, ctx: &eframe::egui::Context) {
         app.collab_msg = "Enter a Collaborator server address first.".into();
         return;
     }
-    let due = app.collab_last_poll.is_none_or(|t| t.elapsed() >= AUTO_POLL_EVERY);
+    // Settings > Collaborator: how long to wait between polls
+    let every = Duration::from_secs(app.settings.collab_poll_secs.max(1));
+    let due = app.collab_last_poll.is_none_or(|t| t.elapsed() >= every);
     if due && !app.collab_polling {
         app.collab_last_poll = Some(std::time::Instant::now());
         poll_collaborator(app);
     }
     // a poll in flight already keeps the frames coming; this is for the wait between them
-    ctx.request_repaint_after(AUTO_POLL_EVERY);
+    ctx.request_repaint_after(every);
 }
 
 /// The address an out-of-band interaction stands for, as the rest of the app reads one: the

@@ -35,7 +35,11 @@ pub struct ProjectFile {
     pub intruder_template: String,
     pub intruder_payloads: String,
     pub intruder_payloads_b: String,
-    pub collab_server: String,
+    /// The relay this project uses. `None` in a file that never carried the field, which
+    /// takes the default from Settings; `Some("")` in one where the relay was cleared on
+    /// purpose, which is left cleared.
+    #[serde(default)]
+    pub collab_server: Option<String>,
     /// The token a protected relay asks for, the session registered with it, the payloads
     /// handed out and what has come back. Absent from files saved before any of this, which
     /// open with no session and nothing collected.
@@ -93,7 +97,7 @@ pub fn snapshot(app: &App) -> ProjectFile {
         intruder_template: app.int_template.clone(),
         intruder_payloads: app.int_payloads.clone(),
         intruder_payloads_b: app.int_payloads_b.clone(),
-        collab_server: app.collab_server.clone(),
+        collab_server: Some(app.collab_server.clone()),
         collab_token: app.collab_token.clone(),
         collab_session: app.collab_session.clone(),
         collab_payloads: app.collab_payloads.clone(),
@@ -149,6 +153,12 @@ pub fn apply_settings(app: &mut App, f: &ProjectFile) {
 
 /// Start over with an empty temporary project: everything a project file holds goes back
 /// to how a fresh start has it (app preferences, the proxy listener and the CA stay).
+/// The relay a project starts on when it names none: the one set in Settings, or nothing.
+fn default_relay(app: &App) -> String {
+    let configured = app.settings.collab_default_server.trim();
+    if configured.is_empty() { crate::collab::DEFAULT_SERVER.to_string() } else { configured.to_string() }
+}
+
 pub fn reset(app: &mut App) {
     use crate::state::*;
     app.history.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -182,7 +192,7 @@ pub fn reset(app: &mut App) {
     app.int_payloads.clear();
     app.int_payloads_b.clear();
     app.int_results.clear();
-    app.collab_server = crate::collab::DEFAULT_SERVER.into();
+    app.collab_server = default_relay(app);
     app.collab_token.clear();
     app.collab_session = None;
     app.collab_registering = false;
@@ -241,7 +251,12 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     app.int_payloads_b = f.intruder_payloads_b;
     // a project opened on another machine keeps its session: the payloads already out in the
     // world answer to that correlation id and no other
-    app.collab_server = if f.collab_server.trim().is_empty() { crate::collab::DEFAULT_SERVER.into() } else { f.collab_server };
+    // a relay the file names is the project's own, cleared or not; only a file that never
+    // carried the field falls back to the workstation default
+    app.collab_server = match f.collab_server {
+        Some(named) => named,
+        None => default_relay(app),
+    };
     app.collab_token = f.collab_token;
     app.collab_session = f.collab_session;
     app.collab_registering = false;
@@ -285,6 +300,7 @@ pub fn with_extension(path: std::path::PathBuf) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     /// Repeater and Intruder start a new project on the same baseline origin, and the Intruder
     /// template's Host header agrees with its target: the default request is sendable as written,
@@ -695,7 +711,7 @@ mod tests {
         let f: ProjectFile = serde_json::from_str(old).expect("a file naming the old view still reads");
         assert_eq!(f.name, "older", "the project's own fields came through");
         assert_eq!(f.history.len(), 1, "and so did its traffic");
-        assert_eq!(f.collab_server, "relay.test");
+        assert_eq!(f.collab_server.as_deref(), Some("relay.test"));
 
         // and it applies to a running app, with the traffic where the Logger will find it
         let ctx = egui::Context::default();
@@ -718,5 +734,62 @@ mod tests {
             "a_setting_from_a_later_build":{"nested":[1,2,3]},"another":"x"}"#;
         let f: ProjectFile = serde_json::from_str(with_junk).expect("unknown fields are passed over");
         assert_eq!(f.name, "n");
+    }
+
+    /// Where a project's relay comes from. A file that names one keeps it, cleared or not; only
+    /// a file that never carried the field takes the workstation's default, so turning a
+    /// default on cannot put a relay back into a project that deliberately has none.
+    #[test]
+    fn a_projects_relay_comes_from_the_file_or_the_default_matrix() {
+        struct Case {
+            name: &'static str,
+            in_file: Option<&'static str>,
+            configured: &'static str,
+            want: &'static str,
+        }
+        let cases = [
+            Case { name: "the file names one", in_file: Some("relay.test"), configured: "default.example.com", want: "relay.test" },
+            Case { name: "the file names one and there is no default", in_file: Some("relay.test"), configured: "", want: "relay.test" },
+            Case { name: "the file cleared it on purpose", in_file: Some(""), configured: "default.example.com", want: "" },
+            Case { name: "the file never carried the field", in_file: None, configured: "default.example.com", want: "default.example.com" },
+            Case { name: "no field and no default", in_file: None, configured: "", want: "" },
+            Case { name: "a default with space around it", in_file: None, configured: "  default.example.com  ", want: "default.example.com" },
+        ];
+        assert_table!(cases, |idx, case| {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx);
+            let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
+            app.settings.collab_default_server = case.configured.to_string();
+
+            let relay = match case.in_file {
+                Some(named) => format!(r#","collab_server":"{named}""#),
+                None => String::new(),
+            };
+            let text = format!(
+                r#"{{"version":1,"name":"p","match_replace":[],"history":[],"tasks":[],"organizer":[],
+                   "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
+                   "intruder_payloads":"","intruder_payloads_b":""{relay}}}"#
+            );
+            let f: ProjectFile = serde_json::from_str(&text).expect("the project file reads");
+            apply_all(&mut app, f);
+            assert_eq!(app.collab_server, case.want, "case #{idx} ({})", case.name);
+        });
+    }
+
+    /// A new project starts on the configured default relay, and on nothing when there is none.
+    #[test]
+    fn a_new_project_starts_on_the_configured_relay() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
+        app.settings.collab_default_server = "default.example.com".into();
+        app.collab_server = "something.else".into();
+        reset(&mut app);
+        assert_eq!(app.collab_server, "default.example.com", "a new project opens on the default");
+
+        app.settings.collab_default_server.clear();
+        app.collab_server = "something.else".into();
+        reset(&mut app);
+        assert_eq!(app.collab_server, "", "and on nothing when none is set");
     }
 }

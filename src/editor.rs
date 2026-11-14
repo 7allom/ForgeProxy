@@ -349,8 +349,22 @@ impl MessageView {
 }
 
 /// The view mode of the message view `id` (kept for the session, per view).
+/// Settings > Display: which way a pane opens before anyone has switched it. Kept beside the
+/// editor font size, and set once a frame from the same place.
+const DEFAULT_VIEW_KEY: &str = "default_message_view";
+
+pub fn set_default_view_mode(ctx: &egui::Context, mode: MessageViewMode) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(DEFAULT_VIEW_KEY), mode));
+}
+
+/// How this pane is showing its message: whatever it was last switched to, and the setting's
+/// default until it is switched. A pane that has been switched keeps its own choice, so
+/// changing the default does not pull the pane someone is reading out from under them.
 pub fn view_mode(ctx: &egui::Context, id: &str) -> MessageViewMode {
-    ctx.data(|d| d.get_temp(egui::Id::new(id).with("view_mode"))).unwrap_or_default()
+    if let Some(mode) = ctx.data(|d| d.get_temp::<MessageViewMode>(egui::Id::new(id).with("view_mode"))) {
+        return mode;
+    }
+    ctx.data(|d| d.get_temp(egui::Id::new(DEFAULT_VIEW_KEY))).unwrap_or_default()
 }
 
 pub fn set_view_mode(ctx: &egui::Context, id: &str, mode: MessageViewMode) {
