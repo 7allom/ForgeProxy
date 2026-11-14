@@ -118,10 +118,6 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.menu_button(label("Help", p), |ui| {
-        if ui.button("Getting started").clicked() {
-            app.tab = Tab::Discover;
-            ui.close_menu();
-        }
         if ui.button("Keyboard shortcuts").clicked() {
             app.show_settings = true;
             app.settings_page = crate::state::SettingsPage::Hotkeys;

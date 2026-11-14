@@ -175,7 +175,6 @@ pub fn reset(app: &mut App) {
     app.org_renaming = None;
     app.org_new_collection = None;
     app.org_message.clear();
-    app.discover_sel = None;
     app.reset_repeater();
     app.rep_renaming = None;
     app.int_target = DEFAULT_INT_TARGET.into();
@@ -677,5 +676,47 @@ mod tests {
         assert_eq!((e.id, e.tool.as_str(), e.host.as_str()), (9, "Proxy", "h.test"));
         assert!(e.url.is_empty(), "with no address recorded");
         assert_eq!((e.truncated, e.time, e.elapsed_ms), (false, 0, 0));
+    }
+
+    /// A project saved while the app still had a separate browsing view opens unchanged. That
+    /// view kept its own selection, and a file from then may carry a `discovered_items` of its
+    /// own; nothing reads it any more, and a field nothing asks for is passed over rather than
+    /// refused, so the rest of the project still loads.
+    #[test]
+    fn a_project_naming_a_view_that_no_longer_exists_still_opens() {
+        let old = r#"{"version":1,"name":"older","match_replace":[],"tasks":[],"organizer":[],
+            "discovered_items":[{"id":7,"host":"shop.test","path":"/cart"}],
+            "discover_sel":3,
+            "history":[{"id":4,"tool":"Proxy","method":"GET","host":"shop.test","path":"/pay",
+                        "status":"200 OK","length":2,"mime":"text/html",
+                        "request":"GET /pay HTTP/1.1\nHost: shop.test\n\n","response":"HTTP/1.1 200 OK\n\nok"}],
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
+            "intruder_payloads":"","intruder_payloads_b":"","collab_server":"relay.test"}"#;
+        let f: ProjectFile = serde_json::from_str(old).expect("a file naming the old view still reads");
+        assert_eq!(f.name, "older", "the project's own fields came through");
+        assert_eq!(f.history.len(), 1, "and so did its traffic");
+        assert_eq!(f.collab_server, "relay.test");
+
+        // and it applies to a running app, with the traffic where the Logger will find it
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
+        apply_all(&mut app, f);
+        assert_eq!(app.project_name, "older");
+        let kept = app.history.lock().unwrap();
+        assert_eq!(kept.len(), 1, "the entry survived the load");
+        assert_eq!((kept[0].id, kept[0].path.as_str()), (4, "/pay"));
+    }
+
+    /// Nothing in the project file refuses a field it does not know, which is what lets a file
+    /// from an older build open at all. A guard on the shape of the struct itself.
+    #[test]
+    fn the_project_file_passes_over_fields_it_does_not_know() {
+        let with_junk = r#"{"version":1,"name":"n","match_replace":[],"history":[],"tasks":[],"organizer":[],
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
+            "intruder_payloads":"","intruder_payloads_b":"","collab_server":"",
+            "a_setting_from_a_later_build":{"nested":[1,2,3]},"another":"x"}"#;
+        let f: ProjectFile = serde_json::from_str(with_junk).expect("unknown fields are passed over");
+        assert_eq!(f.name, "n");
     }
 }

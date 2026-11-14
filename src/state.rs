@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
     Dashboard, Target, Proxy, Intruder, Repeater, Collaborator, Sequencer,
-    Decoder, Comparer, Logger, Organizer, Discover,
+    Decoder, Comparer, Logger, Organizer,
 }
 impl Copy for Tab {}
 
 impl Tab {
-    pub const ALL: [Tab; 12] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Dashboard, Tab::Target, Tab::Proxy, Tab::Intruder, Tab::Repeater, Tab::Collaborator,
-        Tab::Sequencer, Tab::Decoder, Tab::Comparer, Tab::Logger, Tab::Organizer, Tab::Discover,
+        Tab::Sequencer, Tab::Decoder, Tab::Comparer, Tab::Logger, Tab::Organizer,
     ];
     pub fn label(&self) -> &'static str {
         match self {
@@ -29,7 +29,6 @@ impl Tab {
             Tab::Intruder => "Intruder", Tab::Repeater => "Repeater", Tab::Collaborator => "Collaborator",
             Tab::Sequencer => "Sequencer", Tab::Decoder => "Decoder", Tab::Comparer => "Comparer",
             Tab::Logger => "Logger", Tab::Organizer => "Organizer",
-            Tab::Discover => "Discover",
         }
     }
 }
@@ -466,7 +465,6 @@ pub struct App {
     pub org_new_collection: Option<String>,
     /// What became of the last collection that was deleted, to say where its items went.
     pub org_message: String,
-    pub discover_sel: Option<usize>,
 
     // extensions
     pub show_settings: bool,
@@ -695,7 +693,6 @@ impl App {
             org_renaming: None,
             org_new_collection: None,
             org_message: String::new(),
-            discover_sel: None,
             show_settings: false,
             settings_page: SettingsPage::Proxy,
             settings_focus: None,

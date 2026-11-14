@@ -35,7 +35,6 @@ fn sc(shift: bool, k: Key) -> KeyboardShortcut {
 fn selected(app: &App) -> Option<std::sync::Arc<crate::http::HttpEntry>> {
     let id = match app.tab {
         Tab::Target => app.target_selected_history_id.or(app.history_sel)?,
-        Tab::Discover => app.discover_sel.or(app.history_sel)?,
         _ => app.history_sel?,
     };
     app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).cloned()
