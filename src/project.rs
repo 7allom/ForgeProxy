@@ -597,4 +597,85 @@ mod tests {
         assert!(app.tls_passthrough.is_empty());
         assert!(app.project_name.is_empty() && app.project_path.is_none());
     }
+
+    /// What the Logger shows is the shared traffic store, and a project keeps it: every entry
+    /// is there again when the project is reopened, whole, whichever tool recorded it -- and
+    /// the next id carries on past the highest restored, so a new entry cannot be handed an id
+    /// that one of them already holds.
+    #[test]
+    fn logger_entries_survive_a_save_and_reload() {
+        let fresh = || {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx);
+            // a screenshot path keeps the proxy listener off
+            crate::state::App::new(&cc, Some("/dev/null".into()), None, false)
+        };
+        let entry = |id: usize, tool: &str, host: &str, path: &str| crate::http::HttpEntry {
+            id,
+            tool: tool.into(),
+            method: "GET".into(),
+            host: host.into(),
+            path: path.into(),
+            status: "200 OK".into(),
+            length: 2,
+            mime: "text/html".into(),
+            request: format!("GET {path} HTTP/1.1\nHost: {host}\n\n"),
+            response: "HTTP/1.1 200 OK\n\nok".into(),
+            url: format!("http://{host}{path}"),
+            truncated: false,
+            time: 1_700_000_000,
+            elapsed_ms: 12,
+        };
+
+        // the store is behind a lock, so filling it needs no mutable borrow of the app
+        let app = fresh();
+        // the Logger shows every tool's traffic, not the proxy's alone
+        for e in [
+            entry(1, "Proxy", "shop.test", "/cart"),
+            entry(2, "Repeater", "api.test", "/v1/users"),
+            entry(3, "Intruder", "shop.test", "/pay"),
+        ] {
+            app.history.lock().unwrap().push(std::sync::Arc::new(e));
+        }
+        *app.next_id.lock().unwrap() = 3;
+
+        let saved = serde_json::to_string(&snapshot(&app)).unwrap();
+        let back: ProjectFile = serde_json::from_str(&saved).unwrap();
+        let mut loaded = fresh();
+        apply_all(&mut loaded, back);
+
+        let kept: Vec<(usize, String, String, String)> = loaded
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.id, e.tool.clone(), e.host.clone(), e.path.clone()))
+            .collect();
+        assert_eq!(kept.len(), 3, "every entry came back");
+        assert_eq!(kept[0], (1, "Proxy".into(), "shop.test".into(), "/cart".into()));
+        assert_eq!(kept[1], (2, "Repeater".into(), "api.test".into(), "/v1/users".into()));
+        assert_eq!(kept[2], (3, "Intruder".into(), "shop.test".into(), "/pay".into()));
+
+        // the messages come back whole, which is what the detail pane under the table reads
+        let first = loaded.history.lock().unwrap()[0].clone();
+        assert_eq!(first.request, "GET /cart HTTP/1.1\nHost: shop.test\n\n");
+        assert_eq!(first.response, "HTTP/1.1 200 OK\n\nok");
+        assert_eq!(first.url, "http://shop.test/cart");
+        assert_eq!((first.status.as_str(), first.length, first.mime.as_str()), ("200 OK", 2, "text/html"));
+        assert_eq!((first.time, first.elapsed_ms), (1_700_000_000, 12));
+        assert_eq!(*loaded.next_id.lock().unwrap(), 3, "and the next id carries on past the highest restored");
+    }
+
+    /// An entry saved by a version before entries carried an address, a duration or a
+    /// truncation flag still opens, with those at their defaults rather than failing the whole
+    /// project file.
+    #[test]
+    fn a_logger_entry_from_an_older_project_still_reads() {
+        let old = r#"{"id":9,"tool":"Proxy","method":"GET","host":"h.test","path":"/","status":"200 OK",
+            "length":0,"mime":"","request":"GET / HTTP/1.1\n\n","response":""}"#;
+        let e: crate::http::HttpEntry = serde_json::from_str(old).expect("an older entry still reads");
+        assert_eq!((e.id, e.tool.as_str(), e.host.as_str()), (9, "Proxy", "h.test"));
+        assert!(e.url.is_empty(), "with no address recorded");
+        assert_eq!((e.truncated, e.time, e.elapsed_ms), (false, 0, 0));
+    }
 }

@@ -955,7 +955,7 @@ pub fn run_poll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{assert_table, HttpFixture};
+    use crate::test_utils::{assert_table, HttpFixture, MockAppBuilder};
 
     /// Payloads handed out by earlier versions carried their label inside the identifier.
     /// Projects made then still hold them, so what is read back out of one has to keep
@@ -1890,5 +1890,72 @@ mod tests {
         let elsewhere = CollabInteraction { client_ip: "203.0.113.1".into(), ..hits[0].clone() };
         assert!(!hits[0].is_same_event(&elsewhere), "a different address is a different event");
         assert!(!hits[0].is_same_event(&hits[1]));
+    }
+
+    /// Run update frames until `done`, which is what drains the job channel the background
+    /// work answers on.
+    fn run_frames_until(ctx: &eframe::egui::Context, app: &mut crate::state::App, done: impl Fn(&crate::state::App) -> bool) {
+        for _ in 0..600 {
+            let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+                eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest())
+            });
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the background work never finished");
+    }
+
+    /// Registering a session and polling it is this app talking to its own relay, not traffic
+    /// to a target, so none of it belongs in the shared traffic store that the Logger and HTTP
+    /// history read. Driven through the very actions the tab uses, against a relay on this
+    /// machine, so the store being empty is a fact about the real path and not about a test
+    /// that quietly sent nothing.
+    #[test]
+    fn registering_and_polling_put_nothing_in_the_shared_traffic_store() {
+        let session = session_on("127.0.0.1");
+        let answers = |s: &OastSession| {
+            let unique = format!("{}nonce00000000", s.correlation_id);
+            let json = interaction_json("http", &unique, r#","raw-request":"GET /hit HTTP/1.1\nHost: x\n\n","raw-response":"HTTP/1.1 200 OK\n\nok""#);
+            let (key, data) = seal(s, &[json]);
+            format!(r#"{{"data":{},"extra":[],"aes_key":"{key}"}}"#, serde_json::to_string(&data).unwrap())
+        };
+        let (server, log) = test_relay(answers, session.clone());
+
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(crate::state::Tab::Collaborator).build_with_ctx();
+        let mut session = OastSession { server: server.clone(), ..session };
+        let payload = session.new_payload("login", true);
+        // the identifier the relay answers under, so what comes back is matched to the payload
+        session.payloads[0].unique_id = format!("{}nonce00000000", session.correlation_id);
+        app.collab_server = server.clone();
+        app.collab_token = "s3cret".into();
+        app.collab_payloads.push(payload);
+        app.collab_session = Some(session);
+
+        crate::actions::register_collaborator(&mut app);
+        run_frames_until(&ctx, &mut app, |a| !a.collab_registering);
+        assert!(app.collab_session.as_ref().expect("a session").registered, "the relay took the registration");
+
+        crate::actions::poll_collaborator(&mut app);
+        run_frames_until(&ctx, &mut app, |a| !a.collab_polling);
+        assert_eq!(app.collab_interactions.len(), 1, "the interaction came back ({})", app.collab_msg);
+        assert_eq!(app.collab_interactions[0].interaction_type, "HTTP");
+
+        // the relay really was spoken to, both times
+        {
+            let seen = log.lock().unwrap();
+            assert!(!seen.register_body.is_empty(), "the relay was registered with");
+            assert!(!seen.poll_query.is_empty(), "and polled");
+        }
+
+        // and none of either exchange was recorded as traffic
+        let recorded = app.history.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            recorded.is_empty(),
+            "the relay exchange reached the shared traffic store: {:?}",
+            recorded.iter().map(|e| format!("{} {}{}", e.tool, e.host, e.path)).collect::<Vec<_>>()
+        );
+        assert_eq!(*app.next_id.lock().unwrap_or_else(|e| e.into_inner()), 0, "and no entry id was handed out");
     }
 }

@@ -1058,41 +1058,40 @@ pub fn collaborator(app: &mut App, ui: &mut Ui, p: &Palette) {
     app.collab_view.reconcile(&app.collab_interactions);
 
     let mut action = None;
-    // the detail pane is registered first, so the table below takes the height it leaves and
-    // there is no gap under a table with only a few rows in it
-    collab_detail_pane(app, ui, p);
-    egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(p.panel))
-        .show_inside(ui, |ui| {
-            theme::section_title(ui, p, "Collaborator",
-                "Test whether an application can be made to contact an external service via DNS, HTTP, or SMTP. \
-                 Put a payload in a request; if the target looks it up, the interaction shows below.");
-            ui.add_space(8.0);
-            collab_toolbar(app, ui, p);
-            ui.add_space(5.0);
-            collab_filter_bar(app, ui, p);
-            ui.add_space(6.0);
+    theme::section_title(ui, p, "Collaborator",
+        "Test whether an application can be made to contact an external service via DNS, HTTP, or SMTP. \
+         Put a payload in a request; if the target looks it up, the interaction shows below.");
+    ui.add_space(8.0);
+    collab_toolbar(app, ui, p);
+    ui.add_space(5.0);
+    collab_filter_bar(app, ui, p);
+    ui.add_space(6.0);
 
-            let rows = crate::collab::rows(&app.collab_interactions, app.collab_session.as_ref(), &app.collab_view);
-            // how much of the table the filters are hiding, which is worth saying plainly:
-            // an empty-looking table is otherwise hard to tell from one that collected nothing
-            if app.collab_view.is_filtering() && !app.collab_interactions.is_empty() {
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(format!("Showing {} of {}", rows.len(), app.collab_interactions.len()))
-                        .size(11.0)
-                        .color(p.disabled),
-                );
-                ui.add_space(2.0);
-            }
-            if app.collab_interactions.is_empty() {
-                let _ = theme::empty_state(ui, p, EmptyIcon::Radar, "No interactions",
-                    "Generate a payload with \"Copy to clipboard\", use it in a request, then poll for DNS, HTTP, or SMTP interactions.", None);
-                return;
-            }
-            collab_table(app, ui, p, &rows, &mut action);
-            collab_keyboard_navigation(app, ui, &rows);
-        });
+    let rows = crate::collab::rows(&app.collab_interactions, app.collab_session.as_ref(), &app.collab_view);
+    // how much of the table the filters are hiding, which is worth saying plainly:
+    // an empty-looking table is otherwise hard to tell from one that collected nothing
+    if app.collab_view.is_filtering() && !app.collab_interactions.is_empty() {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(format!("Showing {} of {}", rows.len(), app.collab_interactions.len()))
+                .size(11.0)
+                .color(p.disabled),
+        );
+        ui.add_space(2.0);
+    }
+    if app.collab_interactions.is_empty() {
+        let _ = theme::empty_state(ui, p, EmptyIcon::Radar, "No interactions",
+            "Generate a payload with \"Copy to clipboard\", use it in a request, then poll for DNS, HTTP, or SMTP interactions.", None);
+        return;
+    }
+    // The pane is registered after the bars above and before the table, so the height
+    // it may be dragged to is measured from the room those bars left rather than from
+    // the whole tab -- otherwise the clamp meant to keep a table's worth of space
+    // above it reserves room the bars have already taken, and dragging up far enough
+    // leaves no table at all. The traffic tables place theirs the same way.
+    collab_detail_pane(app, ui, p);
+    collab_table(app, ui, p, &rows, &mut action);
+    collab_keyboard_navigation(app, ui, &rows);
     if let Some(action) = action {
         collab_apply(app, action);
     }
@@ -1434,36 +1433,45 @@ fn collab_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::colla
     // a lookup's transcript is not a request and a response, so the pane says "Transcript"
     let request_title = if crate::collab::normalize_protocol(&hit.interaction_type).starts_with("HTTP") { "Request" } else { "Transcript" };
     let columns = if has_response { 3 } else { 2 };
-    let h = (ui.available_height() - 24.0).max(90.0);
-    let (out_req, out_resp) = theme::columns(ui, columns, |cols| {
-        cols[0].label(bold(request_title, 12.5).color(p.strong));
-        let req = editor::message_view(&mut cols[0], p, "collab_req", &hit.raw_request, h);
-        let resp = has_response.then(|| {
-            cols[1].label(bold("Response", 12.5).color(p.strong));
-            editor::message_view(&mut cols[1], p, "collab_resp", &hit.raw_response, h)
+    // The editors go inside a scroll area, which bounds the height they are offered to the
+    // pane's actual (dragged) size. A panel stores the rect of its *contents*, so editors
+    // allowed to ask for more than the pane has would drive its height instead of the drag:
+    // the pane then creeps a little on every idle frame and never settles, and the clamp that
+    // keeps at least a table's worth of room above it is bypassed, letting the table collapse.
+    // Anything that does not fit scrolls instead. The traffic tables do the same, for the same
+    // reason.
+    egui::ScrollArea::vertical().id_salt("collab_detail_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let h = (ui.available_height() - 24.0).max(90.0);
+        let (out_req, out_resp) = theme::columns(ui, columns, |cols| {
+            cols[0].label(bold(request_title, 12.5).color(p.strong));
+            let req = editor::message_view(&mut cols[0], p, "collab_req", &hit.raw_request, h);
+            let resp = has_response.then(|| {
+                cols[1].label(bold("Response", 12.5).color(p.strong));
+                editor::message_view(&mut cols[1], p, "collab_resp", &hit.raw_response, h)
+            });
+            let last = columns - 1;
+            cols[last].label(bold("Details", 12.5).color(p.strong));
+            egui::ScrollArea::vertical().id_salt("collab_details").max_height(h).show(&mut cols[last], |ui| {
+                collab_field(ui, p, "Type", &hit.interaction_type);
+                collab_field(ui, p, "Query type", &hit.query_type);
+                collab_field(ui, p, "Full payload", &hit.payload);
+                collab_field(ui, p, "Label", label);
+                collab_field(ui, p, "Session ID", &hit.unique_id);
+                collab_field(ui, p, "Client IP", &hit.client_ip);
+                collab_field(ui, p, "Timestamp", &hit.timestamp);
+                if !hit.comment.trim().is_empty() {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(&hit.comment).size(12.0).color(p.text)).selectable(true).wrap());
+                }
+            });
+            (req, resp)
         });
-        let last = columns - 1;
-        cols[last].label(bold("Details", 12.5).color(p.strong));
-        egui::ScrollArea::vertical().id_salt("collab_details").max_height(h).show(&mut cols[last], |ui| {
-            collab_field(ui, p, "Type", &hit.interaction_type);
-            collab_field(ui, p, "Query type", &hit.query_type);
-            collab_field(ui, p, "Full payload", &hit.payload);
-            collab_field(ui, p, "Label", label);
-            collab_field(ui, p, "Session ID", &hit.unique_id);
-            collab_field(ui, p, "Client IP", &hit.client_ip);
-            collab_field(ui, p, "Timestamp", &hit.timestamp);
-            if !hit.comment.trim().is_empty() {
-                ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(&hit.comment).size(12.0).color(p.text)).selectable(true).wrap());
-            }
-        });
-        (req, resp)
+        let name = format!("Interaction {}", hit.payload);
+        attach_view_context_menu(&out_req, &hit.raw_request, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} request"));
+        if let Some(out_resp) = out_resp {
+            attach_view_context_menu(&out_resp, &hit.raw_response, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} response"));
+        }
     });
-    let name = format!("Interaction {}", hit.payload);
-    attach_view_context_menu(&out_req, &hit.raw_request, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} request"));
-    if let Some(out_resp) = out_resp {
-        attach_view_context_menu(&out_resp, &hit.raw_response, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} response"));
-    }
 }
 
 /// An interaction that carried no message of its own -- a name lookup, a connection that was
@@ -3387,5 +3395,138 @@ mod collab_tests {
         let update = frame(&ctx, &mut app, vec![]);
         assert_eq!(app.collab_sel, Some(1));
         assert!(!find_all(&update, "2026-11-14T11:06:18.237456789Z").is_empty(), "the full timestamp is there to read");
+    }
+
+    /// The detail pane's rect as egui last laid it out.
+    fn detail_rect(ctx: &egui::Context) -> egui::Rect {
+        egui::containers::panel::PanelState::load(ctx, egui::Id::new("collab_detail"))
+            .map(|s| s.rect)
+            .expect("the detail pane is on screen")
+    }
+
+    /// The table's height: from the top of its header down to the splitter above the pane.
+    fn table_height(ctx: &egui::Context, app: &mut App) -> f32 {
+        let update = frame(ctx, app, vec![]);
+        let header_top = find(&update, "#").top();
+        detail_rect(ctx).top() - header_top
+    }
+
+    /// Drag the splitter by `dy` (negative is upward), a frame at a time as a hand would, and
+    /// give back the detail pane's height afterwards.
+    fn drag_splitter(ctx: &egui::Context, app: &mut App, dy: f32) -> f32 {
+        frame(ctx, app, vec![]);
+        let grip = egui::pos2(detail_rect(ctx).center().x, detail_rect(ctx).top());
+        frame(ctx, app, vec![egui::Event::PointerMoved(grip)]);
+        frame(ctx, app, vec![button(grip, true, false)]);
+        let to = egui::pos2(grip.x, grip.y + dy);
+        // egui reads the resize drag from the frame before, so the move is held for two
+        frame(ctx, app, vec![egui::Event::PointerMoved(to)]);
+        frame(ctx, app, vec![]);
+        frame(ctx, app, vec![button(to, false, false)]);
+        frame(ctx, app, vec![]);
+        detail_rect(ctx).height()
+    }
+
+    /// Dragging the splitter upward gives the detail pane the room and takes it from the table;
+    /// dragging it back down returns it. The pane has to follow the pointer in both directions:
+    /// contents allowed to insist on their own height would stop it shrinking.
+    #[test]
+    fn dragging_the_splitter_trades_height_between_the_table_and_the_detail_pane() {
+        let (ctx, mut app) = collab_app();
+        // interaction #2 carries a request and a response, so the pane is at its fullest
+        app.collab_sel = Some(2);
+        frame(&ctx, &mut app, vec![]);
+
+        let (h0, t0) = (detail_rect(&ctx).height(), table_height(&ctx, &mut app));
+        let grown = drag_splitter(&ctx, &mut app, -90.0);
+        let t1 = table_height(&ctx, &mut app);
+        assert!(grown > h0 + 60.0, "dragging up grew the pane: {h0} -> {grown}");
+        assert!(t1 < t0 - 60.0, "and took it from the table: {t0} -> {t1}");
+
+        // and back down again, which is the direction contents can fight
+        let shrunk = drag_splitter(&ctx, &mut app, 70.0);
+        let t2 = table_height(&ctx, &mut app);
+        assert!(shrunk < grown - 50.0, "dragging down shrank the pane: {grown} -> {shrunk}");
+        assert!(t2 > t1 + 50.0, "and gave it back to the table: {t1} -> {t2}");
+    }
+
+    /// Where the splitter was let go is where it stays. The pane holds the height it was
+    /// dragged to over idle frames instead of drifting a little on each one, which is what a
+    /// pane whose height is decided by its contents rather than by the drag does.
+    #[test]
+    fn the_pane_holds_the_height_it_was_dragged_to_matrix() {
+        let cases: [(&str, usize, f32); 4] = [
+            ("a transcript dragged taller", 2, -120.0),
+            ("a transcript dragged shorter", 2, 90.0),
+            ("a transcript squeezed to the floor", 2, 400.0),
+            ("callback details, which have no editors in them", 1, -120.0),
+        ];
+        assert_table!(cases, |idx, (what, id, dy)| {
+            let (ctx, mut app) = collab_app();
+            app.collab_sel = Some(id);
+            let settled = drag_splitter(&ctx, &mut app, dy);
+            for n in 0..5 {
+                let now = detail_rect(&ctx).height();
+                assert!(
+                    (now - settled).abs() < 0.5,
+                    "case #{idx} ({what}): idle frame {n} moved it from {settled} to {now}"
+                );
+                frame(&ctx, &mut app, vec![]);
+            }
+            // and never past the floor it is clamped to
+            assert!(settled >= 119.5, "case #{idx} ({what}): {settled} is under the minimum");
+        });
+    }
+
+    /// However far the splitter is dragged upward, a table's worth of room is kept above it.
+    /// The pane is registered after the bars for exactly this reason: a clamp measured against
+    /// the whole tab would reserve height the bars have already spent, and the table would be
+    /// left with nothing.
+    #[test]
+    fn dragging_the_splitter_to_the_top_still_leaves_a_table() {
+        let (ctx, mut app) = collab_app();
+        app.collab_sel = Some(2);
+        frame(&ctx, &mut app, vec![]);
+        drag_splitter(&ctx, &mut app, -2000.0);
+        let table = table_height(&ctx, &mut app);
+        assert!(table > 100.0, "the table keeps its own room: {table}");
+
+        // the rows are still there to be read and clicked, not squeezed out of sight
+        let update = frame(&ctx, &mut app, vec![]);
+        assert!(!find_all(&update, "#").is_empty(), "the header is on screen");
+        assert!(!find_all(&update, &row_label(&app, 1)).is_empty(), "and so is a row");
+    }
+
+    /// With no row open there is no pane and no splitter: the table has the whole tab, so a
+    /// table with only a few rows in it is not left sitting above an empty strip.
+    #[test]
+    fn nothing_selected_leaves_no_pane_and_no_gap_under_the_table() {
+        let (ctx, mut app) = collab_app();
+        app.collab_sel = None;
+        let update = frame(&ctx, &mut app, vec![]);
+        for pane in ["Request", "Response", "Transcript", "Details", "Callback details"] {
+            assert!(find_all(&update, pane).is_empty(), "nothing is open, so {pane:?} is not drawn");
+        }
+        let header_top = find(&update, "#").top();
+        let whole = table_height_to(&ctx, &mut app, header_top);
+
+        // opening a row takes that room for the pane, and closing it gives it all back
+        app.collab_sel = Some(2);
+        frame(&ctx, &mut app, vec![]);
+        let shared = table_height(&ctx, &mut app);
+        assert!(shared < whole - 100.0, "the open pane takes its room from the table: {whole} -> {shared}");
+
+        app.collab_sel = None;
+        let update = frame(&ctx, &mut app, vec![]);
+        assert!(find_all(&update, "Request").is_empty(), "closing it puts the pane away again");
+        let back = table_height_to(&ctx, &mut app, find(&update, "#").top());
+        assert!((back - whole).abs() < 1.0, "and the table has the whole tab once more: {whole} -> {back}");
+    }
+
+    /// The table's height when there is no pane below it: from its header down to the bottom
+    /// of the tab, since nothing else is competing for the room.
+    fn table_height_to(ctx: &egui::Context, app: &mut App, header_top: f32) -> f32 {
+        let _ = frame(ctx, app, vec![]);
+        ctx.screen_rect().bottom() - header_top
     }
 }
