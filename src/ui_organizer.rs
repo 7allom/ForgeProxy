@@ -184,7 +184,7 @@ fn header_and_filters(app: &mut App, ui: &mut Ui, p: &Palette, showing: usize, h
     });
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.org_view.search).desired_width(240.0).hint_text("Search address or notes"));
+        ui.add(egui::TextEdit::singleline(&mut app.org_view.search).desired_width(240.0).hint_text("Filter address or notes..."));
         ui.checkbox(&mut app.org_view.only_highlighted, "Only highlighted");
         ui.checkbox(&mut app.org_view.only_notes, "Only items with notes");
     });
@@ -243,7 +243,9 @@ fn table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut O
                 theme::cell_text(ui, cells[3], &it.method, if selected { p.strong } else { method_color(p, &it.method) });
                 theme::cell_text(ui, cells[4], &it.host, fg);
                 theme::cell_text(ui, cells[5], &it.path, fg);
-                theme::cell_text(ui, cells[6], &organizer::status_text(&it.response), fg);
+                let status = organizer::status_text(&it.response);
+                let status_fg = if selected { p.strong } else { crate::ui_core::status_color(p, &status) };
+                theme::cell_text(ui, cells[6], &status, status_fg);
                 theme::cell_text(ui, cells[7], &organizer::body_length(&it.response).to_string(), fg);
 
                 // The two cells that are chosen from rather than typed in. Both are drawn
@@ -311,7 +313,7 @@ fn table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut O
                     let mut note = it.note.clone();
                     let note_edit = ui.put(
                         cells[8],
-                        egui::TextEdit::singleline(&mut note).id_salt(("org_note", it.id)).hint_text("Add a note").frame(false),
+                        egui::TextEdit::singleline(&mut note).id_salt(("org_note", it.id)).hint_text("Note").frame(false),
                     );
                     if note_edit.changed() {
                         *action = Some(RowAction::Note(it.id, note.clone()));
@@ -343,7 +345,7 @@ fn table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut O
                             ui.close_menu();
                         }
                         for (h, (name, col)) in HIGHLIGHTS.iter().enumerate() {
-                            if ui.selectable_label(it.highlight == Some(h), RichText::new(*name).background_color(*col).color(Color32::BLACK)).clicked() {
+                            if ui.selectable_label(it.highlight == Some(h), RichText::new(*name).background_color(*col).color(theme::text_on(*col))).clicked() {
                                 *action = Some(RowAction::Highlight(it.id, Some(h)));
                                 ui.close_menu();
                             }
@@ -550,7 +552,7 @@ fn detail_pane(app: &mut App, ui: &mut Ui, p: &Palette, action: &mut Option<RowA
                             .id_salt("org_notes")
                             .desired_width(f32::INFINITY)
                             .desired_rows(4)
-                            .hint_text("What is worth remembering about this message"),
+                            .hint_text("Note"),
                     );
                     (req_v, resp_v, edit.changed().then_some(note))
                 });

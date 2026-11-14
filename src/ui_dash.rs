@@ -315,7 +315,7 @@ pub fn windows(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 ui.radio_value(&mut app.new_scan_crawl, false, "Audit only (no crawl)");
                 ui.add_space(8.0);
                 ui.label(bold("URLs to scan", 13.0).color(p.strong));
-                ui.add(egui::TextEdit::multiline(&mut app.new_scan_urls).desired_rows(4).desired_width(f32::INFINITY).hint_text("https://example.com/  (one per line)"));
+                ui.add(egui::TextEdit::multiline(&mut app.new_scan_urls).desired_rows(4).desired_width(f32::INFINITY).hint_text("https://example.com/ — one per line"));
                 ui.add_space(6.0);
                 ui.label(RichText::new(format!(
                     "Configuration: crawl up to {} links deep and {} locations, {} minutes at most; repeated issues are merged.",

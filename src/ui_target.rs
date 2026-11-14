@@ -230,10 +230,16 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
             .and_then(|id| all.iter().find(|e| e.id == id))
             .cloned();
         if let Some(e) = detail {
-            // same again downwards: the viewer takes at most 70% of the height on offer, so
-            // the table above it never ends up with less than no room
-            let avail_h = ui.available_height().max(0.0);
-            let detail_tallest = (avail_h * 0.7).max(0.0);
+            // Same again downwards: the viewer takes at most 70% of the height on offer, so
+            // the table above it never ends up with less than no room.
+            //
+            // Measured from the region this panel was given, not from the height still
+            // unspent in it. The unspent height falls as the panel grows, so bounds taken
+            // from it move with the panel they are meant to bound: every frame the ceiling
+            // rose a little, the panel rose to meet it, and the viewer walked down the screen
+            // on its own after the pointer was let go.
+            let container_h = ui.max_rect().height().max(0.0);
+            let detail_tallest = (container_h * 0.7).max(0.0);
             let detail_shortest = 100.0_f32.min(detail_tallest);
             egui::TopBottomPanel::bottom("site_map_detail")
                 .resizable(true)
@@ -241,6 +247,11 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                 .height_range(detail_shortest..=detail_tallest.max(detail_shortest))
                 .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(6)))
                 .show_inside(ui, |ui| {
+                    // A panel keeps the height of its *contents*, so the viewers below have
+                    // to be held to the height the panel actually has: given the run of the
+                    // place they ask for more every frame and the panel grows to match,
+                    // which is a drag that never settles. Anything over scrolls instead.
+                    egui::ScrollArea::vertical().id_salt("site_map_detail_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     // the address on its own line, truncated rather than pushing the buttons
                     // off the edge of a narrow window
                     ui.horizontal(|ui| {
@@ -284,6 +295,7 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                     let e_req = actions::raw_request(&e);
                     crate::ui_tools::attach_view_context_menu(&out_req, &e.request, app, crate::state::Tab::Target, &e_url, &e_req, Some(&e.response), &format!("{name} request"));
                     crate::ui_tools::attach_view_context_menu(&out_resp, &e.response, app, crate::state::Tab::Target, &e_url, &e_req, Some(&e.response), &format!("{name} response"));
+                    });
                 });
         }
 

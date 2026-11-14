@@ -8,7 +8,7 @@ use crate::state::App;
 use crate::theme::{self, bold, EmptyIcon, Palette};
 use crate::ui_core::sub_tabs;
 use eframe::egui;
-use egui::{Color32, FontId, RichText, Ui};
+use egui::{FontId, RichText, Ui};
 use std::sync::atomic::Ordering;
 
 pub fn proxy(app: &mut App, ui: &mut Ui, p: &Palette) {
@@ -103,7 +103,7 @@ fn intercept(app: &mut App, ui: &mut Ui, p: &Palette) {
     egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let on = app.proxy.intercept.load(Ordering::SeqCst);
-            let (txt, col, tc) = if on { ("Intercept on", p.accent, Color32::WHITE) } else { ("Intercept off", p.header, p.text) };
+            let (txt, col, tc) = if on { ("Intercept on", p.accent, p.accent_text) } else { ("Intercept off", p.header, p.text) };
             if ui.add(egui::Button::new(bold(txt, 12.5).color(tc)).fill(col).min_size(egui::vec2(0.0, 22.0))).clicked() {
                 toggle_intercept(app);
             }

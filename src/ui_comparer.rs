@@ -39,11 +39,11 @@ pub fn comparer(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.horizontal(|ui| {
         let ready = matches!((app.comparer_sel_a, app.comparer_sel_b), (Some(a), Some(b)) if a != b);
         let why = "Select two different items, one in each list";
-        if ui.add_enabled(ready, egui::Button::new(bold("Compare words", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
+        if ui.add_enabled(ready, egui::Button::new(bold("Compare words", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
             .on_disabled_hover_text(why).clicked() {
             comparer::compare_selected(app, DiffMode::Words);
         }
-        if ui.add_enabled(ready, egui::Button::new(bold("Compare bytes", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
+        if ui.add_enabled(ready, egui::Button::new(bold("Compare bytes", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
             .on_disabled_hover_text(why).clicked() {
             comparer::compare_selected(app, DiffMode::Bytes);
         }
@@ -65,7 +65,7 @@ pub fn comparer(app: &mut App, ui: &mut Ui, p: &Palette) {
         ui.set_width(ui.available_width());
         egui::ScrollArea::vertical().id_salt("cmp_paste").max_height(110.0).show(ui, |ui| {
             ui.add(egui::TextEdit::multiline(&mut app.comparer_paste).font(FontId::monospace(12.5)).frame(false)
-                .desired_width(f32::INFINITY).desired_rows(4).hint_text("Paste or type text to compare"));
+                .desired_width(f32::INFINITY).desired_rows(4).hint_text("Text to compare"));
         });
     });
     ui.horizontal(|ui| {

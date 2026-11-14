@@ -7,15 +7,21 @@ use crate::ui_proxy;
 use eframe::egui;
 use egui::{RichText, Ui};
 
-fn label(t: &str) -> RichText {
-    RichText::new(t).size(12.5).color(theme::DARK.text)
+/// A menu title, in the primary text colour of whichever theme is on.
+///
+/// This used to be fixed to the dark palette's text, which is a pale grey: on the light
+/// theme's near-white menu strip the titles were barely there.
+fn label(t: &str, p: &theme::Palette) -> RichText {
+    RichText::new(t).size(theme::FONT_UI).color(p.text)
 }
 
 pub fn bar(app: &mut App, ui: &mut Ui) {
-    // plain-text menu titles, like the original's menu bar
+    let look = if ui.visuals().dark_mode { Look::Dark } else { Look::Light };
+    let p = &theme::palette(look);
+    // plain-text menu titles, with no button fill behind them
     ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    ui.menu_button(label("Suite"), |ui| {
+    ui.menu_button(label("Suite", p), |ui| {
         if ui.button("Settings").clicked() {
             app.show_settings = true;
             ui.close_menu();
@@ -33,7 +39,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     });
-    ui.menu_button(label("Project"), |ui| {
+    ui.menu_button(label("Project", p), |ui| {
         use crate::ui_core::{load_config_native, open_project_native, save_project, save_project_as_native};
         if ui.button("New project...").clicked() {
             ui.close_menu();
@@ -62,7 +68,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             ui.close_menu();
         }
     });
-    ui.menu_button(label("Intruder"), |ui| {
+    ui.menu_button(label("Intruder", p), |ui| {
         if ui.add_enabled(!app.int_running, egui::Button::new("Start attack")).clicked() {
             actions::start_attack(app);
             app.tab = Tab::Intruder;
@@ -84,7 +90,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             ui.close_menu();
         }
     });
-    ui.menu_button(label("Repeater"), |ui| {
+    ui.menu_button(label("Repeater", p), |ui| {
         ui.checkbox(&mut app.rep_follow, "Follow redirections");
         ui.separator();
         if ui.add_enabled(app.rep().can_send(), egui::Button::new("Send request   Ctrl+Space")).clicked() {
@@ -92,7 +98,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             ui.close_menu();
         }
     });
-    ui.menu_button(label("View"), |ui| {
+    ui.menu_button(label("View", p), |ui| {
         ui.checkbox(&mut app.inspector.show_inspector, "Inspector panel   Ctrl+Shift+N")
             .on_hover_text("The request/response Inspector in Repeater, Intercept and HTTP history");
         ui.separator();
@@ -111,7 +117,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             ui.close_menu();
         }
     });
-    ui.menu_button(label("Help"), |ui| {
+    ui.menu_button(label("Help", p), |ui| {
         if ui.button("Getting started").clicked() {
             app.tab = Tab::Discover;
             ui.close_menu();

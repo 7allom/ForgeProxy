@@ -46,12 +46,17 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
 
 fn top_menu(app: &mut App, ctx: &egui::Context, p: &Palette) {
     egui::TopBottomPanel::top("menu")
-        .frame(egui::Frame::new().fill(c(0x323334)).inner_margin(egui::Margin::symmetric(8, 3)))
+        .frame(
+            egui::Frame::new()
+                .fill(p.panel)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                // the strip is closed off from the tab row below it by one crisp line
+                .stroke(egui::Stroke::NONE),
+        )
+        .show_separator_line(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                ui.painter().rect_filled(r, 2.0, p.accent);
-                ui.painter().circle_filled(r.center(), 3.0, Color32::WHITE);
+                // "Suite" starts the row, flush with the Dashboard tab under it
                 crate::menus::bar(app, ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let title = match &app.project_path {
@@ -59,7 +64,7 @@ fn top_menu(app: &mut App, ctx: &egui::Context, p: &Palette) {
                         Some(path) => format!("ForgeProxy — {path}"),
                         None => "ForgeProxy — Temporary Project".to_string(),
                     };
-                    ui.label(RichText::new(title).size(12.5).color(c(0x9A9A9A)));
+                    ui.label(RichText::new(title).size(theme::FONT_UI).color(p.disabled));
                 });
             });
         });
@@ -89,31 +94,65 @@ fn tab_bar(app: &mut App, ctx: &egui::Context, p: &Palette) {
         });
 }
 
-fn status_bar(app: &mut App, ctx: &egui::Context, _p: &Palette) {
+fn status_bar(app: &mut App, ctx: &egui::Context, p: &Palette) {
+    use std::sync::atomic::Ordering;
     egui::TopBottomPanel::bottom("status")
-        .frame(egui::Frame::new().fill(c(0x323334)).inner_margin(egui::Margin::symmetric(8, 3)))
+        .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(8, 3)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // each label opens its drawer tab, or closes the drawer if that tab is showing
+                // each pill opens its drawer tab, or closes the drawer if that tab is showing
                 for (tab, name) in [(DrawerTab::EventLog, "Event log"), (DrawerTab::AllIssues, "All issues")] {
                     let open = app.drawer == Some(tab);
-                    let text = RichText::new(name).size(11.5).color(if open { Color32::WHITE } else { c(0xC5C7C8) });
-                    let text = if open { text.underline() } else { text };
+                    let colour = if open { p.accent } else { p.disabled };
                     let hint = if open { format!("Hide {name}") } else { format!("Show {name}") };
-                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(hint).clicked() {
+                    if theme::status_pill(ui, p, name, colour).on_hover_text(hint).clicked() {
                         app.drawer = if open { None } else { Some(tab) };
                     }
-                    ui.add_space(8.0);
                 }
+                theme::chrome_divider(ui, p);
+
+                // the listener, which is the one thing worth seeing at a glance from anywhere
+                let (running, intercept) =
+                    (app.proxy.running.load(Ordering::SeqCst), app.proxy.intercept.load(Ordering::SeqCst));
+                let (badge, colour, hint) = match (running, intercept) {
+                    (false, _) => ("Listener off".to_string(), p.error, "The proxy listener is not running. Proxy > Intercept starts it.".to_string()),
+                    (true, true) => (format!("Intercepting :{}", app.proxy_port), p.warning, "Requests are being held for review in Proxy > Intercept.".to_string()),
+                    (true, false) => (format!("Listening :{}", app.proxy_port), p.success, "The proxy is passing traffic and recording it.".to_string()),
+                };
+                if theme::status_pill(ui, p, &badge, colour).on_hover_text(hint).clicked() {
+                    app.tab = Tab::Proxy;
+                }
+                theme::chrome_divider(ui, p);
+
+                // the project this work belongs to, shortened from the left so the file shows
+                let project = match &app.project_path {
+                    Some(path) => path.clone(),
+                    None => "Temporary project".to_string(),
+                };
+                ui.label(RichText::new(ellipsize_left(&project, 52)).size(11.0).color(p.disabled))
+                    .on_hover_text(&project);
+
                 if !app.project_msg.is_empty() {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(&app.project_msg).size(11.5).color(c(0x9A9A9A)));
+                    theme::chrome_divider(ui, p);
+                    ui.label(RichText::new(&app.project_msg).size(11.0).color(p.text));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(memory_text()).size(11.5).color(c(0x9A9A9A)));
+                    // monospace, so the figure does not jiggle as it changes
+                    ui.label(RichText::new(memory_text()).size(11.0).monospace().color(p.disabled));
                 });
             });
         });
+}
+
+/// Keep the last `max` characters of a path, with a leading ellipsis when it was longer: the
+/// end of a path says which project this is, the start rarely does.
+fn ellipsize_left(text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    if n <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(n - max).collect();
+    format!("\u{2026}{tail}")
 }
 
 /// The bottom drawer: Event log and All issues, docked above the status bar, resizable by
@@ -546,6 +585,19 @@ pub fn method_color(p: &Palette, m: &str) -> Color32 {
     match m { "GET" | "OPTIONS" => p.get, "POST" => p.post, _ => p.other_method }
 }
 
+/// The colour a response's status is written in: a class at a glance, from the palette's own
+/// status tokens, so it reads in either theme. A row with no status to show -- a request still
+/// in flight, a connection that failed -- is left in the ordinary text colour.
+pub fn status_color(p: &Palette, status: &str) -> Color32 {
+    match crate::http::status_code(status) {
+        Some(200..=299) => p.success,
+        Some(300..=399) => p.badge_info,
+        Some(400..=499) => p.warning,
+        Some(500..=599) => p.error,
+        _ => p.text,
+    }
+}
+
 /// The colour an out-of-band interaction's protocol is written in. A relay may report any
 /// protocol at all, so anything not named here is drawn in the neutral colour the tables use
 /// for a method they do not know either -- readable, and plainly not one of the named ones.
@@ -616,10 +668,39 @@ mod window_tests {
         egui::AreaState::load(ctx, id).map(|s| s.rect()).unwrap_or_else(|| panic!("no window {id:?} on screen"))
     }
 
+    /// Run frames until the window has reached the size it is going to keep, and give back
+    /// that size.
+    ///
+    /// A comparison window works its word diff out on a worker thread and shows a short
+    /// placeholder body until the result lands, so the first frame is not the size the window
+    /// will settle at. Measuring then races that worker: under load the body arrives partway
+    /// through a drag and the window grows, which reads as a drag that resized a window it
+    /// should only have moved. Waiting on the work itself, rather than on a count of frames or
+    /// a stretch of wall clock, makes every one of these drags measure the same thing whatever
+    /// else the machine is busy with.
+    fn settle(ctx: &egui::Context, app: &mut App, id: egui::Id) -> egui::Rect {
+        let mut last = None;
+        for _ in 0..2000 {
+            frame(ctx, app, vec![]);
+            // a comparison still being computed will change the body's height when it arrives,
+            // so there is no point reading a size yet
+            if app.comparer_active_diff.as_ref().is_some_and(|d| d.words_job.is_some()) {
+                std::thread::yield_now();
+                continue;
+            }
+            let now = egui::AreaState::load(ctx, id).map(|s| s.rect());
+            // the same size twice over means nothing is still growing into place
+            if now.is_some() && now == last {
+                return now.expect("the window is on screen");
+            }
+            last = now;
+        }
+        panic!("the window {id:?} never settled at one size");
+    }
+
     /// Press `edge`, drag it by `delta` and let go, a frame at a time as a hand would.
     fn drag_edge(ctx: &egui::Context, app: &mut App, id: egui::Id, edge: Edge, delta: egui::Vec2) -> egui::Rect {
-        frame(ctx, app, vec![]);
-        let from = edge.grip(window_rect(ctx, id));
+        let from = edge.grip(settle(ctx, app, id));
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -699,8 +780,7 @@ mod window_tests {
             for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
                 let (ctx, mut app) = app_with(name);
                 let id = egui::Id::new(name);
-                frame(&ctx, &mut app, vec![]);
-                let start = window_rect(&ctx, id);
+                let start = settle(&ctx, &mut app, id);
                 let grip = edge.grip(start);
                 let vertical = matches!(edge, Edge::Top | Edge::Bottom);
                 // the one coordinate the drag moves along, and a pointer position on it
@@ -799,8 +879,7 @@ mod window_tests {
         assert_table!(windows, |idx, name| {
             let (ctx, mut app) = app_with(name);
             let id = egui::Id::new(name);
-            frame(&ctx, &mut app, vec![]);
-            let before = window_rect(&ctx, id);
+            let before = settle(&ctx, &mut app, id);
             // a point on the title bar, clear of the close button and of either border
             let grip = egui::pos2(before.center().x, before.top() + 12.0);
             let button = |pos, pressed| egui::Event::PointerButton {
@@ -842,8 +921,7 @@ mod window_tests {
         assert_table!(windows, |idx, name| {
             let (ctx, mut app) = app_with(name);
             let id = egui::Id::new(name);
-            frame(&ctx, &mut app, vec![]);
-            let before = window_rect(&ctx, id);
+            let before = settle(&ctx, &mut app, id);
             let narrow = drag_edge(&ctx, &mut app, id, Edge::Right, egui::vec2(SMALL.x - before.width(), 0.0));
             assert!(
                 narrow.width() <= SMALL.x + SLACK,
@@ -871,8 +949,7 @@ mod window_tests {
             for edge in [Edge::Right, Edge::Bottom, Edge::Left, Edge::Top] {
                 let (ctx, mut app) = app_with(name);
                 let id = egui::Id::new(name);
-                frame(&ctx, &mut app, vec![]);
-                let before = window_rect(&ctx, id);
+                let before = settle(&ctx, &mut app, id);
                 let after = drag_edge(&ctx, &mut app, id, edge, edge.inwards(60.0));
                 let what = format!("case #{idx} ({name}, {edge:?} edge)");
                 let moved = |a: f32, b: f32| (a - b).abs() > 1.0;
@@ -898,6 +975,422 @@ mod window_tests {
                         assert!(!moved(after.min.x, before.min.x), "{what}: the left edge stayed");
                     }
                 }
+            }
+        });
+    }
+
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use crate::state::{App, Tab};
+    use crate::test_utils::{assert_table, MockAppBuilder};
+    use eframe::egui;
+
+    fn frame(ctx: &egui::Context, app: &mut App) -> Option<egui::accesskit::TreeUpdate> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 950.0))),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+    }
+
+    /// One frame with input events.
+    fn events(ctx: &egui::Context, app: &mut App, evts: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 950.0))),
+            events: evts,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| crate::ui_core::frame(app, ctx));
+    }
+
+    fn labels(update: &Option<egui::accesskit::TreeUpdate>) -> Vec<String> {
+        update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().or_else(|| n.value()).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Every tool draws, on the shared chrome and the shared table and pane primitives. This is
+    /// the net under a change to any of them: a palette token, a row height or a header strip
+    /// that one tab disagrees with shows up here as a panic rather than in a screenshot.
+    #[test]
+    fn every_tool_tab_draws_matrix() {
+        assert_table!(Tab::ALL, |idx, tab| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(tab).build_with_ctx();
+            ctx.enable_accesskit();
+            // twice: the second frame is the one that reads back the first frame's responses,
+            // which is where a hover shade or a settled pane height is decided
+            frame(&ctx, &mut app);
+            let seen = labels(&frame(&ctx, &mut app));
+            assert!(!seen.is_empty(), "case #{idx} ({}): the tab drew nothing", tab.label());
+            // the chrome is there whichever tool is open
+            for want in ["Event log", "All issues"] {
+                assert!(seen.iter().any(|l| l == want), "case #{idx} ({}): the status bar kept {want:?}", tab.label());
+            }
+        });
+    }
+
+    /// A tool's explanation lives behind the `?` on its header strip, not in a paragraph under
+    /// the title: the words are still reachable, but they cost no height.
+    #[test]
+    fn a_tool_header_is_one_strip_with_its_words_behind_the_question_mark() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Collaborator).build_with_ctx();
+        ctx.enable_accesskit();
+        frame(&ctx, &mut app);
+        let seen = labels(&frame(&ctx, &mut app));
+        assert!(seen.iter().any(|l| l == "Collaborator"), "the tool is named");
+        // the sentence that used to sit under the title is no longer laid out as a label
+        assert!(
+            !seen.iter().any(|l| l.starts_with("Test whether an application can be made")),
+            "the description is no longer a paragraph on the page: {seen:?}"
+        );
+    }
+
+    /// The listener badge says what the proxy is actually doing, and changes when it changes.
+    #[test]
+    fn the_status_bar_badge_follows_the_listener_matrix() {
+        use std::sync::atomic::Ordering;
+        let cases: [(&str, bool, bool, &str); 3] = [
+            ("not running", false, false, "Listener off"),
+            ("passing traffic", true, false, "Listening :8080"),
+            ("holding requests", true, true, "Intercepting :8080"),
+        ];
+        assert_table!(cases, |idx, (what, running, intercept, want)| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+            ctx.enable_accesskit();
+            app.proxy_port = "8080".into();
+            app.proxy.running.store(running, Ordering::SeqCst);
+            app.proxy.intercept.store(intercept, Ordering::SeqCst);
+            frame(&ctx, &mut app);
+            let seen = labels(&frame(&ctx, &mut app));
+            assert!(seen.iter().any(|l| l == want), "case #{idx} ({what}): expected {want:?} in {seen:?}");
+        });
+    }
+
+    /// Where the one widget labelled `want` is drawn.
+    fn find(update: &Option<egui::accesskit::TreeUpdate>, want: &str) -> egui::Rect {
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let found = nodes
+            .iter()
+            .filter(|(_, n)| n.label().as_deref() == Some(want) || n.value().as_deref() == Some(want))
+            .find_map(|(_, n)| n.bounds());
+        let b = found.unwrap_or_else(|| panic!("no widget labelled {want:?}"));
+        egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+    }
+
+    fn panel_rect(ctx: &egui::Context, id: &str) -> egui::Rect {
+        egui::containers::panel::PanelState::load(ctx, egui::Id::new(id))
+            .map(|s| s.rect)
+            .unwrap_or_else(|| panic!("no panel {id:?} on screen"))
+    }
+
+    /// The issue listing's header spans the tab above a split that is fixed: the listing is
+    /// wide enough for all three of its columns and its border is not a handle, so there is
+    /// nothing to drag the Name column narrower than the names in it.
+    #[test]
+    fn the_issue_listing_header_spans_the_tab_above_a_split_that_cannot_be_dragged() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Target).build_with_ctx();
+        ctx.enable_accesskit();
+        app.target_sub = 2;
+        frame(&ctx, &mut app);
+        let seen = labels(&frame(&ctx, &mut app));
+        assert!(seen.iter().any(|l| l == "Issue definitions"), "the header is drawn: {seen:?}");
+        assert!(
+            !seen.iter().any(|l| l.starts_with("This listing contains")),
+            "and its sentence is behind the ? rather than a second line: {seen:?}"
+        );
+
+        let header = panel_rect(&ctx, "issues_header");
+        let list = panel_rect(&ctx, "issuelist");
+        // the header spans the whole tab, not just the column the table sits in
+        assert!(
+            header.width() > list.width() * 1.5,
+            "the header spans the tab, not one side of the split (header {:.0}, list {:.0})",
+            header.width(),
+            list.width()
+        );
+        // and the split begins strictly under it, so the divider never has the header to drag
+        assert!(
+            list.top() >= header.bottom() - 0.5,
+            "the split starts below the header (header {header:?}, list {list:?})"
+        );
+        assert!(header.height() > 10.0 && header.height() < 60.0, "the header is one compact strip: {header:?}");
+
+        // all three columns fit, so there is a Name column worth reading
+        assert!(list.width() >= 540.0, "the listing is wide enough for its three columns: {:.0}", list.width());
+
+        // the first definition is drawn, whole, inside the listing and below the header
+        let row = find(&frame(&ctx, &mut app), "OS command injection (High)");
+        assert!(row.top() >= header.bottom() - 0.5, "the first row is not under the header ({row:?})");
+        assert!(row.right() <= list.right() + 0.5, "nor past the edge of the listing ({row:?})");
+        assert!(row.width() > 400.0, "and it has the width of the listing to write in: {:.0}", row.width());
+
+        // the border is not a divider: dragging across it changes nothing
+        let grip = egui::pos2(list.right(), list.center().y);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        events(&ctx, &mut app, vec![egui::Event::PointerMoved(grip)]);
+        events(&ctx, &mut app, vec![button(grip, true)]);
+        for step in 1..=4 {
+            let to = egui::pos2(grip.x - 30.0 * step as f32, grip.y);
+            events(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        }
+        events(&ctx, &mut app, vec![button(egui::pos2(grip.x - 120.0, grip.y), false)]);
+        frame(&ctx, &mut app);
+
+        let (header_after, list_after) = (panel_rect(&ctx, "issues_header"), panel_rect(&ctx, "issuelist"));
+        assert!(
+            (list_after.width() - list.width()).abs() < 0.5,
+            "the listing kept its width through the drag ({:.0} -> {:.0})",
+            list.width(),
+            list_after.width()
+        );
+        assert!(
+            (header_after.height() - header.height()).abs() < 0.5 && (header_after.top() - header.top()).abs() < 0.5,
+            "and the header was left alone ({header:?} -> {header_after:?})"
+        );
+        assert!(list_after.top() >= header_after.bottom() - 0.5, "the first row stays whole after the drag");
+    }
+
+    /// A window too narrow for the listing at its full width gives it less rather than taking
+    /// the definition pane's room away entirely -- and never a width below zero, which is what
+    /// a squeezed layout hands an unguarded `set_width`.
+    #[test]
+    fn the_issue_listing_gives_way_on_a_narrow_window_matrix() {
+        let widths: [f32; 4] = [1500.0, 820.0, 520.0, 360.0];
+        assert_table!(widths, |idx, width| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Target).build_with_ctx();
+            ctx.enable_accesskit();
+            app.target_sub = 2;
+            let input = |events: Vec<egui::Event>| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                events,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let _ = ctx.run(input(vec![]), |ctx| crate::ui_core::frame(&mut app, ctx));
+            }
+            let list = panel_rect(&ctx, "issuelist");
+            assert!(list.width() > 0.0, "case #{idx} (window {width}): the listing has a width at all");
+            assert!(list.width() <= 560.5, "case #{idx} (window {width}): and never more than its fixed width");
+            // whatever is left over is the definition's, and it is never nothing
+            let left_over = width - list.width();
+            assert!(left_over >= 60.0, "case #{idx} (window {width}): the definition keeps room ({left_over:.0})");
+        });
+    }
+
+
+    /// The menu row starts with "Suite" itself: the orange square that used to sit before it
+    /// was not a control, and it pushed the whole row out of line with the tabs underneath.
+    #[test]
+    fn the_menu_row_starts_with_suite_in_line_with_the_first_tab() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+        ctx.enable_accesskit();
+        frame(&ctx, &mut app);
+        let update = frame(&ctx, &mut app);
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let left_of = |want: &str| {
+            nodes
+                .iter()
+                .filter(|(_, n)| n.label().as_deref() == Some(want) || n.value().as_deref() == Some(want))
+                .filter_map(|(_, n)| n.bounds())
+                .map(|b| b.x0 as f32)
+                .fold(f32::INFINITY, f32::min)
+        };
+        let (suite, dashboard) = (left_of("Suite"), left_of("Dashboard"));
+        assert!(suite.is_finite(), "the Suite menu is there");
+        assert!(dashboard.is_finite(), "and the Dashboard tab under it");
+        // both start at the window's left edge, give or take each one's own padding
+        assert!(suite < 40.0, "Suite sits at the left edge, not pushed in by a badge: x {suite}");
+        assert!(
+            (suite - dashboard).abs() < 16.0,
+            "and lines up with the first tab (Suite x {suite}, Dashboard x {dashboard})"
+        );
+    }
+
+    /// Every tool draws under both themes. The palette is swapped underneath a live app rather
+    /// than only at startup, which is what the View menu's theme switch does, so anything that
+    /// cached a colour or a measurement from the other theme shows up here.
+    #[test]
+    fn every_tool_tab_draws_under_both_themes_matrix() {
+        assert_table!(Tab::ALL, |idx, tab| {
+            for look in [crate::theme::Look::Dark, crate::theme::Look::Light] {
+                let (ctx, mut app) = MockAppBuilder::new()
+                    .with_tab(tab)
+                    .with_light_theme(look == crate::theme::Look::Light)
+                    .build_with_ctx();
+                ctx.enable_accesskit();
+                app.set_theme(look);
+                crate::theme::apply(&ctx, look);
+                frame(&ctx, &mut app);
+                let seen = labels(&frame(&ctx, &mut app));
+                assert!(!seen.is_empty(), "case #{idx} ({}, {look:?}): the tab drew nothing", tab.label());
+                assert!(
+                    seen.iter().any(|l| l == "Event log"),
+                    "case #{idx} ({}, {look:?}): the chrome drew too",
+                    tab.label()
+                );
+                // the visuals really are the ones asked for, not left over from the other theme
+                assert_eq!(
+                    ctx.style().visuals.dark_mode,
+                    look == crate::theme::Look::Dark,
+                    "case #{idx} ({}, {look:?}): the theme took effect",
+                    tab.label()
+                );
+            }
+        });
+    }
+
+    /// Switching theme on a running app repaints every tab in the new palette, with no stale
+    /// surface left behind from the one before.
+    #[test]
+    fn switching_theme_on_a_live_app_takes_effect_everywhere() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+        ctx.enable_accesskit();
+        for tab in Tab::ALL {
+            app.tab = tab;
+            for look in [crate::theme::Look::Light, crate::theme::Look::Dark, crate::theme::Look::Light] {
+                app.set_theme(look);
+                crate::theme::apply(&ctx, look);
+                frame(&ctx, &mut app);
+                let v = &ctx.style().visuals;
+                let p = crate::theme::palette(look);
+                assert_eq!(v.panel_fill, p.panel, "{:?} on {look:?}: the panel surface", tab.label());
+                assert_eq!(v.extreme_bg_color, p.bg_input, "{:?} on {look:?}: the recessed surface", tab.label());
+                assert_eq!(v.override_text_color, Some(p.text), "{:?} on {look:?}: the text colour", tab.label());
+            }
+        }
+    }
+
+    /// Put some recorded traffic in the store, as every one of these panes needs.
+    fn with_traffic(app: &mut App) {
+        for (i, path) in ["/", "/cart", "/pay"].iter().enumerate() {
+            let id = i + 1;
+            app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
+                id,
+                tool: "Proxy".into(),
+                method: "GET".into(),
+                host: "shop.test".into(),
+                path: (*path).into(),
+                status: "200 OK".into(),
+                length: 2,
+                mime: "text/html".into(),
+                request: format!("GET {path} HTTP/1.1\nHost: shop.test\n\n"),
+                response: "HTTP/1.1 200 OK\ncontent-length: 2\n\nok".into(),
+                url: format!("http://shop.test{path}"),
+                truncated: false,
+                time: 0,
+                elapsed_ms: 1,
+            }));
+        }
+        *app.next_id.lock().unwrap() = 3;
+    }
+
+    /// Drag a bottom pane's splitter by `dy` and give back the height it was left at, having
+    /// let five idle frames pass -- which is where a pane that does not hold its height snaps
+    /// back to its default, or walks off on its own.
+    fn drag_bottom_splitter(ctx: &egui::Context, app: &mut App, id: &str, dy: f32) -> (f32, f32) {
+        let before = panel_rect(ctx, id).height();
+        let r = panel_rect(ctx, id);
+        let grip = egui::pos2(r.center().x, r.top());
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        events(ctx, app, vec![egui::Event::PointerMoved(grip)]);
+        events(ctx, app, vec![button(grip, true)]);
+        // in steps, so it reads as a drag and not as a jump
+        for step in 1..=4 {
+            let to = egui::pos2(grip.x, grip.y + dy * (step as f32 / 4.0));
+            events(ctx, app, vec![egui::Event::PointerMoved(to)]);
+        }
+        events(ctx, app, vec![button(egui::pos2(grip.x, grip.y + dy), false)]);
+        let released = panel_rect(ctx, id).height();
+        for _ in 0..5 {
+            frame(ctx, app);
+        }
+        (before, released)
+    }
+
+    /// Every bottom detail pane keeps the height it was dragged to, in both directions, once
+    /// the pointer is let go.
+    ///
+    /// The pane's own contents are what used to decide this. A panel keeps the height of what
+    /// is inside it, so message viewers given the run of the place asked for a little more
+    /// room every frame and the panel grew to match -- and because the pane's ceiling was
+    /// worked out from the height still unspent in its container, the ceiling rose along with
+    /// it. The pane walked down the screen on its own after the pointer was released.
+    #[test]
+    fn every_bottom_detail_pane_keeps_the_height_it_was_dragged_to_matrix() {
+        struct Case {
+            name: &'static str,
+            panel: &'static str,
+            open: fn(&mut App),
+        }
+        let cases = [
+            Case {
+                name: "the site map's request and response",
+                panel: "site_map_detail",
+                open: |app| {
+                    app.tab = Tab::Target;
+                    app.target_sub = 0;
+                    with_traffic(app);
+                    crate::actions::sync_site_map(app);
+                    app.target_selected_node = app.site_map.roots.keys().next().cloned();
+                    app.target_selected_history_id = Some(2);
+                },
+            },
+            Case {
+                name: "the Organizer's message",
+                panel: "org_detail",
+                open: |app| {
+                    app.tab = Tab::Organizer;
+                    let request = "GET /cart HTTP/1.1\nHost: shop.test\n\n";
+                    crate::actions::send_to_organizer(app, "http://shop.test/cart", request, "HTTP/1.1 200 OK\n\nok");
+                    app.tab = Tab::Organizer;
+                    app.org_sel = Some(1);
+                },
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            for (direction, dy) in [("shrinking it", 120.0_f32), ("growing it", -120.0)] {
+                let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+                ctx.enable_accesskit();
+                (case.open)(&mut app);
+                frame(&ctx, &mut app);
+                frame(&ctx, &mut app);
+
+                let what = format!("case #{idx} ({}, {direction})", case.name);
+                let (before, released) = drag_bottom_splitter(&ctx, &mut app, case.panel, dy);
+                let settled = panel_rect(&ctx, case.panel).height();
+
+                // it moved the way it was dragged, and by something like the distance asked for
+                if dy > 0.0 {
+                    assert!(released < before - 60.0, "{what}: the drag shrank it ({before} -> {released})");
+                } else {
+                    assert!(released > before + 60.0, "{what}: the drag grew it ({before} -> {released})");
+                }
+                // and five idle frames later it is exactly where it was left: no snapping back
+                // to the default, and no drifting on from it
+                assert!(
+                    (settled - released).abs() < 0.5,
+                    "{what}: it did not hold ({released} on release, {settled} five frames later)"
+                );
+                assert!(
+                    (settled - before).abs() > 50.0,
+                    "{what}: it snapped back to where it started ({before} -> {settled})"
+                );
             }
         });
     }

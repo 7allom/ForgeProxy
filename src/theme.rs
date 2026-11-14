@@ -1,6 +1,9 @@
-//! Colours and shared widgets. Palettes come from the original's theme files
-//! UI color swatch definitions; swatch index n = shades[n-1], 0 = core.
-//! The dark palette was checked against the person's screenshots (reference/picture-8..26).
+//! The ForgeProxy design system: the surface ladder and accent tokens, the typography and
+//! geometry every control is laid out to, and the shared widgets built on them -- tables,
+//! pills, header strips and empty states.
+//!
+//! Swatch index n = shades[n-1], 0 = core. The dark palette was checked against the
+//! reference screenshots (reference/picture-8..26).
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, Ui};
 use std::sync::Arc;
@@ -18,17 +21,43 @@ pub enum Look {
 
 #[derive(Clone, Copy)]
 pub struct Palette {
-    pub deep: Color32,      // background 1: editors, tab row, side panels
-    pub panel: Color32,     // background 2: body, title and status bars
-    pub header: Color32,    // background 3: table headers, buttons
-    pub hover: Color32,     // background 4
-    pub banner: Color32,    // background 5: info banners, task cards
-    pub selection: Color32, // background 6: selected rows
+    // The surface ladder, deepest first. Each step is a clear luminance apart, so a pane
+    // sitting on another reads as raised without needing a border to say so.
+    /// The canvas behind every panel: editors, the tab strip, side panels.
+    pub deep: Color32,
+    /// The primary workspace surface: tab bodies, the title and status bars.
+    pub panel: Color32,
+    /// Raised chrome: toolbars, table headers, editor bars, buttons.
+    pub header: Color32,
+    /// What a raised surface becomes under the pointer.
+    pub hover: Color32,
+    /// Informational banners and task cards.
+    pub banner: Color32,
+    /// The tinted fill of a selected row.
+    pub selection: Color32,
+    /// Recessed text fields, which sit *below* the canvas so an input reads as a well.
+    pub bg_input: Color32,
+    /// A 1px divider or frame: visible, never loud.
+    pub border_subtle: Color32,
+    /// The 1px frame around whatever has the keyboard.
+    pub border_focus: Color32,
     pub text: Color32,
     pub strong: Color32,
     pub disabled: Color32,
     pub link: Color32,
-    pub accent: Color32, // orange underline / primary buttons
+    /// The primary action fill: warm amber-orange, with [`Palette::accent_text`] over it.
+    pub accent: Color32,
+    /// The primary action under the pointer, and while it is being pressed.
+    pub accent_hover: Color32,
+    pub accent_active: Color32,
+    /// Text and icons drawn on top of an accent fill, kept at high contrast against it.
+    pub accent_text: Color32,
+    /// Status tokens for badges and pills. These say what a thing *is* -- running, finished,
+    /// gone wrong -- and are separate from the severity colours below, which grade a finding.
+    pub badge_info: Color32,
+    pub success: Color32,
+    pub warning: Color32,
+    pub error: Color32,
     pub get: Color32,
     pub post: Color32,
     pub other_method: Color32,
@@ -59,29 +88,39 @@ pub struct Palette {
 }
 
 pub const DARK: Palette = Palette {
-    deep: c(0x2B2B2B),
-    panel: c(0x323334),
-    header: c(0x424244),
-    hover: c(0x525255),
-    banner: c(0x323945),
-    selection: c(0x2C5175),
-    text: c(0xC5C7C8),
+    deep: c(0x1F2123),
+    panel: c(0x272A2D),
+    header: c(0x31353A),
+    hover: c(0x3B4046),
+    banner: c(0x2A323D),
+    selection: c(0x2E5680),
+    bg_input: c(0x191B1D),
+    border_subtle: c(0x3A3F45),
+    border_focus: c(0xE07B3C),
+    text: c(0xC8CBCE),
     strong: c(0xFFFFFF),
-    disabled: c(0x818181),
+    disabled: c(0x868A8E),
     link: c(0xFF9E7A),
-    accent: c(0xDB612F),
+    accent: c(0xE07B3C),
+    accent_hover: c(0xF08E4C),
+    accent_active: c(0xC56528),
+    accent_text: c(0x1C1203),
+    badge_info: c(0x56B6D8),
+    success: c(0x4CBE80),
+    warning: c(0xE0A33C),
+    error: c(0xE4596E),
     get: c(0xBB608D),
     post: c(0x786FFF),
     other_method: c(0x5FBAC2),
-    high: c(0xD6213F),
-    medium: c(0xFF6633),
-    low: c(0x26649D),
-    info: c(0x818181),
+    high: c(0xE8556A),
+    medium: c(0xFF8A4C),
+    low: c(0x6AA8E0),
+    info: c(0x9DA2A7),
     ed_text: c(0xCECECE),
     ed_header_name: c(0xD1E8F9),
     ed_header_value: c(0xBABABA),
     ed_first_line: c(0xD1E8F9),
-    ed_line_numbers: c(0xA0A0A0),
+    ed_line_numbers: c(0xBDBDBD),
     ed_param_name: c(0xBBCDFF),
     ed_param_value: c(0xA5C35B),
     syn_key: c(0x9CDCFE),
@@ -98,24 +137,39 @@ pub const DARK: Palette = Palette {
 };
 
 pub const LIGHT: Palette = Palette {
-    deep: c(0xFFFFFF),
-    panel: c(0xFBFBFB),
-    header: c(0xEEEEEE),
-    hover: c(0xDFDFDF),
+    // canvas, panels, raised chrome, then the recessed input: light mode runs the other way
+    // round from dark, with the panel the brightest surface and the canvas a shade behind it
+    deep: c(0xF3F4F6),
+    panel: c(0xFFFFFF),
+    header: c(0xE9ECF0),
+    hover: c(0xDBE0E6),
     banner: c(0xEBF1F6),
-    selection: c(0xCADAF0),
-    text: c(0x2B2B2B),
-    strong: c(0x000000),
-    disabled: c(0x4B4B4B),
-    link: c(0xAD5B28),
-    accent: c(0xDB612F),
+    selection: c(0xCBDDF0),
+    bg_input: c(0xFFFFFF),
+    border_subtle: c(0xCBD2D9),
+    border_focus: c(0xA8491A),
+    // dark slate, in three weights
+    text: c(0x374151),
+    strong: c(0x111827),
+    disabled: c(0x6B7280),
+    link: c(0x9C4517),
+    // amber kept dark enough that its own label reads white on it, and darkening further as
+    // it is hovered and pressed -- a light theme has nowhere brighter to go
+    accent: c(0xB3511C),
+    accent_hover: c(0x9C4517),
+    accent_active: c(0x863A12),
+    accent_text: c(0xFFFFFF),
+    badge_info: c(0x1F7FA8),
+    success: c(0x1F8A4C),
+    warning: c(0xB4711A),
+    error: c(0xC32438),
     get: c(0x87486F),
     post: c(0x4B44AE),
     other_method: c(0x2A828E),
-    high: c(0xD6213F),
-    medium: c(0xFF6633),
+    high: c(0xC32438),
+    medium: c(0xA85A08),
     low: c(0x26649D),
-    info: c(0x818181),
+    info: c(0x6B7280),
     ed_text: c(0x141414),
     ed_header_name: c(0x000075),
     ed_header_value: c(0x202020),
@@ -156,7 +210,7 @@ pub fn palette(look: Look) -> Palette {
     }
 }
 
-/// Noto Sans (the original's UI font on Linux) at 13 px, Noto Sans Mono for messages.
+/// Noto Sans for the interface, Noto Sans Mono for messages and metrics.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -184,36 +238,71 @@ pub fn apply(ctx: &egui::Context, look: Look) {
     let v = &mut style.visuals;
     v.panel_fill = p.panel;
     v.window_fill = p.panel;
-    v.extreme_bg_color = p.deep;
-    v.faint_bg_color = if look == Look::Dark { c(0x333333) } else { c(0xF6F6F6) };
+    // a text field is a well: it sits below the canvas rather than on it
+    v.extreme_bg_color = p.bg_input;
+    // the stripe on every other table row, a hair away from the surface under it
+    v.faint_bg_color = if look == Look::Dark { c(0x2C2F33) } else { c(0xE9EBEE) };
     v.override_text_color = Some(p.text);
     v.hyperlink_color = p.link;
     v.selection.bg_fill = p.selection;
     v.selection.stroke = Stroke::new(1.0_f32, p.strong);
-    v.window_stroke = Stroke::new(1.0_f32, p.header);
+    v.window_stroke = Stroke::new(1.0_f32, p.border_subtle);
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.fg_stroke.color = p.text;
-        w.corner_radius = egui::CornerRadius::same(2);
+        w.corner_radius = egui::CornerRadius::same(CORNER);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.deep);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
     v.widgets.inactive.weak_bg_fill = p.header;
     v.widgets.inactive.bg_fill = p.header;
     v.widgets.hovered.weak_bg_fill = p.hover;
     v.widgets.hovered.bg_fill = p.hover;
     v.widgets.active.weak_bg_fill = p.hover;
     v.widgets.open.weak_bg_fill = p.header;
-    v.widgets.inactive.bg_stroke = Stroke::NONE;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.hover);
+    // every control carries the same 1px frame, which brightens on hover and again for focus
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.border_focus);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
+    // a menu, a dropdown list or a tooltip floats over the work: a soft shadow is what says
+    // so, and it has to be darker than the surface it falls on, which differs by theme
+    let shade = if look == Look::Dark { Color32::from_black_alpha(96) } else { Color32::from_black_alpha(40) };
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 3], blur: 10, spread: 0, color: shade };
+    v.window_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: shade };
+    // the surface those float on, and the frame around it
+    v.window_fill = p.panel;
+    v.widgets.open.bg_fill = p.header;
+    // text the user has selected inside a field, which must not vanish into the selection
+    v.selection.bg_fill = p.selection;
+    v.selection.stroke = Stroke::new(1.0_f32, p.strong);
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-    style.spacing.button_padding = egui::vec2(10.0, 3.0);
-    style.spacing.interact_size.y = 20.0;
-    style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(12.5));
-    style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(11.0));
-    style.text_styles.insert(egui::TextStyle::Heading, FontId::new(15.0, FontFamily::Name("bold".into())));
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    // one height for every button, field and dropdown, so a toolbar row lines up
+    style.spacing.interact_size.y = CONTROL_H;
+    style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(FONT_UI));
+    style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(FONT_UI));
+    // metrics and message bodies: a monospace face gives the fixed-width digits that keep a
+    // column of ids, sizes and timestamps lined up
+    style.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(FONT_CODE));
+    style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(FONT_CAPTION));
+    style.text_styles.insert(egui::TextStyle::Heading, FontId::new(FONT_TITLE, FontFamily::Name("bold".into())));
     ctx.set_style(style);
 }
+
+/// The one control height every button, text field, dropdown and toolbar control is laid out
+/// at, so a row of mixed controls shares a baseline and a centre line.
+pub const CONTROL_H: f32 = 26.0;
+
+/// The one corner radius, on every control and every framed surface.
+pub const CORNER: u8 = 4;
+
+/// Muted captions, badge text and column counts.
+pub const FONT_CAPTION: f32 = 11.0;
+/// Dense table text and UI controls: the size most of the app is written in.
+pub const FONT_UI: f32 = 12.5;
+/// Message bodies, hex, and any figure meant to line up under another.
+pub const FONT_CODE: f32 = 13.0;
+/// Section titles.
+pub const FONT_TITLE: f32 = 14.0;
 
 pub fn bold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).font(FontId::new(size, FontFamily::Name("bold".into())))
@@ -221,7 +310,20 @@ pub fn bold(text: impl Into<String>, size: f32) -> RichText {
 
 /// Primary (orange) button, as "Start attack", "Open browser", "Next".
 pub fn primary_button(ui: &mut Ui, p: &Palette, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(bold(label, 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(0.0, 22.0)))
+    // drawn twice: once to learn whether the pointer is on it, then again in the shade that
+    // answers. egui settles on the second frame, which is the frame anyone can see.
+    let id = ui.next_auto_id();
+    let fill = match ui.ctx().read_response(id) {
+        Some(r) if r.is_pointer_button_down_on() => p.accent_active,
+        Some(r) if r.hovered() => p.accent_hover,
+        _ => p.accent,
+    };
+    ui.add(
+        egui::Button::new(bold(label, FONT_UI).color(p.accent_text))
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::same(CORNER))
+            .min_size(egui::vec2(0.0, CONTROL_H)),
+    )
 }
 
 /// Grey button with bold label, as "Add", "Edit".
@@ -242,18 +344,24 @@ pub fn underline_tabs<T: Copy + PartialEq>(ui: &mut Ui, p: &Palette, items: &[(T
         let is_sel = *selected == *value;
         let galley = ui.painter().layout_no_wrap(
             label.to_string(),
-            FontId::proportional(13.0),
+            FontId::proportional(FONT_UI),
             if is_sel { p.strong } else { p.text },
         );
-        let w = galley.size().x + 20.0;
+        let w = galley.size().x + 22.0;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, height), egui::Sense::click());
-        if resp.hovered() && !is_sel {
-            ui.painter().rect_filled(rect, 0.0, p.hover.gamma_multiply(0.35));
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, is_sel, *label));
+        // the tab being read is a surface of its own; one not being read lifts only under the
+        // pointer, as a rounded pill inset from the strip
+        if is_sel {
+            ui.painter().rect_filled(rect, egui::CornerRadius { nw: CORNER, ne: CORNER, sw: 0, se: 0 }, p.panel);
+        } else if resp.hovered() {
+            let pill = rect.shrink2(egui::vec2(2.0, 4.0));
+            ui.painter().rect_filled(pill, egui::CornerRadius::same(CORNER), p.hover);
         }
         let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(pos, galley, p.text);
         if is_sel {
-            let r = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 3.0), rect.right_bottom());
+            let r = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom());
             ui.painter().rect_filled(r, 0.0, p.accent);
         }
         if resp.clicked() {
@@ -263,28 +371,50 @@ pub fn underline_tabs<T: Copy + PartialEq>(ui: &mut Ui, p: &Palette, items: &[(T
 }
 
 /// Bold section title with the round "?" and gear icons on its left, as in the settings panes.
+/// One compact strip per tool: the name, and a `?` that explains it on hover.
+///
+/// The explanation used to sit under the title as a paragraph of its own, on every tab, with a
+/// gear beside it that did nothing. A tool is used far more often than it is read about, so
+/// the words move into the tooltip and the vertical space goes to the work.
 pub fn section_title(ui: &mut Ui, p: &Palette, title: &str, description: &str) {
     ui.horizontal(|ui| {
-        icon_help(ui, p);
-        ui.label(bold(title, 14.0).color(p.strong));
-    });
-    ui.horizontal(|ui| {
-        icon_gear(ui, p);
-        ui.label(RichText::new(description).color(p.text));
+        ui.label(bold(title, FONT_TITLE).color(p.strong));
+        if !description.is_empty() {
+            icon_help(ui, p).on_hover_text(description);
+        }
     });
 }
 
+/// The round `?` that carries a tooltip: a 1px circle with the glyph dead-centre in it.
+///
+/// Centred on the glyph's *ink*. A galley's `rect` is its line box, which carries the room the
+/// font leaves below the baseline for descenders; "?" has none, so centring on the line box
+/// leaves the glyph sitting visibly high in the circle. `mesh_bounds` is the rectangle the
+/// glyph actually covers, which is what the eye judges the centre by.
 pub fn icon_help(ui: &mut Ui, p: &Palette) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    ui.painter().circle_stroke(r.center(), 7.5, Stroke::new(1.3_f32, p.text));
-    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "?", FontId::proportional(11.0), p.text);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    let centre = rect.center();
+    let lit = resp.hovered();
+    if lit {
+        ui.painter().circle_filled(centre, 8.0, p.hover);
+    }
+    ui.painter().circle_stroke(centre, 7.5, Stroke::new(1.0_f32, if lit { p.strong } else { p.disabled }));
+    let colour = if lit { p.strong } else { p.text };
+    let galley = ui.painter().layout_no_wrap("?".to_string(), FontId::proportional(11.0), colour);
+    ui.painter().galley(centre - glyph_ink(&galley).center().to_vec2(), galley, colour);
     resp
 }
 
-pub fn icon_gear(ui: &mut Ui, p: &Palette) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    paint_gear(ui.painter(), r.center(), 7.0, p.text);
-    resp
+/// The rectangle a laid-out glyph's ink covers, for placing it by eye rather than by line box.
+/// Falls back to the line box when there is no ink to measure -- whitespace, or a font that
+/// reported nothing.
+fn glyph_ink(galley: &egui::Galley) -> egui::Rect {
+    let ink = galley.mesh_bounds;
+    if ink.is_positive() && ink.is_finite() {
+        ink
+    } else {
+        galley.rect
+    }
 }
 
 pub fn paint_gear(painter: &egui::Painter, c0: egui::Pos2, rad: f32, col: Color32) {
@@ -305,18 +435,20 @@ pub fn paint_globe(painter: &egui::Painter, c0: egui::Pos2, rad: f32, col: Color
     painter.add(egui::Shape::ellipse_stroke(c0, egui::vec2(rad * 0.45, rad), s));
 }
 
-/// Small toggle switch (blue when on), as "Capturing".
+/// Small toggle switch, filled in the accent when on, as "Capturing".
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
+    let p = palette(if ui.visuals().dark_mode { Look::Dark } else { Look::Light });
+    let p = &p;
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(28.0, 15.0), egui::Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "Capturing"));
-    let bg = if *on { c(0x2F6EB5) } else { c(0x6A6A6C) };
+    let bg = if *on { p.accent } else { p.hover };
     ui.painter().rect_filled(rect, 7.5, bg);
     let x = if *on { rect.right() - 7.5 } else { rect.left() + 7.5 };
-    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 5.0, Color32::WHITE);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 5.0, text_on(bg));
     resp
 }
 
@@ -359,8 +491,8 @@ impl EmptyIcon {
     }
 }
 
-const EMPTY_ICON: egui::Vec2 = egui::vec2(110.0, 80.0);
-const EMPTY_MAX_WIDTH: f32 = 400.0;
+const EMPTY_ICON: egui::Vec2 = egui::vec2(40.0, 40.0);
+const EMPTY_MAX_WIDTH: f32 = 340.0;
 
 /// "Nothing here yet" card, centred horizontally and vertically in the space left in `ui`
 /// (which it then fills): an icon (a drawn illustration named as in `EmptyIcon::from_name`,
@@ -371,8 +503,8 @@ pub fn empty_state_card(ui: &mut Ui, icon: Option<&str>, title: &str, subtitle: 
     let avail = ui.available_rect_before_wrap();
     let width = EMPTY_MAX_WIDTH.min(avail.width() - 32.0).max(120.0);
     // measure first, so the whole card (not just its top) sits in the middle
-    let title_font = FontId::new(17.0, egui::FontFamily::Name("bold".into()));
-    let sub_font = FontId::proportional(12.5);
+    let title_font = FontId::new(FONT_TITLE, egui::FontFamily::Name("bold".into()));
+    let sub_font = FontId::proportional(12.0);
     let title_h = ui.fonts(|f| f.row_height(&title_font));
     let sub_h = ui.fonts(|f| f.layout(subtitle.to_string(), sub_font.clone(), p.disabled, width).size().y);
     let (gap_icon, gap_title, gap_button, button_h) = (16.0, 8.0, 16.0, 26.0);
@@ -381,13 +513,23 @@ pub fn empty_state_card(ui: &mut Ui, icon: Option<&str>, title: &str, subtitle: 
     let top = (avail.center().y - height / 2.0).max(avail.top() + 12.0);
     let card = egui::Rect::from_min_size(egui::pos2(avail.center().x - width / 2.0, top), egui::vec2(width, height));
     let mut clicked = None;
+    // a quiet container behind it, so the icon and its words read as one placed object rather
+    // than as text adrift in an empty panel
+    let container = card.expand2(egui::vec2(24.0, 20.0));
+    ui.painter().rect_filled(container, egui::CornerRadius::same(CORNER * 2), p.deep);
+    ui.painter().rect_stroke(
+        container,
+        egui::CornerRadius::same(CORNER * 2),
+        Stroke::new(1.0_f32, p.border_subtle),
+        egui::StrokeKind::Inside,
+    );
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card), |ui| {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if let Some(name) = icon {
                 let (r, _) = ui.allocate_exact_size(EMPTY_ICON, egui::Sense::hover());
                 match EmptyIcon::from_name(name) {
-                    Some(drawn) => paint_empty_icon(ui.painter(), r, drawn),
+                    Some(drawn) => paint_empty_icon(ui.painter(), r, drawn, &p),
                     None => { ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name, FontId::proportional(44.0), p.text); }
                 }
                 ui.add_space(gap_icon);
@@ -397,7 +539,10 @@ pub fn empty_state_card(ui: &mut Ui, icon: Option<&str>, title: &str, subtitle: 
             ui.add(egui::Label::new(RichText::new(subtitle).font(sub_font.clone()).color(p.disabled)).wrap());
             if let Some(label) = action_label {
                 ui.add_space(gap_button);
-                let b = egui::Button::new(bold(label, 12.5).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(110.0, button_h));
+                let b = egui::Button::new(bold(label, FONT_UI).color(p.accent_text))
+                    .fill(p.accent)
+                    .corner_radius(egui::CornerRadius::same(CORNER))
+                    .min_size(egui::vec2(110.0, button_h));
                 clicked = Some(ui.add(b));
             }
         });
@@ -421,81 +566,74 @@ pub fn empty_state(
     (false, r.is_some_and(|r| r.clicked()))
 }
 
-/// Simple flat isometric-style illustrations in the original's blue (shapes only).
-pub fn paint_empty_icon(painter: &egui::Painter, r: egui::Rect, icon: EmptyIcon) {
-    let blue = c(0x2C64A8);
-    let blue2 = c(0x3B7BC8);
-    let side = c(0x1E4677);
-    let tile = |center: egui::Pos2, w: f32, h: f32, top: Color32| {
-        let pts = vec![
-            center + egui::vec2(-w / 2.0, 0.0),
-            center + egui::vec2(0.0, -h / 2.0),
-            center + egui::vec2(w / 2.0, 0.0),
-            center + egui::vec2(0.0, h / 2.0),
-        ];
-        let low: Vec<egui::Pos2> = pts.iter().map(|q| *q + egui::vec2(0.0, 4.0)).collect();
-        painter.add(egui::Shape::convex_polygon(low, side, Stroke::NONE));
-        painter.add(egui::Shape::convex_polygon(pts, top, Stroke::NONE));
-        for k in 0..2 {
-            let o = egui::vec2(-w * 0.18 + k as f32 * 4.0, -h * 0.05 + k as f32 * 4.0);
-            painter.line_segment([center + o, center + o + egui::vec2(w * 0.22, -h * 0.11)], Stroke::new(1.5_f32, Color32::from_white_alpha(170)));
-        }
-    };
-    let cc = r.center();
+/// One quiet monochrome line icon, drawn inside a rounded badge.
+///
+/// These used to be multi-coloured isometric illustrations the width of the card. An empty
+/// state is a thing the eye should pass over on its way to the words that say what to do, so
+/// the drawing is now a single-weight outline in the muted text colour, sitting in a badge the
+/// size of a large glyph.
+pub fn paint_empty_icon(painter: &egui::Painter, r: egui::Rect, icon: EmptyIcon, p: &Palette) {
+    let badge = egui::Rect::from_center_size(r.center(), EMPTY_ICON);
+    painter.rect_filled(badge, egui::CornerRadius::same(CORNER * 2), p.header);
+    painter.rect_stroke(
+        badge,
+        egui::CornerRadius::same(CORNER * 2),
+        Stroke::new(1.0_f32, p.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    let cc = badge.center();
+    let ink = Stroke::new(1.5_f32, p.disabled);
+    let at = |dx: f32, dy: f32| cc + egui::vec2(dx, dy);
+    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], ink);
+    // every icon is drawn inside the same 22x22 box in the middle of the badge
     match icon {
+        // three nodes joined by the branches between them
         EmptyIcon::SiteMap => {
-            painter.line_segment([cc + egui::vec2(-24.0, -4.0), cc + egui::vec2(0.0, 6.0)], Stroke::new(1.5_f32, c(0xC8C8C8)));
-            painter.line_segment([cc + egui::vec2(24.0, -14.0), cc + egui::vec2(0.0, 6.0)], Stroke::new(1.5_f32, c(0xC8C8C8)));
-            tile(cc + egui::vec2(-26.0, -4.0), 40.0, 22.0, blue);
-            tile(cc + egui::vec2(26.0, -16.0), 40.0, 22.0, blue2);
-            tile(cc + egui::vec2(8.0, 16.0), 40.0, 22.0, blue);
+            line(at(-7.0, -7.0), at(-7.0, 7.0));
+            line(at(-7.0, -7.0), at(5.0, -7.0));
+            line(at(-7.0, 0.0), at(5.0, 0.0));
+            line(at(-7.0, 7.0), at(5.0, 7.0));
+            for dy in [-7.0, 0.0, 7.0] {
+                painter.circle_stroke(at(7.5, dy), 2.5, ink);
+            }
         }
+        // a sheet of paper with lines of text on it
         EmptyIcon::History | EmptyIcon::Logger => {
-            tile(cc, 82.0, 46.0, blue);
-            let dot = cc + egui::vec2(12.0, -10.0);
-            painter.circle_filled(dot, 8.0, c(0x23558F));
-            painter.circle_stroke(dot, 5.0, Stroke::new(1.2_f32, Color32::from_white_alpha(200)));
+            let page = egui::Rect::from_min_max(at(-7.0, -9.0), at(7.0, 9.0));
+            painter.rect_stroke(page, egui::CornerRadius::same(2), ink, egui::StrokeKind::Inside);
+            for dy in [-4.0, 0.0, 4.0] {
+                line(at(-4.0, dy), at(4.0, dy));
+            }
         }
+        // a tray with a tab above it
         EmptyIcon::Organizer => {
-            tile(cc, 110.0, 60.0, blue);
-            painter.rect_filled(egui::Rect::from_center_size(cc + egui::vec2(24.0, -22.0), egui::vec2(22.0, 8.0)), 2.0, c(0x5C8FD0));
+            line(at(-8.0, -6.0), at(-1.0, -6.0));
+            let body = egui::Rect::from_min_max(at(-9.0, -2.0), at(9.0, 8.0));
+            painter.rect_stroke(body, egui::CornerRadius::same(2), ink, egui::StrokeKind::Inside);
+            line(at(-9.0, 3.0), at(9.0, 3.0));
         }
+        // two bars: traffic held rather than passed
         EmptyIcon::Intercept => {
-            painter.line_segment([cc + egui::vec2(-40.0, -26.0), cc + egui::vec2(-18.0, -10.0)], Stroke::new(2.0_f32, c(0x4A4A4A)));
-            painter.line_segment([cc + egui::vec2(40.0, -26.0), cc + egui::vec2(18.0, -10.0)], Stroke::new(2.0_f32, c(0x4A4A4A)));
-            painter.line_segment([cc + egui::vec2(-40.0, 26.0), cc + egui::vec2(-18.0, 10.0)], Stroke::new(2.0_f32, c(0x4A4A4A)));
-            painter.line_segment([cc + egui::vec2(40.0, 26.0), cc + egui::vec2(18.0, 10.0)], Stroke::new(2.0_f32, c(0x4A4A4A)));
-            let body = egui::Rect::from_center_size(cc + egui::vec2(0.0, -4.0), egui::vec2(20.0, 50.0));
-            painter.rect_filled(body, 6.0, blue);
-            painter.circle_filled(cc + egui::vec2(0.0, -16.0), 5.0, c(0x1E4677));
-            painter.circle_filled(cc + egui::vec2(0.0, 6.0), 5.0, c(0xB5D35B));
-            painter.line_segment([cc + egui::vec2(0.0, 21.0), cc + egui::vec2(0.0, 36.0)], Stroke::new(3.0_f32, c(0x555555)));
+            for dx in [-4.0, 4.0] {
+                line(at(dx, -8.0), at(dx, 8.0));
+            }
+            painter.circle_stroke(cc, 11.0, Stroke::new(1.0_f32, p.border_subtle));
         }
+        // pulse rings going out from a point, and one return
         EmptyIcon::Radar => {
-            painter.add(egui::Shape::ellipse_filled(cc + egui::vec2(0.0, 6.0), egui::vec2(52.0, 30.0), c(0x222222)));
-            painter.add(egui::Shape::ellipse_filled(cc, egui::vec2(52.0, 30.0), blue));
-            for k in 1..4 {
-                painter.add(egui::Shape::ellipse_stroke(cc, egui::vec2(13.0 * k as f32, 7.5 * k as f32), Stroke::new(1.2_f32, c(0x6FA0DA))));
+            for k in 1..=3 {
+                painter.circle_stroke(cc, 3.5 * k as f32, ink);
             }
-            for q in [egui::vec2(-2.0, -20.0), egui::vec2(-46.0, 10.0), egui::vec2(8.0, 10.0)] {
-                painter.circle_filled(cc + q, 4.5, c(0xE1632F));
-            }
+            painter.circle_filled(at(7.0, -7.0), 2.0, p.accent);
         }
+        // a packet out and a packet back
         EmptyIcon::Repeater => {
-            let a = [cc + egui::vec2(-28.0, 4.0), cc + egui::vec2(18.0, -18.0)];
-            painter.line_segment(a, Stroke::new(9.0_f32, blue2));
-            painter.add(egui::Shape::convex_polygon(
-                vec![cc + egui::vec2(16.0, -28.0), cc + egui::vec2(32.0, -24.0), cc + egui::vec2(22.0, -10.0)],
-                blue2,
-                Stroke::NONE,
-            ));
-            let b = [cc + egui::vec2(28.0, 0.0), cc + egui::vec2(-18.0, 22.0)];
-            painter.line_segment(b, Stroke::new(9.0_f32, c(0x3E4A86)));
-            painter.add(egui::Shape::convex_polygon(
-                vec![cc + egui::vec2(-16.0, 32.0), cc + egui::vec2(-32.0, 28.0), cc + egui::vec2(-22.0, 14.0)],
-                c(0x3E4A86),
-                Stroke::NONE,
-            ));
+            line(at(-8.0, -5.0), at(6.0, -5.0));
+            line(at(2.0, -9.0), at(7.0, -5.0));
+            line(at(2.0, -1.0), at(7.0, -5.0));
+            line(at(8.0, 5.0), at(-6.0, 5.0));
+            line(at(-2.0, 1.0), at(-7.0, 5.0));
+            line(at(-2.0, 9.0), at(-7.0, 5.0));
         }
     }
 }
@@ -515,7 +653,7 @@ pub fn table_header(ui: &mut Ui, p: &Palette, cols: &[(&str, f32)]) {
 }
 
 /// How tall a table row is when it holds nothing but text.
-pub const ROW_HEIGHT: f32 = 19.0;
+pub const ROW_HEIGHT: f32 = 23.0;
 
 /// How tall a table row is when it holds widgets of its own -- a dropdown, an editor --
 /// rather than text alone: enough room for the controls to sit in.
@@ -547,7 +685,15 @@ pub fn table_row_cells(
     // table is re-sorted or the panel above it changes height, which closes an open menu
     // under the pointer.
     let resp = ui.interact(rect, ui.id().with(id_salt), egui::Sense::click());
-    let base = if selected { p.selection } else if stripe { ui.visuals().faint_bg_color } else { p.deep };
+    let base = if selected {
+        p.selection
+    } else if resp.hovered() {
+        p.hover
+    } else if stripe {
+        ui.visuals().faint_bg_color
+    } else {
+        p.deep
+    };
     // a selected row keeps the selection colour: of the two things a row can be, which one is
     // being read matters more than which colour it was marked with
     let bg = match tint {
@@ -555,11 +701,17 @@ pub fn table_row_cells(
         _ => base,
     };
     ui.painter().rect_filled(rect, 0.0, bg);
-    if let Some(highlight) = tint {
-        // the bar is what does the work: solid, the full height of the row, and at the very
-        // edge the eye runs down
+    // the bar is what does the work: solid, the full height of the row, and at the very edge
+    // the eye runs down. The row being read claims it in the accent; otherwise it shows
+    // whichever colour the row was marked with.
+    let edge = match (selected, tint) {
+        (true, _) => Some(p.accent),
+        (false, Some(highlight)) => Some(highlight),
+        (false, None) => None,
+    };
+    if let Some(colour) = edge {
         let bar = egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + ROW_ACCENT, rect.bottom()));
-        ui.painter().rect_filled(bar, 0.0, highlight);
+        ui.painter().rect_filled(bar, 0.0, colour);
     }
     let mut x = rect.left() + 6.0;
     let cells = widths
@@ -662,8 +814,20 @@ pub fn sort_header<C: Copy + PartialEq>(ui: &mut Ui, p: &Palette, cols: &[(&str,
 /// One table row (text cells at the same widths). Returns the click response.
 pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32>)], selected: bool, stripe: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
-    let bg = if selected { p.selection } else if stripe { ui.visuals().faint_bg_color } else { p.deep };
+    let bg = if selected {
+        p.selection
+    } else if resp.hovered() {
+        p.hover
+    } else if stripe {
+        ui.visuals().faint_bg_color
+    } else {
+        p.deep
+    };
     ui.painter().rect_filled(rect, 0.0, bg);
+    if selected {
+        let bar = egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + ROW_ACCENT, rect.bottom()));
+        ui.painter().rect_filled(bar, 0.0, p.accent);
+    }
     let mut x = rect.left() + 6.0;
     for (text, w, col) in cells {
         let clip = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + w - 8.0, rect.bottom()));
@@ -916,6 +1080,46 @@ pub fn fitted_table(ui: &mut Ui, p: &Palette, id: impl std::hash::Hash, height: 
     }
 }
 
+/// Whichever of the palette's near-black and near-white reads better on `fill`.
+///
+/// For text on a coloured fill that is neither of the theme's surfaces nor the accent -- a
+/// destructive action's crimson, a highlight swatch. The answer depends on the fill alone, so
+/// it is the same in either theme.
+pub fn text_on(fill: Color32) -> Color32 {
+    // the WCAG relative luminance, which is what decides legibility here
+    let channel = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let l = 0.2126 * channel(fill.r()) + 0.7152 * channel(fill.g()) + 0.0722 * channel(fill.b());
+    // 0.18 is where white text and black text are about equally readable
+    if l > 0.18 { DARK.bg_input } else { LIGHT.panel }
+}
+
+/// A status pill for the chrome: a filled dot in `colour` and a word beside it, on a raised
+/// rounded fill. Hoverable, so the caller can hang a tooltip or a click on what comes back.
+pub fn status_pill(ui: &mut Ui, p: &Palette, text: &str, colour: Color32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(FONT_CAPTION), p.text);
+    let size = egui::vec2(galley.size().x + 24.0, (galley.size().y + 7.0).max(18.0));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    let fill = if resp.hovered() { p.hover } else { p.header };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(CORNER), fill);
+    ui.painter().circle_filled(egui::pos2(rect.left() + 9.0, rect.center().y), 3.5, colour);
+    ui.painter().galley(egui::pos2(rect.left() + 17.0, rect.center().y - galley.size().y / 2.0), galley, p.text);
+    resp
+}
+
+/// A thin upright divider between two groups of chrome.
+pub fn chrome_divider(ui: &mut Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
+    let x = rect.center().x;
+    ui.painter().line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        Stroke::new(1.0_f32, p.border_subtle),
+    );
+}
+
 /// Small rounded on/off toggle (the Settings scope filter, the history filter ribbon).
 pub fn pill(ui: &mut Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(11.5), if on { p.strong } else { p.text });
@@ -936,6 +1140,8 @@ mod tests {
     /// Draw `add` in a ui `width` wide, however little that is.
     fn in_a_ui_of(width: f32, add: impl FnOnce(&mut Ui)) {
         let ctx = egui::Context::default();
+        // the bold family the titles are set in is bound by the app's own font setup
+        install_fonts(&ctx);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 200.0));
         // `run` wants an FnMut, and this closure draws exactly once
         let mut add = Some(add);
@@ -975,5 +1181,140 @@ mod tests {
             });
             in_a_ui_of(width, |ui| columns(ui, 4, |cols| for c in cols.iter_mut() { c.label("x"); }));
         });
+    }
+
+    /// Every empty state draws its badge and its words, at any width, and the one that has an
+    /// action hands the caller something to act on.
+    #[test]
+    fn every_empty_state_icon_draws_matrix() {
+        let icons = ["sitemap", "history", "intercept", "logger", "organizer", "radar", "repeater"];
+        assert_table!(icons, |idx, name| {
+            for width in [1200.0_f32, 420.0, 90.0] {
+                in_a_ui_of(width, |ui| {
+                    let r = empty_state_card(ui, Some(name), "Nothing here yet", "A short line about what would fill this.", None);
+                    assert!(r.is_none(), "case #{idx} ({name}): no action was asked for, so none came back");
+                });
+            }
+            in_a_ui_of(900.0, |ui| {
+                let r = empty_state_card(ui, Some(name), "Nothing here yet", "A short line.", Some("Do the thing"));
+                assert!(r.is_some(), "case #{idx} ({name}): the action is there to click");
+            });
+        });
+        // a name no icon answers to falls back to drawing the name, rather than drawing nothing
+        in_a_ui_of(900.0, |ui| {
+            let _ = empty_state_card(ui, Some("no-such-icon"), "Title", "Text", None);
+        });
+    }
+
+    /// The WCAG relative luminance of a colour, on the 0..1 scale the contrast formula wants.
+    fn luminance(col: Color32) -> f64 {
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(col.r()) + 0.7152 * channel(col.g()) + 0.0722 * channel(col.b())
+    }
+
+    /// The WCAG contrast ratio between two colours, 1.0 (identical) to 21.0 (black on white).
+    fn contrast(fg: Color32, bg: Color32) -> f64 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Every colour the app writes text or a badge in, against the surface it is drawn on, in
+    /// both themes.
+    ///
+    /// Body text is held to the WCAG AA ratio of 4.5. Deliberately quiet text and the coloured
+    /// badges, methods and syntax tones are held to 3.0, the ratio AA asks of large text and of
+    /// user interface components: these carry a word or two at a time, and pushing them to 4.5
+    /// would flatten the hues they exist to tell apart.
+    #[test]
+    fn every_foreground_is_legible_on_its_surface_in_both_themes() {
+        let mut bad: Vec<String> = Vec::new();
+        for (theme, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            // the surfaces text is read on
+            let body: [(&str, Color32, &str, Color32); 11] = [
+                ("text on the canvas", p.text, "deep", p.deep),
+                ("text on a panel", p.text, "panel", p.panel),
+                ("text on raised chrome", p.text, "header", p.header),
+                ("text in an input", p.text, "bg_input", p.bg_input),
+                ("text under the pointer", p.text, "hover", p.hover),
+                ("text on a selected row", p.strong, "selection", p.selection),
+                ("emphasis on a panel", p.strong, "panel", p.panel),
+                ("emphasis on the canvas", p.strong, "deep", p.deep),
+                ("a banner's text", p.text, "banner", p.banner),
+                // the menu titles, which are drawn straight onto the menu strip
+                ("the top menu's titles", p.text, "the menu strip", p.panel),
+                // the label on the primary action, which is the one place accent is a fill
+                ("the primary action's label", p.accent_text, "accent", p.accent),
+            ];
+            for (what, fg, surface, bg) in body {
+                let r = contrast(fg, bg);
+                if r < 4.5 { bad.push(format!("{theme}: {what} on {surface} is {r:.2}:1 (needs 4.5)")); }
+            }
+
+            // the primary action also has a hover and a pressed shade to stay readable on
+            for (name, fill) in [("hovered", p.accent_hover), ("pressed", p.accent_active)] {
+                let r = contrast(p.accent_text, fill);
+                if r < 4.5 { bad.push(format!("{theme}: primary label on accent_{name} is {r:.2}:1 (needs 4.5)")); }
+            }
+
+            // badges, methods, severities and syntax: a word at a time, on panel and canvas
+            let accents: [(&str, Color32); 16] = [
+                ("badge_info", p.badge_info),
+                ("success", p.success),
+                ("warning", p.warning),
+                ("error", p.error),
+                ("high severity", p.high),
+                ("medium severity", p.medium),
+                ("low severity", p.low),
+                ("link", p.link),
+                ("GET", p.get),
+                ("POST", p.post),
+                ("other methods", p.other_method),
+                ("quiet text", p.disabled),
+                ("syntax keys", p.syn_key),
+                ("syntax strings", p.syn_string),
+                ("syntax numbers", p.syn_number),
+                ("syntax literals", p.syn_literal),
+            ];
+            for (what, fg) in accents {
+                for (surface, bg) in [("panel", p.panel), ("deep", p.deep), ("header", p.header)] {
+                    let r = contrast(fg, bg);
+                    if r < 3.0 { bad.push(format!("{theme}: {what} on {surface} is {r:.2}:1 (needs 3.0)")); }
+                }
+            }
+
+            // the message editors draw their own text on the recessed input surface
+            let editor: [(&str, Color32); 6] = [
+                ("message text", p.ed_text),
+                ("header names", p.ed_header_name),
+                ("header values", p.ed_header_value),
+                ("first lines", p.ed_first_line),
+                ("parameter names", p.ed_param_name),
+                ("parameter values", p.ed_param_value),
+            ];
+            for (what, fg) in editor {
+                for (surface, bg) in [("bg_input", p.bg_input), ("deep", p.deep)] {
+                    let r = contrast(fg, bg);
+                    if r < 3.0 { bad.push(format!("{theme}: {what} on {surface} is {r:.2}:1 (needs 3.0)")); }
+                }
+            }
+            // the gutter's line numbers are read against the gutter itself
+            let r = contrast(p.ed_line_numbers, p.ed_gutter);
+            if r < 3.0 { bad.push(format!("{theme}: line numbers on the gutter are {r:.2}:1 (needs 3.0)")); }
+
+            // and the surfaces have to be told apart from one another at all
+            for (a_name, a, b_name, b) in [
+                ("deep", p.deep, "panel", p.panel),
+                ("panel", p.panel, "header", p.header),
+                ("header", p.header, "hover", p.hover),
+            ] {
+                let step = (luminance(a) - luminance(b)).abs();
+                if step <= 0.0008 { bad.push(format!("{theme}: {a_name} and {b_name} are the same surface ({step:.5})")); }
+            }
+        }
+        assert!(bad.is_empty(), "{} contrast shortfalls:\n  {}", bad.len(), bad.join("\n  "));
     }
 }

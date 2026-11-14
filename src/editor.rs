@@ -358,21 +358,59 @@ pub fn set_view_mode(ctx: &egui::Context, id: &str, mode: MessageViewMode) {
 }
 
 /// The [ Raw | Pretty | Hex ] switch.
-fn mode_switch(ui: &mut Ui, p: &Palette, id: &str) -> MessageViewMode {
+/// The bar over a message pane: the Raw / Pretty / Hex segmented control, how much message
+/// there is, and a Copy that takes the whole of it.
+///
+/// The size and the Copy live here rather than in each of the dozen callers, so every message
+/// pane in the app says the same things in the same place.
+fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMode {
     let mut mode = view_mode(ui.ctx(), id);
     ui.horizontal(|ui| {
-        egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, p.ed_gutter)).corner_radius(4.0).inner_margin(egui::Margin::same(1)).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for m in MessageViewMode::ALL {
-                let tip = match m {
-                    MessageViewMode::Raw => "The message as received",
-                    MessageViewMode::Pretty => "JSON re-indented and coloured; XML and HTML tags indented",
-                    MessageViewMode::Hex => "Every byte, 16 per row, with an ASCII column",
-                };
-                if ui.add(egui::Button::new(egui::RichText::new(m.label()).size(11.5)).selected(mode == m).min_size(egui::vec2(48.0, 18.0))).on_hover_text(tip).clicked() {
-                    mode = m;
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0_f32, p.border_subtle))
+            .corner_radius(f32::from(crate::theme::CORNER))
+            .inner_margin(egui::Margin::same(1))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for m in MessageViewMode::ALL {
+                    let tip = match m {
+                        MessageViewMode::Raw => "The message as received",
+                        MessageViewMode::Pretty => "JSON re-indented and coloured; XML and HTML tags indented",
+                        MessageViewMode::Hex => "Every byte, 16 per row, with an ASCII column",
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(m.label()).size(11.5))
+                                .selected(mode == m)
+                                .min_size(egui::vec2(48.0, 18.0)),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        mode = m;
+                    }
                 }
+            });
+        if text.is_empty() {
+            return;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Copy").size(11.0)).min_size(egui::vec2(0.0, 18.0)))
+                .on_hover_text("Copy the whole message")
+                .clicked()
+            {
+                ui.ctx().copy_text(text.to_string());
             }
+            // monospace, so a figure that changes as a response streams in does not jiggle
+            let lines = text.lines().count();
+            ui.label(
+                egui::RichText::new(format!("{} B · {lines} ln", text.len()))
+                    .size(crate::theme::FONT_CAPTION)
+                    .monospace()
+                    .color(p.badge_info),
+            )
+            .on_hover_text("Bytes and lines in this message");
         });
     });
     set_view_mode(ui.ctx(), id, mode);
@@ -413,7 +451,7 @@ fn large_note(ui: &mut Ui, p: &Palette, id: &str, full_len: usize, limit: usize)
 /// forwarding always use `text` itself.
 pub fn message_view(ui: &mut Ui, p: &Palette, id: &str, text: &str, min_height: f32) -> MessageView {
     let before = ui.cursor().top();
-    let mode = mode_switch(ui, p, id);
+    let mode = mode_switch(ui, p, id, text);
     let min_height = (min_height - (ui.cursor().top() - before)).max(40.0);
     // each mode has its own text widget state (cursor positions don't carry over)
     let wid = format!("{id}:{}", mode.label());

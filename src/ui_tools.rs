@@ -348,26 +348,49 @@ fn scope_list(app: &mut App, ui: &mut Ui, p: &Palette, exclude: bool) {
 }
 
 fn target_issues(app: &mut App, ui: &mut Ui, p: &Palette) {
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label(bold("Issue definitions", 14.0).color(p.strong));
-    });
-    ui.label(RichText::new("This listing contains the definitions of all issues that can be detected by the scanner.").size(12.0).color(p.text));
-    ui.add_space(6.0);
+    // The header is registered first, before either panel, so it spans the whole tab and the
+    // split starts strictly under it: the divider and its resize handle then have only the
+    // table and the detail pane between them, and never the header.
+    egui::TopBottomPanel::top("issues_header")
+        .resizable(false)
+        .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { left: 2, right: 2, top: 8, bottom: 6 }))
+        .show_separator_line(false)
+        .show_inside(ui, |ui| {
+            theme::section_title(ui, p, "Issue definitions",
+                "This listing contains the definitions of all issues that can be detected by the scanner.");
+        });
     let defs = issue_defs::ISSUE_DEFS;
-    egui::SidePanel::left("issuelist").resizable(true).default_width(470.0)
-        .frame(egui::Frame::new().fill(p.deep)).show_inside(ui, |ui| {
-            theme::table_header(ui, p, &[("Name", 290.0), ("Typical severity", 100.0), ("Type index", 90.0)]);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, (idx, name, sev)) in defs.iter().enumerate() {
-                    let sel = app.issue_sel == i;
-                    let r = theme::table_row(ui, p, &[
-                        ((*name).into(), 290.0, None),
-                        ((*sev).into(), 100.0, Some(sev_color(p, sev))),
-                        (format!("0x{idx:08x}"), 90.0, None),
-                    ], sel, i % 2 == 1);
-                    if r.clicked() { app.issue_sel = i; }
-                }
+    // The three columns need 480px between them, plus the well's own padding. The listing is
+    // fixed at a width that shows all of them, with nothing to drag: there is no reading of
+    // this table that wants a narrower Name column. It gives way only on a window too narrow
+    // to hold that and a definition beside it, and never below 300px.
+    let list_w = 560.0_f32.min((ui.max_rect().width() - 220.0).max(300.0));
+    egui::SidePanel::left("issuelist").resizable(false).exact_width(list_w)
+        .frame(egui::Frame::new().fill(p.deep).inner_margin(egui::Margin { top: 1, ..Default::default() })).show_inside(ui, |ui| {
+            // laid out like every other table in the app: the name takes the slack, and a
+            // window too narrow for the three of them scrolls sideways rather than cutting
+            // the last column off
+            const ISSUE_COLS: [(f32, f32); 3] = [(290.0, 1.0), (110.0, 0.0), (90.0, 0.0)];
+            let table_h = ui.available_height().max(0.0);
+            theme::fitted_table(ui, p, "issue_defs_table", table_h, &ISSUE_COLS, |ui, w| {
+                theme::table_header(ui, p, &[("Name", w[0]), ("Typical severity", w[1]), ("Type index", w[2])]);
+                egui::ScrollArea::vertical().id_salt("issue_defs_rows").auto_shrink([false, false])
+                    .show_rows(ui, theme::ROW_HEIGHT, defs.len(), |ui, range| {
+                        for (i, (idx, name, sev)) in defs.iter().enumerate().skip(range.start).take(range.len()) {
+                            let sel = app.issue_sel == i;
+                            let r = theme::table_row(ui, p, &[
+                                ((*name).into(), w[0], None),
+                                ((*sev).into(), w[1], Some(sev_color(p, sev))),
+                                (format!("0x{idx:08x}"), w[2], None),
+                            ], sel, i % 2 == 1);
+                            r.widget_info(|| {
+                                egui::WidgetInfo::selected(egui::WidgetType::Button, true, sel, format!("{name} ({sev})"))
+                            });
+                            if r.clicked() {
+                                app.issue_sel = i;
+                            }
+                        }
+                    });
             });
         });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(14))).show_inside(ui, |ui| {
@@ -398,14 +421,13 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
     let (target_before, template_before) = (app.int_target.clone(), app.int_template.clone());
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        theme::icon_help(ui, p);
         egui::ComboBox::from_id_salt("attack").width(300.0)
             .selected_text(format!("{} attack", app.int_attack.label()))
             .show_ui(ui, |ui| { for t in AttackType::ALL { ui.selectable_value(&mut app.int_attack, t, format!("{} attack", t.label())); } });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let running = app.int_running;
             let problem = actions::attack_problem(app);
-            let start = ui.add_enabled(!running && problem.is_none(), egui::Button::new(bold("Start attack", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(120.0, 24.0)));
+            let start = ui.add_enabled(!running && problem.is_none(), egui::Button::new(bold("Start attack", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(120.0, 24.0)));
             if start.clicked() {
                 actions::start_attack(app);
             }
@@ -459,7 +481,7 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
                     let width = ui.available_width();
                     egui::ScrollArea::vertical().id_salt(salt).max_height(rows as f32 * 18.0).auto_shrink([false, true]).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(text).id_salt(salt).desired_rows(rows).desired_width(width)
-                            .font(FontId::monospace(12.5)).frame(false).hint_text("Enter payloads, one per line"));
+                            .font(FontId::monospace(12.5)).frame(false).hint_text("One payload per line"));
                     });
                 });
             };
@@ -627,10 +649,17 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 (id, app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).cloned())
             });
             if let Some((id, entry)) = detail {
+                // bounded against the region the window gave this pane, not against what is
+                // still unspent in it: an unspent height shrinks as the pane grows, so a
+                // ceiling taken from it rises with the thing it is meant to hold down
+                let int_tallest = (ui.max_rect().height() - 90.0).max(90.0);
                 egui::TopBottomPanel::bottom("int_detail").resizable(true).default_height(240.0).min_height(90.0)
+                    .max_height(int_tallest)
                     .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { top: 6, ..Default::default() }))
                     .show_inside(ui, |ui| match entry {
                         Some(e) => {
+                            // the viewers are held to the pane's own height; see the site map
+                            egui::ScrollArea::vertical().id_salt(("int_detail_scroll", id)).auto_shrink([false, false]).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("#{}", e.id)).color(p.text));
                                 if theme::plain_button(ui, p, "Copy as cURL", true).on_hover_text("Copy the request as a curl command").clicked() {
@@ -649,6 +678,7 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                             let e_req = actions::raw_request(&e);
                             attach_view_context_menu(&out_req, &e.request, app, Tab::Intruder, &e_url, &e_req, Some(&e.response), &format!("Intruder #{} request", e.id));
                             attach_view_context_menu(&out_resp, &e.response, app, Tab::Intruder, &e_url, &e_req, Some(&e.response), &format!("Intruder #{} response", e.id));
+                            });
                         }
                         None => { ui.label(RichText::new("This request is no longer in history.").size(12.0).color(p.disabled)); }
                     });
@@ -759,7 +789,7 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
                 }
                 let can_send = tab.can_send();
                 let why = if tab.waiting { "Waiting for the response" } else { "Write a request first" };
-                if ui.add_enabled(can_send, egui::Button::new(bold("Send", 13.0).color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(80.0, 24.0)))
+                if ui.add_enabled(can_send, egui::Button::new(bold("Send", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(80.0, 24.0)))
                     .on_disabled_hover_text(why).clicked() {
                     send = true;
                 }
@@ -1121,7 +1151,7 @@ fn collab_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
             egui::TextEdit::singleline(&mut app.collab_custom)
                 .desired_width(118.0)
                 .char_limit(crate::collab::CUSTOM_DATA_MAX)
-                .hint_text("optional tag"),
+                .hint_text("Tag"),
         )
         .on_hover_text("Goes into the payload's hostname, so it comes back on the interaction it caused.");
         ui.checkbox(&mut app.collab_with_server, "Include server location");
@@ -1176,7 +1206,7 @@ fn collab_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
             egui::TextEdit::singleline(&mut app.collab_token)
                 .desired_width(104.0)
                 .password(true)
-                .hint_text("if asked"),
+                .hint_text("Optional token"),
         )
         .on_hover_text("Sent as the Authorization header. A public relay needs none.");
         collab_session_badge(app, ui, p);
@@ -1900,7 +1930,7 @@ pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
                         if theme::plain_button(ui, p, "Cancel", true).clicked() {
                             do_cancel = true;
                         }
-                        let del_btn = egui::Button::new(bold("Delete", 12.5).color(Color32::WHITE))
+                        let del_btn = egui::Button::new(bold("Delete", 12.5).color(theme::text_on(p.high)))
                             .fill(p.high)
                             .min_size(egui::vec2(72.0, 24.0));
                         if ui.add(del_btn).clicked() {
@@ -2312,7 +2342,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                             (e.method.clone(), w[3], Some(method_color(p, &e.method))),
                             (e.host.clone(), w[4], None),
                             (e.path.clone(), w[5], None),
-                            (e.status.clone(), w[6], None),
+                            (e.status.clone(), w[6], Some(crate::ui_core::status_color(p, &e.status))),
                             (e.length.to_string(), w[7], None),
                             (e.mime.clone(), w[8], None),
                         ];
@@ -2556,7 +2586,7 @@ pub fn discover(app: &mut App, ui: &mut Ui, p: &Palette) {
                                 (e.method.clone(), 70.0, Some(method_color(p, &e.method))),
                                 (e.host.clone(), 200.0, None),
                                 (e.path.clone(), 300.0, None),
-                                (e.status.clone(), 120.0, None),
+                                (e.status.clone(), 120.0, Some(crate::ui_core::status_color(p, &e.status))),
                             ];
                             let row = theme::table_row(ui, p, &cells, app.discover_sel == Some(e.id), i % 2 == 1);
                             if row.clicked() || row.secondary_clicked() {
