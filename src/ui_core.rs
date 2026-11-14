@@ -546,6 +546,22 @@ pub fn method_color(p: &Palette, m: &str) -> Color32 {
     match m { "GET" | "OPTIONS" => p.get, "POST" => p.post, _ => p.other_method }
 }
 
+/// The colour an out-of-band interaction's protocol is written in. A relay may report any
+/// protocol at all, so anything not named here is drawn in the neutral colour the tables use
+/// for a method they do not know either -- readable, and plainly not one of the named ones.
+pub fn protocol_color(p: &Palette, protocol: &str) -> Color32 {
+    match crate::collab::normalize_protocol(protocol).as_str() {
+        // a name lookup is the one almost every payload fires first
+        "DNS" => p.get,
+        "HTTP" | "HTTPS" => p.post,
+        "SMTP" | "SMTPS" => p.medium,
+        "LDAP" => p.link,
+        "FTP" | "FTPS" => p.info,
+        "SMB" => p.low,
+        _ => p.other_method,
+    }
+}
+
 #[cfg(test)]
 mod window_tests {
     use crate::state::{App, Tab};

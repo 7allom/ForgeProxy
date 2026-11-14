@@ -36,6 +36,17 @@ pub struct ProjectFile {
     pub intruder_payloads: String,
     pub intruder_payloads_b: String,
     pub collab_server: String,
+    /// The token a protected relay asks for, the session registered with it, the payloads
+    /// handed out and what has come back. Absent from files saved before any of this, which
+    /// open with no session and nothing collected.
+    #[serde(default)]
+    pub collab_token: String,
+    #[serde(default)]
+    pub collab_session: Option<crate::collab::OastSession>,
+    #[serde(default)]
+    pub collab_payloads: Vec<String>,
+    #[serde(default)]
+    pub collab_interactions: Vec<crate::collab::CollabInteraction>,
     /// "Default Proxy interception state": applied when the project is opened.
     #[serde(default)]
     pub intercept_at_startup: bool,
@@ -83,6 +94,10 @@ pub fn snapshot(app: &App) -> ProjectFile {
         intruder_payloads: app.int_payloads.clone(),
         intruder_payloads_b: app.int_payloads_b.clone(),
         collab_server: app.collab_server.clone(),
+        collab_token: app.collab_token.clone(),
+        collab_session: app.collab_session.clone(),
+        collab_payloads: app.collab_payloads.clone(),
+        collab_interactions: app.collab_interactions.clone(),
         intercept_at_startup: app.intercept_default,
         intercept_only_in_scope: app.intercept_only_in_scope,
         tls_passthrough: app.tls_passthrough.clone(),
@@ -168,10 +183,17 @@ pub fn reset(app: &mut App) {
     app.int_payloads.clear();
     app.int_payloads_b.clear();
     app.int_results.clear();
-    app.collab_server.clear();
+    app.collab_server = crate::collab::DEFAULT_SERVER.into();
+    app.collab_token.clear();
+    app.collab_session = None;
+    app.collab_registering = false;
+    app.collab_sel = None;
     app.collab_payloads.clear();
     app.collab_interactions.clear();
     app.collab_polling = false;
+    app.collab_auto_poll = false;
+    app.collab_last_poll = None;
+    app.collab_view = crate::collab::CollabView::default();
     app.collab_msg.clear();
     app.decoder_pending_delete = None;
     app.project_name.clear();
@@ -218,7 +240,21 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     }
     app.int_payloads = f.intruder_payloads;
     app.int_payloads_b = f.intruder_payloads_b;
-    app.collab_server = f.collab_server;
+    // a project opened on another machine keeps its session: the payloads already out in the
+    // world answer to that correlation id and no other
+    app.collab_server = if f.collab_server.trim().is_empty() { crate::collab::DEFAULT_SERVER.into() } else { f.collab_server };
+    app.collab_token = f.collab_token;
+    app.collab_session = f.collab_session;
+    app.collab_registering = false;
+    app.collab_sel = None;
+    app.collab_payloads = f.collab_payloads;
+    app.collab_interactions = f.collab_interactions;
+    // a project saved before interactions had ids reads them all back as 0; the table
+    // addresses rows by id, so give them one before anything draws
+    crate::collab::renumber(&mut app.collab_interactions);
+    app.collab_auto_poll = false;
+    app.collab_last_poll = None;
+    app.collab_view = crate::collab::CollabView::default();
     // the project's default interception state takes effect as it opens
     app.intercept_default = f.intercept_at_startup;
     if app.proxy.intercept.load(std::sync::atomic::Ordering::SeqCst) != app.intercept_default {
@@ -394,6 +430,83 @@ mod tests {
         assert_eq!(f.organizer[1].note, "401 as it should");
         assert_eq!(f.organizer[1].collection, app.org_collections[1].id);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project keeps the session its payloads were handed out under, and what has come
+    /// back so far. Payloads live out in the world for as long as whatever they were put
+    /// into does: a project reopened next week has to be able to go on collecting for them,
+    /// which it can only do with the same correlation id and the same key.
+    #[test]
+    fn a_project_keeps_the_collaborator_session_and_what_it_caught() {
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
+        app.collab_server = "relay.test".into();
+        app.collab_token = "s3cret".into();
+        let mut session = crate::collab::OastSession::begin("relay.test");
+        session.prepare().expect("a session key");
+        session.registered = true;
+        let payload = session.new_payload("Login Flow", true);
+        app.collab_payloads.push(payload.clone());
+        app.collab_session = Some(session.clone());
+        app.collab_interactions.push(crate::collab::CollabInteraction {
+            id: 1,
+            interaction_type: "DNS".into(),
+            client_ip: "203.0.113.7".into(),
+            timestamp: "2026-11-14T09:30:00Z".into(),
+            protocol_details: "A lookup".into(),
+            comment: "Custom data: login-flow".into(),
+            payload: payload.clone(),
+            query_type: "A".into(),
+            raw_request: ";; QUESTION\nlogin-flow.relay.test. IN A".into(),
+            raw_response: ";; ANSWER\nlogin-flow.relay.test. 60 IN A 203.0.113.1".into(),
+            unique_id: session.payloads[0].unique_id.clone(),
+        });
+
+        let saved = serde_json::to_string(&snapshot(&app)).unwrap();
+        let back: ProjectFile = serde_json::from_str(&saved).unwrap();
+        let mut loaded = {
+            let ctx = eframe::egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx);
+            App::new(&cc, Some("/dev/null".into()), None, false)
+        };
+        apply_all(&mut loaded, back);
+
+        assert_eq!(loaded.collab_server, "relay.test");
+        assert_eq!(loaded.collab_token, "s3cret");
+        assert_eq!(loaded.collab_payloads, [payload.clone()]);
+        let kept = loaded.collab_session.as_ref().expect("the session came back");
+        assert_eq!(kept, &session, "the whole session: its ids, its key and the payloads it handed out");
+        assert!(kept.private_key_pem.contains("PRIVATE KEY"), "with the key that can still read what the relay sends");
+        assert_eq!(kept.payloads[0].custom_data, "login-flow");
+
+
+        let hits = &loaded.collab_interactions;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw_request, ";; QUESTION\nlogin-flow.relay.test. IN A", "the message it carried");
+        assert_eq!(hits[0].raw_response, ";; ANSWER\nlogin-flow.relay.test. 60 IN A 203.0.113.1");
+        assert_eq!(hits[0].query_type, "A");
+        assert_eq!(hits[0].unique_id, session.payloads[0].unique_id);
+        assert_eq!(hits[0].comment, "Custom data: login-flow");
+    }
+
+    /// A project saved before any of this opens with no session and nothing collected, on
+    /// the relay a new project starts on.
+    #[test]
+    fn a_project_from_before_the_collaborator_session_opens_clean() {
+        let old = r#"{"version":1,"name":"o","match_replace":[],"history":[],"tasks":[],"organizer":[],
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#;
+        let f: ProjectFile = serde_json::from_str(old).expect("an older project file still reads");
+        assert!(f.collab_session.is_none());
+        assert!(f.collab_interactions.is_empty());
+
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
+        apply_all(&mut app, f);
+        assert_eq!(app.collab_server, crate::collab::DEFAULT_SERVER, "a file with no server named opens on the one a new project uses");
+        assert!(app.collab_session.is_none());
+        assert!(app.collab_token.is_empty());
     }
 
     #[cfg(unix)]

@@ -130,7 +130,9 @@ pub enum Job {
     SeqToken(String),
     SeqMiss(String),
     SeqDone,
-    CollabPoll(Result<Vec<crate::collab::CollabInteraction>, String>),
+    CollabPoll(Result<crate::collab::PollRun, String>),
+    /// A session registered in the background, ready for the interactions to come back to.
+    CollabSession(Result<crate::collab::OastSession, String>),
 }
 
 /// Tabs of the bottom drawer.
@@ -512,13 +514,32 @@ pub struct App {
 
     // collaborator
     pub collab_server: String,
+    /// Sent as the `Authorization` header to a relay that asks for one. Blank for the public
+    /// relays, which do not.
+    pub collab_token: String,
+    /// The session registered with the relay: the correlation id payloads are built from and
+    /// the key the interactions come back encrypted to.
+    pub collab_session: Option<crate::collab::OastSession>,
+    /// A session is being registered in the background.
+    pub collab_registering: bool,
+    /// Which interaction's message is open under the table, by its stable
+    /// [`crate::collab::CollabInteraction::id`] rather than by row, so that re-sorting or
+    /// filtering the table cannot move the selection onto a different interaction.
+    pub collab_sel: Option<usize>,
+    /// The protocol pill that is on, the search box, and the column the table is sorted by.
+    pub collab_view: crate::collab::CollabView,
+    /// Poll on a timer while the Collaborator tab is open. Switched off again by a failed
+    /// poll or registration, so a relay that has gone away is asked once, not forever.
+    pub collab_auto_poll: bool,
+    /// When the timer last started a poll. Not kept in a project: a timer is about this run
+    /// of the app, not about the work saved in it.
+    pub collab_last_poll: Option<std::time::Instant>,
     pub collab_payloads: Vec<String>,
     pub collab_interactions: Vec<crate::collab::CollabInteraction>,
     pub collab_polling: bool,
     pub collab_msg: String,
     pub collab_custom: String,
     pub collab_with_server: bool,
-    pub collab_counter: u64,
     pub event_log: crate::proxy::Events,
 
     // site map / logger selection
@@ -703,14 +724,20 @@ impl App {
             new_scan_urls: String::new(),
             new_scan_crawl: true,
             report_msg: String::new(),
-            collab_server: String::new(),
+            collab_server: crate::collab::DEFAULT_SERVER.into(),
+            collab_token: String::new(),
+            collab_session: None,
+            collab_registering: false,
+            collab_sel: None,
+            collab_view: crate::collab::CollabView::default(),
+            collab_auto_poll: false,
+            collab_last_poll: None,
             collab_payloads: Vec::new(),
             collab_interactions: Vec::new(),
             collab_polling: false,
             collab_msg: String::new(),
             collab_custom: String::new(),
             collab_with_server: true,
-            collab_counter: 0,
             event_log: events,
             history_sel: None,
             history_filter: crate::history::HistoryFilter::default(),
@@ -900,14 +927,57 @@ impl App {
         }
     }
 
+    /// Apply a session registered in the background (`Job::CollabSession`). A session made
+    /// meanwhile for another relay is left alone: the one that came back is for a server the
+    /// user has since moved off.
+    pub fn apply_collab_session(&mut self, res: Result<crate::collab::OastSession, String>) {
+        self.collab_registering = false;
+        match res {
+            Ok(session) => {
+                let same_server = crate::collab::server_host(&session.server) == crate::collab::server_host(&self.collab_server);
+                let same_id = self.collab_session.as_ref().is_none_or(|s| s.correlation_id == session.correlation_id);
+                if same_server && same_id {
+                    // the payloads handed out meanwhile belong to this session too
+                    let handed_out = self.collab_session.take().map(|s| s.payloads).unwrap_or_default();
+                    let mut session = session;
+                    for p in handed_out {
+                        if !session.payloads.iter().any(|q| q.unique_id == p.unique_id) {
+                            session.payloads.push(p);
+                        }
+                    }
+                    self.collab_session = Some(session);
+                }
+            }
+            Err(err) => {
+                crate::proxy::log_error(&self.event_log, format!("Collaborator registration failed: {err}"));
+                self.collab_msg = format!("Registration failed: {err}");
+                // a relay that cannot be registered with is not worth asking on a timer
+                self.collab_auto_poll = false;
+            }
+        }
+    }
+
     /// Apply the result of a background Collaborator poll (`Job::CollabPoll`).
-    pub fn apply_collab_poll(&mut self, res: Result<Vec<crate::collab::CollabInteraction>, String>) {
+    pub fn apply_collab_poll(&mut self, res: Result<crate::collab::PollRun, String>) {
         self.collab_polling = false;
+        let res = res.map(|run| {
+            if let Some(session) = run.session {
+                // what the run registered, or registered again, is the session from now on
+                self.collab_session = Some(session);
+            }
+            if !run.note.is_empty() {
+                crate::proxy::log_error(&self.event_log, format!("Collaborator: {}", run.note));
+            }
+            run.hits
+        });
         match res {
             Ok(hits) => {
                 let mut added = 0usize;
-                for hit in hits {
-                    if !self.collab_interactions.contains(&hit) {
+                for mut hit in hits {
+                    // what a relay reports has no id of its own, so an interaction already
+                    // taken in is recognised by everything else it said
+                    if !self.collab_interactions.iter().any(|h| h.is_same_event(&hit)) {
+                        hit.id = crate::collab::next_interaction_id(&self.collab_interactions);
                         self.collab_interactions.push(hit);
                         added += 1;
                     }
@@ -932,6 +1002,8 @@ impl App {
             Err(err) => {
                 crate::proxy::log_error(&self.event_log, format!("Collaborator poll failed: {err}"));
                 self.collab_msg = format!("Poll failed: {err}");
+                // stop the timer rather than report the same failure every ten seconds
+                self.collab_auto_poll = false;
             }
         }
     }
@@ -1015,6 +1087,9 @@ impl eframe::App for App {
                 }
                 Job::CollabPoll(res) => {
                     self.apply_collab_poll(res);
+                }
+                Job::CollabSession(res) => {
+                    self.apply_collab_session(res);
                 }
             }
         }
@@ -1176,8 +1251,9 @@ mod close_tests {
             protocol_details: "A query".into(),
             comment: "Custom data: test1".into(),
             payload: "abc.collab.test".into(),
+            ..Default::default()
         };
-        app.apply_collab_poll(Ok(vec![hit.clone()]));
+        app.apply_collab_poll(Ok(crate::collab::PollRun { session: None, hits: vec![hit.clone()], note: String::new() }));
         assert_eq!(app.collab_interactions.len(), 1);
         assert!(app.collab_msg.contains("Received 1 new interaction(s)"));
 
