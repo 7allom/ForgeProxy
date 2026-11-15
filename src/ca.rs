@@ -143,6 +143,22 @@ impl CertificateAuthority {
         }
     }
 
+    /// Load a CA already saved in `dir`, without making one. `Ok(None)` when none is saved
+    /// there, which is how a headless run tells "no CA, leave HTTPS tunnelled" from a real
+    /// error reading one that is.
+    pub fn load_saved(dir: &Path) -> Result<Option<Self>, CaError> {
+        let (cert_path, key_path) = (dir.join(CERT_FILE), dir.join(KEY_FILE));
+        match (cert_path.exists(), key_path.exists()) {
+            (false, false) => Ok(None),
+            (true, true) => Self::load(&cert_path, &key_path).map(Some),
+            _ => Err(CaError::Invalid(format!(
+                "{} and {} must both be present or both absent",
+                cert_path.display(),
+                key_path.display()
+            ))),
+        }
+    }
+
     fn load(cert_path: &Path, key_path: &Path) -> Result<Self, CaError> {
         let ca_cert_pem = std::fs::read_to_string(cert_path)?;
         let ca_key_pem = std::fs::read_to_string(key_path)?;

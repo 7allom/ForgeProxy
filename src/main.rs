@@ -56,7 +56,13 @@ use eframe::egui;
 use state::{App, Tab};
 
 fn main() -> eframe::Result<()> {
-    let opts = match cli::parse(std::env::args().skip(1)) {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // a subcommand (scan, intruder, repeat, proxy, sequence, decode) runs its own engine and
+    // ends the process; anything else is the flat flags, exactly as before
+    if let Some(code) = cli::run_subcommand(&raw_args, &mut std::io::stdout(), &mut std::io::stderr()) {
+        std::process::exit(code);
+    }
+    let opts = match cli::parse(raw_args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("{e}");

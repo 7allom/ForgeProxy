@@ -346,6 +346,22 @@ impl UserSettings {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         crate::paths::write_private(&dir.join(SETTINGS_FILE), json.as_bytes())
     }
+
+    /// The network options a request uses, built from these settings alone.
+    ///
+    /// The drawn app reaches the same thing through [`App::send_options`], which also folds in
+    /// a project's per-setting overrides; a run with no window behind it has only the global
+    /// settings, so it builds the options straight from them.
+    pub fn send_options(&self) -> crate::http::SendOptions {
+        crate::http::SendOptions {
+            timeout: std::time::Duration::from_secs(self.http_timeout_secs),
+            net: crate::upstream::NetConfig {
+                upstream: self.upstream_proxy.clone(),
+                verify_tls: self.protocol.verify_upstream_tls,
+            },
+            max_body: (self.max_body_kib as u64).saturating_mul(1024),
+        }
+    }
 }
 
 /// Per-project overrides of user settings. When a field is `Some`, the project uses that value

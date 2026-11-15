@@ -190,6 +190,47 @@ pub fn start(shared: Shared, addr: String) -> Result<(), String> {
 }
 
 impl Shared {
+    /// A proxy to run with no window behind it, from the saved settings.
+    ///
+    /// The listener, the Match & Replace rules and the capture all work exactly as they do in
+    /// the app; what the app keeps current each frame -- scope, limits, upstream proxy -- is set
+    /// once here from `settings` instead. Interception is left off, since there is no one to
+    /// release a held request. `history`/`next_id` are shared so the caller can keep what was
+    /// captured. The CA cache, when one is loaded, lets it open intercepted HTTPS.
+    pub fn headless(
+        history: History,
+        next_id: Arc<Mutex<usize>>,
+        rules: Vec<Rule>,
+        settings: &crate::state::UserSettings,
+        tls: Option<Arc<crate::ca::TlsConfigCache>>,
+    ) -> Self {
+        Shared {
+            history,
+            next_id,
+            capture_paused: Arc::new(AtomicBool::new(false)),
+            entry_limit: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_entries.max(1))),
+            pause_when_full: Arc::new(AtomicBool::new(settings.pause_when_full)),
+            intercept: Arc::new(AtomicBool::new(false)),
+            held: Arc::new(Mutex::new(Vec::new())),
+            rules: Arc::new(Mutex::new(rules)),
+            events: Arc::new(Mutex::new(Default::default())),
+            running: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            use_rules: Arc::new(AtomicBool::new(settings.intercept_rules)),
+            fix_length: Arc::new(AtomicBool::new(settings.fix_length)),
+            decrypt_https: Arc::new(AtomicBool::new(tls.is_some())),
+            intercept_only_in_scope: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(Mutex::new(crate::scope::TargetScope::default())),
+            tls_passthrough: Arc::new(Mutex::new(Vec::new())),
+            skip_extensions: Arc::new(Mutex::new(crate::rules::default_skip_extensions())),
+            read_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(settings.proxy_read_timeout_secs)),
+            upstream_proxy: Arc::new(Mutex::new(settings.upstream_proxy.clone())),
+            verify_upstream_tls: Arc::new(AtomicBool::new(settings.protocol.verify_upstream_tls)),
+            tls: Arc::new(Mutex::new(tls)),
+            upstream_tls: upstream_client_config(),
+        }
+    }
+
     /// The traffic store, as the recording path takes it.
     fn recorder(&self) -> crate::http::Recorder {
         crate::http::Recorder {

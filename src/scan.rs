@@ -374,6 +374,113 @@ fn contains_private_ip(s: &str) -> bool {
     false
 }
 
+/// How far a headless scan goes, so a command line can hold it in where the GUI leans on the
+/// fixed crawl limits.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanLimits {
+    /// Follow same-site links out to this depth. 0 audits only the start page.
+    pub depth: usize,
+    /// Stop once this many pages have been fetched, whatever the depth.
+    pub max_pages: usize,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        ScanLimits { depth: crate::rules::CRAWL_MAX_LINK_DEPTH, max_pages: crate::rules::CRAWL_MAX_UNIQUE_LOCATIONS }
+    }
+}
+
+/// One line of a scan's running account, for a caller to show as it arrives.
+pub type ScanProgress<'a> = dyn FnMut(&str) + 'a;
+
+/// What a headless scan found and fetched.
+pub struct ScanOutcome {
+    pub findings: Vec<Finding>,
+    /// Every exchange the scan made, oldest first, so a caller can keep them in a project.
+    pub history: Vec<crate::http::HttpEntry>,
+}
+
+/// Crawl (when `crawl` is set) and audit `start`, synchronously, with no app behind it.
+///
+/// This is the engine the scan task in the drawn app drives on a worker; run here on the
+/// calling thread so a command line can wait for it and act on what it found. Every page is
+/// audited with the passive checks, and the start page is then probed once with a benign
+/// marker for a reflected value and for a database error message. `progress` is called with a
+/// line for each request as it is made.
+pub fn run_scan(
+    start: &str,
+    crawl: bool,
+    limits: ScanLimits,
+    opts: &crate::http::SendOptions,
+    progress: &mut ScanProgress<'_>,
+) -> ScanOutcome {
+    let mut findings = Vec::new();
+    let mut history = Vec::new();
+    let mut next_id = 0usize;
+    let mut record = |method: &str, url: &str, r: &crate::http::SendResult, history: &mut Vec<crate::http::HttpEntry>| {
+        next_id += 1;
+        let (host, path) = crate::http::split_url(url);
+        history.push(crate::http::HttpEntry {
+            id: next_id,
+            tool: "Scanner".into(),
+            method: method.into(),
+            host,
+            path,
+            status: r.status.clone(),
+            length: r.length,
+            mime: r.mime.clone(),
+            request: format!("{method} {url}"),
+            response: r.raw_response(),
+            url: url.to_string(),
+            truncated: false,
+            time: crate::http::now_ms(),
+            elapsed_ms: 0,
+        });
+    };
+
+    let mut queue = std::collections::VecDeque::from([(start.to_string(), 0usize)]);
+    let mut seen = std::collections::HashSet::from([start.to_string()]);
+    let mut requests = 0usize;
+    while let Some((page, depth)) = queue.pop_front() {
+        if requests >= limits.max_pages {
+            break;
+        }
+        requests += 1;
+        let r = crate::http::send("GET", &page, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+        record("GET", &page, &r, &mut history);
+        let (host, path) = crate::http::split_url(&page);
+        findings.extend(passive_checks(&host, &path, page.starts_with("https"), &r.headers, &r.body));
+        progress(&format!("GET {page} — {}", r.status));
+        if crawl && depth < limits.depth {
+            for link in extract_links(&page, &r.body) {
+                if seen.insert(link.clone()) {
+                    queue.push_back((link, depth + 1));
+                }
+            }
+        }
+    }
+
+    // the start page, probed once with a value that is safe to send and unmistakable to find
+    let (host, path) = crate::http::split_url(start);
+    let marker = "fpx9q7z";
+    let probe = if start.contains('?') { format!("{start}&q={marker}") } else { format!("{start}?q={marker}") };
+    let pr = crate::http::send("GET", &probe, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+    record("GET", &probe, &pr, &mut history);
+    progress(&format!("GET {probe} — {}", pr.status));
+    if reflects_marker(&pr.body, marker) {
+        findings.push(Finding::new(INPUT_REFLECTED, Confidence::Certain, &host, &path,
+            "A value sent in the query string came back unchanged in the page. That is the first condition \
+             for reflected cross-site scripting; check how this value is encoded."));
+    }
+    if let Some(sig) = sql_error_signature(&pr.body) {
+        findings.push(Finding::new(SQL_INJECTION, Confidence::Tentative, &host, &path,
+            &format!("The page showed a database error message ({sig}). That can point to SQL injection and \
+                      also reveals details about the database.")));
+    }
+
+    ScanOutcome { findings: consolidate(findings), history }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

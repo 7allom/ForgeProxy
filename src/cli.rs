@@ -28,7 +28,17 @@ pub const USAGE: &str = "\
 ForgeProxy -- a web-testing workbench.
 
 Usage:
-  forgeproxy [options] [<project.forge>]
+  forgeproxy [<subcommand>] [options] [<project.forge>]
+
+Subcommands (each takes --help of its own):
+  scan       Crawl and audit a URL for issues.
+  intruder   Replay a request with a wordlist in its marked positions.
+  repeat     Send one raw request and show the response.
+  proxy      Run the intercepting proxy with no window, into a project.
+  sequence   Measure the randomness of a set of tokens.
+  decode     Run text through a chain of decoder transforms.
+
+With no subcommand, the flags below open the app or run an automation, as before:
 
 Opening:
   <project.forge>        Open this project (the same as --project).
@@ -779,6 +789,1103 @@ fn run_one_tool(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32
     let outcome = crate::tooling::run_tool_streaming(&tool, &setup.ctx, out);
     settle(opts, out, err, outcome, setup)
 }
+
+// ======================================================================
+// Subcommands: the core engines, each runnable with no window.
+//
+// A subcommand is the first argument when it names one of the engines below; everything after
+// it is that engine's own flags. With no subcommand the flat flags above still do exactly what
+// they did, so nothing that worked before this stops working.
+// ======================================================================
+
+/// The subcommand names this build knows.
+pub const SUBCOMMANDS: [&str; 6] = ["scan", "intruder", "repeat", "proxy", "sequence", "decode"];
+
+/// The subcommand `args` names, if its first argument is one. The caller runs it with
+/// [`run_subcommand`]; a first argument that is a flag or a bare path is not a subcommand, so
+/// the flat flags take it instead.
+pub fn subcommand_of(args: &[String]) -> Option<&str> {
+    args.first().and_then(|a| SUBCOMMANDS.into_iter().find(|s| s == a))
+}
+
+/// Run the subcommand `args` names, or return `None` when it names none (so the flat flags
+/// run instead). The config directory, when one is given, is set before the engine reads any
+/// settings, exactly as it is for the flat flags.
+pub fn run_subcommand(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Option<i32> {
+    let name = subcommand_of(args)?;
+    let rest = &args[1..];
+    // --config on a subcommand points settings.json the same way --config does at the top
+    if let Some(dir) = sub_config_dir(rest) {
+        std::env::set_var("FORGEPROXY_CONFIG_DIR", dir);
+    }
+    let code = match name {
+        "scan" => sub_scan(rest, out, err),
+        "intruder" => sub_intruder(rest, out, err),
+        "repeat" => sub_repeat(rest, out, err),
+        "proxy" => sub_proxy(rest, out, err),
+        "sequence" => sub_sequence(rest, out, err),
+        "decode" => sub_decode(rest, out, err),
+        _ => unreachable!("subcommand_of only returns a known name"),
+    };
+    Some(code)
+}
+
+/// The `--config` value among a subcommand's arguments, read on its own so it can be set
+/// before the engine starts. Either form of the flag is accepted.
+fn sub_config_dir(argv: &[String]) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        if let Some(v) = a.strip_prefix("--config=") {
+            return (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if a == "--config" {
+            return argv.get(i + 1).filter(|v| !v.starts_with("--")).map(PathBuf::from);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A subcommand's arguments, read once: valued flags, boolean flags, repeatable valued flags,
+/// and the bare arguments. An unknown flag or a missing value is refused, with a line saying
+/// which. Flag names are given with their `--` so error messages read as the user typed them.
+#[derive(Default)]
+struct SubArgs {
+    values: std::collections::HashMap<String, String>,
+    multi: std::collections::HashMap<String, Vec<String>>,
+    flags: std::collections::HashSet<String>,
+    positionals: Vec<String>,
+    help: bool,
+}
+
+impl SubArgs {
+    fn parse(argv: &[String], valued: &[&str], boolean: &[&str], repeatable: &[&str]) -> Result<Self, String> {
+        let mut me = SubArgs::default();
+        let mut i = 0;
+        while i < argv.len() {
+            let arg = &argv[i];
+            if arg == "-h" || arg == "--help" {
+                me.help = true;
+                i += 1;
+                continue;
+            }
+            if !arg.starts_with("--") {
+                me.positionals.push(arg.clone());
+                i += 1;
+                continue;
+            }
+            let (name, inline) = match arg.split_once('=') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                None => (arg.clone(), None),
+            };
+            let takes_value = valued.contains(&name.as_str()) || repeatable.contains(&name.as_str());
+            if takes_value {
+                let val = match inline {
+                    Some(v) => v,
+                    None => match argv.get(i + 1).filter(|v| !v.starts_with("--")) {
+                        Some(v) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        None => return Err(needs_value(&name, "a value")),
+                    },
+                };
+                if repeatable.contains(&name.as_str()) {
+                    me.multi.entry(name).or_default().push(val);
+                } else {
+                    me.values.insert(name, val);
+                }
+            } else if boolean.contains(&name.as_str()) {
+                if inline.is_some() {
+                    return Err(format!("{name} takes no value."));
+                }
+                me.flags.insert(name);
+            } else {
+                return Err(format!("{name} is not a flag this subcommand knows."));
+            }
+            i += 1;
+        }
+        Ok(me)
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+    fn has(&self, name: &str) -> bool {
+        self.flags.contains(name)
+    }
+    /// A `usize` flag, or the fallback when it was not given; `Err` when it was given as
+    /// something that is not a number.
+    fn number(&self, name: &str, fallback: usize) -> Result<usize, String> {
+        match self.value(name) {
+            None => Ok(fallback),
+            Some(v) => v.trim().parse().map_err(|_| format!("{name} wants a whole number, not {v:?}.")),
+        }
+    }
+}
+
+/// Read a raw request file, saying plainly when it cannot be read.
+fn read_text_file(path: &str, what: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("Couldn't read the {what} from {path}: {e}"))
+}
+
+/// Read a raw request from a file, with its line endings brought to `\n`.
+///
+/// The request parser and the section-sign markers both read `\n`, as the editor holds a
+/// request; a file saved with `\r\n` would otherwise leave the head and body joined (the
+/// blank line between them is not seen) and the body lost.
+fn read_request_file(path: &str) -> Result<String, String> {
+    read_text_file(path, "request").map(|t| t.replace("\r\n", "\n"))
+}
+
+/// The origin (`scheme://host[:port]`) a raw request is sent to: the one `--target` names, or
+/// the one the request's own Host header implies over plain HTTP.
+fn request_origin(raw: &str, target: Option<&str>) -> Result<String, String> {
+    if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
+        return Ok(crate::actions::origin_of(t));
+    }
+    match crate::actions::host_header(raw) {
+        Some(host) => Ok(format!("http://{}", host.trim())),
+        None => Err("No --target was given and the request has no Host header to take one from.".to_string()),
+    }
+}
+
+/// The full URL a raw request is sent to: its origin and the path on its request line.
+fn request_url(raw: &str, target: Option<&str>) -> Result<String, String> {
+    let origin = request_origin(raw, target)?;
+    let (_, path, _, _) = crate::actions::parse_raw_request(raw);
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    Ok(format!("{origin}{path}"))
+}
+
+/// A project to keep a run's traffic in: the one at `path` when it is there, else a new one.
+fn open_or_new_project(path: &str, name: &str) -> Result<crate::project::ProjectFile, String> {
+    if Path::new(path).exists() {
+        crate::project::read(path)
+    } else {
+        Ok(crate::project::ProjectFile::fresh(name))
+    }
+}
+
+/// Add captured exchanges to a project, numbering them after the ones already in it.
+fn append_history(file: &mut crate::project::ProjectFile, entries: Vec<crate::http::HttpEntry>) {
+    let mut next = file.history.iter().map(|e| e.id).max().unwrap_or(0);
+    for mut e in entries {
+        next += 1;
+        e.id = next;
+        file.history.push(e);
+    }
+}
+
+/// One exchange as a history entry, for keeping in a project.
+fn entry_of(tool: &str, method: &str, url: &str, request: String, r: &crate::http::SendResult) -> crate::http::HttpEntry {
+    let (host, path) = crate::http::split_url(url);
+    crate::http::HttpEntry {
+        id: 0,
+        tool: tool.into(),
+        method: method.into(),
+        host,
+        path,
+        status: r.status.clone(),
+        length: r.length,
+        mime: r.mime.clone(),
+        request,
+        response: r.raw_response(),
+        url: url.to_string(),
+        truncated: false,
+        time: crate::http::now_ms(),
+        elapsed_ms: 0,
+    }
+}
+
+// ---- scan ----------------------------------------------------------------
+
+const SCAN_USAGE: &str = "\
+forgeproxy scan <url> [options]
+
+Crawl and audit a URL, and report the issues found.
+
+Options:
+  --crawl                Follow same-site links, not just the one page.
+  --depth <n>            How far to follow links when crawling (default 4).
+  --max-pages <n>        Stop after this many pages (default 1500).
+  --project <path>       Keep the findings and the traffic in this .forge file.
+  --report <path>        Write the issues to this file (.xml for XML, else HTML).
+  --fail-on-findings     Exit 2 when the scan reports one issue or more.
+  --json                 Print the findings as JSON instead of a table.
+  --config <dir>         Read settings.json from here.
+";
+
+fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(
+        argv,
+        &["--depth", "--max-pages", "--project", "--report", "--config"],
+        &["--crawl", "--fail-on-findings", "--json"],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{SCAN_USAGE}");
+        return EXIT_OK;
+    }
+    let Some(url) = parsed.positionals.first() else {
+        let _ = writeln!(err, "scan needs a URL: forgeproxy scan <url>.");
+        return EXIT_FAILED;
+    };
+    let limits = crate::scan::ScanLimits {
+        depth: match parsed.number("--depth", crate::scan::ScanLimits::default().depth) {
+            Ok(n) => n,
+            Err(e) => return refuse(err, &e),
+        },
+        max_pages: match parsed.number("--max-pages", crate::scan::ScanLimits::default().max_pages) {
+            Ok(n) => n.max(1),
+            Err(e) => return refuse(err, &e),
+        },
+    };
+    let settings = settings_of_config(&parsed, err);
+    let opts = settings.send_options();
+    let crawl = parsed.has("--crawl");
+    let _ = writeln!(err, "{} {url}...", if crawl { "Crawling and auditing" } else { "Auditing" });
+    let outcome = crate::scan::run_scan(url, crawl, limits, &opts, &mut |line| {
+        let _ = writeln!(err, "  {line}");
+    });
+
+    if parsed.has("--json") {
+        let _ = writeln!(out, "{}", findings_json(&outcome.findings));
+    } else {
+        print_findings(out, &outcome.findings);
+    }
+
+    if let Some(path) = parsed.value("--project") {
+        let mut file = match open_or_new_project(path, url) {
+            Ok(f) => f,
+            Err(e) => return refuse(err, &e),
+        };
+        let mut all = file.imported_findings.clone();
+        all.extend(outcome.findings.iter().cloned());
+        file.imported_findings = crate::scan::consolidate(all);
+        append_history(&mut file, outcome.history);
+        if let Err(e) = crate::project::write(&file, path) {
+            return refuse(err, &format!("Couldn't save {path}: {e}"));
+        }
+        let _ = writeln!(err, "Saved {path}.");
+    }
+    if let Some(path) = parsed.value("--report") {
+        match crate::export::write_report(&outcome.findings, Path::new(path)) {
+            Ok(fmt) => {
+                let _ = writeln!(err, "Wrote the {} report to {path}.", fmt.extension().to_ascii_uppercase());
+            }
+            Err(e) => return refuse(err, &format!("Couldn't write {path}: {e}")),
+        }
+    }
+
+    if parsed.has("--fail-on-findings") && !outcome.findings.is_empty() {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    }
+}
+
+/// The findings, as a plain table on stdout.
+fn print_findings(out: &mut dyn Write, findings: &[crate::scan::Finding]) {
+    if findings.is_empty() {
+        let _ = writeln!(out, "No issues found.");
+        return;
+    }
+    for f in findings {
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}\t{}{}",
+            f.severity.label(),
+            f.confidence.label(),
+            f.name,
+            f.host,
+            f.path
+        );
+    }
+    let _ = writeln!(out, "{} {} found.", findings.len(), if findings.len() == 1 { "issue" } else { "issues" });
+}
+
+/// The findings as a JSON array.
+fn findings_json(findings: &[crate::scan::Finding]) -> String {
+    let items: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "severity": f.severity.label(),
+                "confidence": f.confidence.label(),
+                "name": f.name,
+                "host": f.host,
+                "path": f.path,
+                "type_index": f.type_index,
+                "detail": f.detail,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "findings": items })).unwrap_or_else(|_| "{}".into())
+}
+
+// ---- repeat --------------------------------------------------------------
+
+const REPEAT_USAGE: &str = "\
+forgeproxy repeat --req <file> [options]
+
+Send one raw HTTP request and show the response.
+
+Options:
+  --req <path>           The file holding the raw request to send. Required.
+  --target <url>         Where to send it; its path comes from the request line. Without
+                         this the request's Host header is used, over plain HTTP.
+  --follow-redirects     Follow 3xx responses to where they point.
+  --project <path>       Apply the project's Match & Replace rules, and keep the exchange in it.
+  --json                 Print a JSON envelope instead of the raw response.
+  --config <dir>         Read settings.json from here.
+";
+
+fn sub_repeat(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(
+        argv,
+        &["--req", "--target", "--project", "--config"],
+        &["--follow-redirects", "--json"],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{REPEAT_USAGE}");
+        return EXIT_OK;
+    }
+    let Some(req_path) = parsed.value("--req") else {
+        let _ = writeln!(err, "repeat needs --req <file>: the raw request to send.");
+        return EXIT_FAILED;
+    };
+    let raw = match read_request_file(req_path) {
+        Ok(t) => t,
+        Err(e) => return refuse(err, &e),
+    };
+    let settings = settings_of_config(&parsed, err);
+
+    // the project, when one is named, supplies the Match & Replace rules and keeps the exchange
+    let mut project = match parsed.value("--project") {
+        Some(path) => match open_or_new_project(path, "Repeater run") {
+            Ok(f) => Some((path.to_string(), f)),
+            Err(e) => return refuse(err, &e),
+        },
+        None => None,
+    };
+    let rules = project.as_ref().map(|(_, f)| f.match_replace.clone()).unwrap_or_default();
+
+    // the request as it is sent, after any rewrite rules act on it
+    let sent = crate::rewrite::apply_first_line_of(&rules, &raw);
+    let (method, _, headers, body) = crate::actions::parse_raw_request(&sent);
+    let htext = headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n");
+    let (htext, body) = crate::rewrite::apply(&rules, true, &htext, &body);
+    let hv: Vec<(String, String)> = htext
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let url = match request_url(&sent, parsed.value("--target")) {
+        Ok(u) => u,
+        Err(e) => return refuse(err, &e),
+    };
+
+    let _ = writeln!(err, "{method} {url}");
+    let started = std::time::Instant::now();
+    let mut r = crate::http::send(&method, &url, &hv, &body, parsed.has("--follow-redirects"), true, &settings.send_options());
+    let elapsed_ms = started.elapsed().as_millis();
+    if !rules.is_empty() {
+        let (rh, rb) = crate::rewrite::apply(&rules, false, &r.headers, &r.body);
+        r.headers = rh;
+        r.body = rb;
+    }
+
+    if parsed.has("--json") {
+        let env = serde_json::json!({
+            "status": r.status,
+            "status_code": crate::http::status_code(&r.status),
+            "length": r.length,
+            "mime": r.mime,
+            "elapsed_ms": elapsed_ms,
+            "error": r.error,
+            "response": r.raw_response(),
+        });
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&env).unwrap_or_else(|_| "{}".into()));
+    } else {
+        let _ = writeln!(out, "{}", r.raw_response());
+    }
+
+    if let Some((path, file)) = project.as_mut() {
+        append_history(file, vec![entry_of("Repeater", &method, &url, sent, &r)]);
+        if let Err(e) = crate::project::write(file, path) {
+            return refuse(err, &format!("Couldn't save {path}: {e}"));
+        }
+        let _ = writeln!(err, "Saved {path}.");
+    }
+    if r.error.is_some() {
+        EXIT_FAILED
+    } else {
+        EXIT_OK
+    }
+}
+
+// ---- intruder ------------------------------------------------------------
+
+const INTRUDER_USAGE: &str = "\
+forgeproxy intruder --req <file> --wordlist <file> [options]
+
+Replay a request with each word of a wordlist in its marked positions. Mark a position by
+wrapping it in section signs, like id=\u{00a7}1\u{00a7}.
+
+Options:
+  --req <path>           The raw request, with \u{00a7}\u{00a7} marks. Required.
+  --wordlist <path>      One payload per line. Required.
+  --target <url>         Where to send the requests. Without this the request's Host is used.
+  --battering-ram        Put the same word in every position at once, rather than one at a time.
+  --threads <n>          How many requests to keep in flight (default 10).
+  --match-status <csv>   Keep only these status codes or classes (e.g. 200,3xx).
+  --hide-length <csv>    Drop results whose length is one of these.
+  --project <path>       Keep the exchanges in this .forge file.
+  --json                 Print the results as JSON instead of a table.
+  --config <dir>         Read settings.json from here.
+";
+
+fn sub_intruder(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(
+        argv,
+        &["--req", "--wordlist", "--target", "--threads", "--match-status", "--hide-length", "--project", "--config"],
+        &["--battering-ram", "--json"],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{INTRUDER_USAGE}");
+        return EXIT_OK;
+    }
+    let (Some(req_path), Some(list_path)) = (parsed.value("--req"), parsed.value("--wordlist")) else {
+        let _ = writeln!(err, "intruder needs --req <file> and --wordlist <file>.");
+        return EXIT_FAILED;
+    };
+    let template = match read_request_file(req_path) {
+        Ok(t) => t,
+        Err(e) => return refuse(err, &e),
+    };
+    if crate::intruder::count_positions(&template) == 0 {
+        let _ = writeln!(err, "The request has no \u{00a7}\u{00a7} marks, so there is nothing to vary.");
+        return EXIT_FAILED;
+    }
+    let words: Vec<String> = match read_text_file(list_path, "wordlist") {
+        Ok(t) => t.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect(),
+        Err(e) => return refuse(err, &e),
+    };
+    if words.is_empty() {
+        let _ = writeln!(err, "The wordlist is empty.");
+        return EXIT_FAILED;
+    }
+    let kind = if parsed.has("--battering-ram") {
+        crate::intruder::AttackType::BatteringRam
+    } else {
+        crate::intruder::AttackType::Sniper
+    };
+    let threads = match parsed.number("--threads", 10) {
+        Ok(n) => n.max(1),
+        Err(e) => return refuse(err, &e),
+    };
+    let keep = match parse_status_filter(parsed.value("--match-status")) {
+        Ok(f) => f,
+        Err(e) => return refuse(err, &e),
+    };
+    let hide_len = match parse_len_filter(parsed.value("--hide-length")) {
+        Ok(f) => f,
+        Err(e) => return refuse(err, &e),
+    };
+
+    // the origin every request connects to, taken once from the target or the first request
+    let origin = match request_origin(&template, parsed.value("--target")) {
+        Ok(o) => o,
+        Err(e) => return refuse(err, &e),
+    };
+    let settings = settings_of_config(&parsed, err);
+    let plan = std::sync::Arc::new(crate::intruder::AttackPlan::new(kind, &template, &[words]));
+    let total = plan.len();
+    if total == 0 {
+        let _ = writeln!(err, "These payloads produce no requests for this attack type.");
+        return EXIT_FAILED;
+    }
+    let _ = writeln!(err, "{} requests against {origin}...", total);
+
+    // one row per request, gathered off the worker threads and then put back in order
+    let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<IntruderRow>::new()));
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opts = settings.send_options();
+    let mut handles = Vec::new();
+    for _ in 0..threads.min(total) {
+        let (plan, rows, next, origin, opts) = (plan.clone(), rows.clone(), next.clone(), origin.clone(), opts.clone());
+        handles.push(std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if i >= total {
+                break;
+            }
+            let (payload, raw) = plan.request(i);
+            let (method, path, _, body) = crate::actions::parse_raw_request(&raw);
+            let headers = crate::intruder::dispatch_headers(&raw, false);
+            let path = if path.starts_with('/') { path } else { format!("/{path}") };
+            let full = format!("{origin}{path}");
+            let started = std::time::Instant::now();
+            let r = crate::http::send(&method, &full, &headers, &body, false, true, &opts);
+            let elapsed_ms = started.elapsed().as_millis();
+            rows.lock().unwrap_or_else(|e| e.into_inner()).push(IntruderRow {
+                index: i + 1,
+                payload,
+                status: r.status.clone(),
+                status_code: crate::http::status_code(&r.status),
+                length: r.length,
+                elapsed_ms,
+                error: r.error.clone(),
+                method,
+                url: full,
+                request: raw,
+                result: r,
+            });
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let mut rows = std::sync::Arc::try_unwrap(rows).map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner())).unwrap_or_default();
+    rows.sort_by_key(|r| r.index);
+
+    let shown: Vec<&IntruderRow> = rows
+        .iter()
+        .filter(|r| keep.as_ref().map_or(true, |f| f.allows(r.status_code)))
+        .filter(|r| !hide_len.contains(&r.length))
+        .collect();
+
+    if parsed.has("--json") {
+        let items: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "index": r.index,
+                    "payload": r.payload,
+                    "status": r.status,
+                    "status_code": r.status_code,
+                    "length": r.length,
+                    "elapsed_ms": r.elapsed_ms,
+                    "error": r.error,
+                })
+            })
+            .collect();
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&serde_json::json!({ "results": items })).unwrap_or_else(|_| "{}".into()));
+    } else {
+        for r in &shown {
+            let _ = writeln!(out, "{}\t{}\t{}\t{}\t{} ms", r.index, r.payload, r.status, r.length, r.elapsed_ms);
+        }
+        let _ = writeln!(err, "{} of {} results shown.", shown.len(), rows.len());
+    }
+
+    if let Some(path) = parsed.value("--project") {
+        let mut file = match open_or_new_project(path, "Intruder run") {
+            Ok(f) => f,
+            Err(e) => return refuse(err, &e),
+        };
+        let entries = rows
+            .iter()
+            .map(|r| entry_of("Intruder", &r.method, &r.url, r.request.clone(), &r.result))
+            .collect();
+        append_history(&mut file, entries);
+        if let Err(e) = crate::project::write(&file, path) {
+            return refuse(err, &format!("Couldn't save {path}: {e}"));
+        }
+        let _ = writeln!(err, "Saved {path}.");
+    }
+    EXIT_OK
+}
+
+/// One finished Intruder request, before filtering.
+struct IntruderRow {
+    index: usize,
+    payload: String,
+    status: String,
+    status_code: Option<u16>,
+    length: usize,
+    elapsed_ms: u128,
+    error: Option<String>,
+    method: String,
+    url: String,
+    request: String,
+    result: crate::http::SendResult,
+}
+
+/// Which status codes a `--match-status` list keeps: exact codes and `Nxx` classes.
+struct StatusFilter {
+    codes: std::collections::HashSet<u16>,
+    classes: std::collections::HashSet<u16>,
+}
+
+impl StatusFilter {
+    fn allows(&self, code: Option<u16>) -> bool {
+        match code {
+            Some(c) => self.codes.contains(&c) || self.classes.contains(&(c / 100)),
+            // a request that never answered is kept only when nothing specific was asked for
+            None => self.codes.is_empty() && self.classes.is_empty(),
+        }
+    }
+}
+
+fn parse_status_filter(csv: Option<&str>) -> Result<Option<StatusFilter>, String> {
+    let Some(csv) = csv else { return Ok(None) };
+    let mut codes = std::collections::HashSet::new();
+    let mut classes = std::collections::HashSet::new();
+    for token in csv.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let lower = token.to_ascii_lowercase();
+        if let Some(digit) = lower.strip_suffix("xx") {
+            match digit.parse::<u16>() {
+                Ok(n) if (1..=5).contains(&n) => {
+                    classes.insert(n);
+                }
+                _ => return Err(format!("--match-status: {token:?} is not a status class like 2xx.")),
+            }
+        } else {
+            match token.parse::<u16>() {
+                Ok(n) => {
+                    codes.insert(n);
+                }
+                Err(_) => return Err(format!("--match-status: {token:?} is not a status code.")),
+            }
+        }
+    }
+    Ok(Some(StatusFilter { codes, classes }))
+}
+
+fn parse_len_filter(csv: Option<&str>) -> Result<std::collections::HashSet<usize>, String> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(csv) = csv {
+        for token in csv.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            match token.parse::<usize>() {
+                Ok(n) => {
+                    set.insert(n);
+                }
+                Err(_) => return Err(format!("--hide-length: {token:?} is not a length.")),
+            }
+        }
+    }
+    Ok(set)
+}
+
+// ---- proxy ---------------------------------------------------------------
+
+const PROXY_USAGE: &str = "\
+forgeproxy proxy --project <file> [options]
+
+Run the intercepting proxy with no window, writing what it captures to a project.
+
+Options:
+  --project <path>       The .forge file the captured traffic is written to. Required.
+  --bind <host>          The address to listen on (default from settings).
+  --port <n>             The port to listen on (default from settings).
+  --duration <secs>      Stop after this many seconds. Without it, runs until the process is
+                         ended, writing what it has every couple of seconds so nothing is lost.
+  --config <dir>         Read settings.json from here.
+";
+
+fn sub_proxy(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(
+        argv,
+        &["--project", "--bind", "--port", "--duration", "--config"],
+        &[],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{PROXY_USAGE}");
+        return EXIT_OK;
+    }
+    let Some(project_path) = parsed.value("--project").map(str::to_string) else {
+        let _ = writeln!(err, "proxy needs --project <file>: where the captured traffic is written.");
+        return EXIT_FAILED;
+    };
+    let settings = settings_of_config(&parsed, err);
+    let host = parsed.value("--bind").map(str::trim).filter(|h| !h.is_empty()).unwrap_or(settings.proxy_host.trim());
+    let port = match parsed.value("--port") {
+        None => settings.proxy_port.trim().to_string(),
+        Some(v) => match v.trim().parse::<u16>().ok().filter(|p| *p > 0) {
+            Some(p) => p.to_string(),
+            None => return refuse(err, &format!("--port wants a number from 1 to 65535, not {v:?}.")),
+        },
+    };
+    let duration = match parsed.value("--duration") {
+        None => None,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(s) => Some(std::time::Duration::from_secs(s)),
+            Err(_) => return refuse(err, &format!("--duration wants a number of seconds, not {v:?}.")),
+        },
+    };
+
+    // a store the listener records into and the flush reads out of
+    let history: crate::http::History = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let next_id = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    // the project may already exist; its rules drive Match & Replace and its traffic is kept
+    let mut file = match open_or_new_project(&project_path, "Proxy capture") {
+        Ok(f) => f,
+        Err(e) => return refuse(err, &e),
+    };
+    let rules = if file.match_replace.is_empty() { crate::rewrite::defaults() } else { file.match_replace.clone() };
+    let tls = load_ca_cache(&config_dir_of(&parsed));
+    let shared = crate::proxy::Shared::headless(history.clone(), next_id.clone(), rules, &settings, tls);
+    let addr = format!("{host}:{port}");
+    if let Err(e) = crate::proxy::start(shared, addr.clone()) {
+        return refuse(err, &e);
+    }
+    match &duration {
+        Some(d) => {
+            let _ = writeln!(err, "Listening on {addr} for {} s. Point a browser's proxy at it.", d.as_secs());
+        }
+        None => {
+            let _ = writeln!(err, "Listening on {addr}. End the process to stop; progress is saved as it arrives.");
+        }
+    }
+
+    // flush what has been captured into the project, so an ended process still leaves a file
+    let flush = |file: &mut crate::project::ProjectFile| -> Result<usize, String> {
+        let captured: Vec<crate::http::HttpEntry> =
+            history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| (**e).clone()).collect();
+        let n = captured.len();
+        file.history = captured;
+        crate::project::write(file, &project_path).map(|()| n)
+    };
+
+    let started = std::time::Instant::now();
+    let step = std::time::Duration::from_millis(500);
+    let mut last_flush = std::time::Instant::now();
+    loop {
+        std::thread::sleep(step);
+        if duration.map_or(false, |d| started.elapsed() >= d) {
+            break;
+        }
+        // with no deadline, write a snapshot every couple of seconds so a kill loses nothing
+        if duration.is_none() && last_flush.elapsed() >= std::time::Duration::from_secs(2) {
+            let _ = flush(&mut file);
+            last_flush = std::time::Instant::now();
+        }
+    }
+    match flush(&mut file) {
+        Ok(n) => {
+            let _ = writeln!(err, "Captured {n} {}; wrote {project_path}.", if n == 1 { "request" } else { "requests" });
+            EXIT_OK
+        }
+        Err(e) => refuse(err, &format!("Couldn't save {project_path}: {e}")),
+    }
+}
+
+/// The root CA's per-host certificate cache, when a CA is set up, so the headless proxy can
+/// open intercepted HTTPS. `None` when none is set up, which leaves HTTPS tunnelled unopened.
+fn load_ca_cache(dir: &Path) -> Option<std::sync::Arc<crate::ca::TlsConfigCache>> {
+    let ca = crate::ca::CertificateAuthority::load_saved(dir).ok()??;
+    Some(std::sync::Arc::new(crate::ca::TlsConfigCache::new(std::sync::Arc::new(ca))))
+}
+
+// ---- sequence ------------------------------------------------------------
+
+const SEQUENCE_USAGE: &str = "\
+forgeproxy sequence (--file <tokens> | --url <url> --extract <what> --count <n>) [options]
+
+Measure the randomness of a set of tokens.
+
+Options:
+  --file <path>          A file of tokens, one per line.
+  --url <url>            Collect tokens by requesting this address repeatedly.
+  --extract <what>       Where the token is in each response: a header name, or a regular
+                         expression with one capture group.
+  --count <n>            How many tokens to collect from --url.
+  --json                 Print the analysis as JSON instead of a summary.
+  --config <dir>         Read settings.json from here.
+";
+
+fn sub_sequence(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(
+        argv,
+        &["--file", "--url", "--extract", "--count", "--config"],
+        &["--json"],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{SEQUENCE_USAGE}");
+        return EXIT_OK;
+    }
+    let tokens: Vec<String> = if let Some(path) = parsed.value("--file") {
+        match read_text_file(path, "tokens") {
+            Ok(t) => crate::sequencer::tokens_from_text(&t),
+            Err(e) => return refuse(err, &e),
+        }
+    } else if let Some(url) = parsed.value("--url") {
+        let Some(extract) = parsed.value("--extract") else {
+            let _ = writeln!(err, "sequence --url needs --extract <header-or-regex> to find the token.");
+            return EXIT_FAILED;
+        };
+        let count = match parsed.number("--count", 0) {
+            Ok(0) => {
+                let _ = writeln!(err, "sequence --url needs --count <n>: how many tokens to collect.");
+                return EXIT_FAILED;
+            }
+            Ok(n) => n,
+            Err(e) => return refuse(err, &e),
+        };
+        match collect_tokens(url, extract, count, &settings_of_config(&parsed, err), err) {
+            Ok(t) => t,
+            Err(e) => return refuse(err, &e),
+        }
+    } else {
+        let _ = writeln!(err, "sequence needs either --file <tokens> or --url with --extract and --count.");
+        return EXIT_FAILED;
+    };
+
+    let Some(analysis) = crate::sequencer::analyze_tokens(&tokens) else {
+        let _ = writeln!(err, "No tokens to analyse ({} collected).", tokens.len());
+        return EXIT_FAILED;
+    };
+    if parsed.has("--json") {
+        let effective: f64 = analysis.per_char_entropy.iter().sum();
+        let env = serde_json::json!({
+            "sample_count": analysis.sample_count,
+            "min_len": analysis.min_len,
+            "max_len": analysis.max_len,
+            "entropy_bits_per_char": analysis.overall_entropy,
+            "max_possible_bits_per_char": analysis.max_possible_entropy,
+            "effective_entropy_bits": effective,
+            "fips_monobit_passed": analysis.fips_monobit_passed,
+            "fips_applicable": analysis.fips_applicable,
+            "detected_format": format!("{:?}", analysis.detected_format),
+        });
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&env).unwrap_or_else(|_| "{}".into()));
+    } else {
+        let _ = write!(out, "{}", crate::sequencer::analyse(&tokens));
+    }
+    EXIT_OK
+}
+
+/// Collect `count` tokens from `url`, pulling one out of each response by `extract` -- a header
+/// name, or a regular expression (anything with a capture group) read against the whole
+/// response.
+fn collect_tokens(
+    url: &str,
+    extract: &str,
+    count: usize,
+    settings: &crate::state::UserSettings,
+    err: &mut dyn Write,
+) -> Result<Vec<String>, String> {
+    let location = if extract.contains('(') {
+        crate::sequencer::TokenLocation::Regex(extract.to_string())
+    } else {
+        crate::sequencer::TokenLocation::Header(extract.to_string())
+    };
+    let opts = settings.send_options();
+    let mut tokens = Vec::new();
+    for n in 0..count {
+        let r = crate::http::send("GET", url, &[], "", false, true, &opts);
+        if let Some(tok) = crate::sequencer::extract_token(&location, &r.raw_response()) {
+            tokens.push(tok);
+        }
+        if (n + 1) % 25 == 0 || n + 1 == count {
+            let _ = writeln!(err, "  collected {} of {count}...", tokens.len());
+        }
+    }
+    if tokens.is_empty() {
+        return Err(format!("No token matched {extract:?} in any of the {count} responses."));
+    }
+    Ok(tokens)
+}
+
+// ---- decode --------------------------------------------------------------
+
+const DECODE_USAGE: &str = "\
+forgeproxy decode <transforms> [options]
+
+Run text through a comma-separated chain of transforms, left to right.
+
+Transforms: for each of url, html, base64, base64url, ascii-hex, hex, octal, binary, gzip
+there is a <name>-encode and a <name>-decode; and jwt-decode reads a JWT as JSON. For example:
+  url-decode,base64-decode,jwt-decode
+  gzip-encode,base64-encode,url-encode
+
+Options:
+  --input <text>         The text to transform. Without --input or --file, reads stdin.
+  --file <path>          Read the input from this file instead.
+  --json                 Wrap the result in a JSON envelope.
+";
+
+fn sub_decode(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let parsed = match SubArgs::parse(argv, &["--input", "--file"], &["--json"], &[]) {
+        Ok(p) => p,
+        Err(e) => return refuse(err, &e),
+    };
+    if parsed.help {
+        let _ = write!(out, "{DECODE_USAGE}");
+        return EXIT_OK;
+    }
+    let Some(chain) = parsed.positionals.first() else {
+        let _ = writeln!(err, "decode needs a transform chain: forgeproxy decode url-decode,base64-decode.");
+        return EXIT_FAILED;
+    };
+    let transforms = match parse_transforms(chain) {
+        Ok(t) => t,
+        Err(e) => return refuse(err, &e),
+    };
+    let input: Vec<u8> = if let Some(text) = parsed.value("--input") {
+        text.as_bytes().to_vec()
+    } else if let Some(path) = parsed.value("--file") {
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => return refuse(err, &format!("Couldn't read {path}: {e}")),
+        }
+    } else {
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf) {
+            return refuse(err, &format!("Couldn't read the input: {e}"));
+        }
+        buf
+    };
+
+    let data = match run_chain(&transforms, input) {
+        Ok(d) => d,
+        Err(e) => return refuse(err, &e),
+    };
+
+    if parsed.has("--json") {
+        let env = serde_json::json!({
+            "transforms": transforms.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            "output": String::from_utf8_lossy(&data),
+            "output_base64": crate::codec::base64_encode(&data, false, true),
+        });
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&env).unwrap_or_else(|_| "{}".into()));
+    } else {
+        let _ = out.write_all(&data);
+    }
+    EXIT_OK
+}
+
+/// One step of a decode chain.
+#[derive(Clone, Copy)]
+enum Transform {
+    /// A codec, run forwards (encode) or backwards (decode).
+    Codec(crate::decoder_ops::Codec, bool),
+    /// A JWT read into its header and payload JSON.
+    JwtDecode,
+}
+
+impl Transform {
+    fn name(self) -> String {
+        match self {
+            Transform::Codec(c, encode) => format!("{}-{}", codec_slug(c), if encode { "encode" } else { "decode" }),
+            Transform::JwtDecode => "jwt-decode".to_string(),
+        }
+    }
+}
+
+/// The command-line slug for a codec: its label, lowered, with the spaces gone.
+fn codec_slug(c: crate::decoder_ops::Codec) -> &'static str {
+    use crate::decoder_ops::Codec;
+    match c {
+        Codec::Url => "url",
+        Codec::Html => "html",
+        Codec::Base64 => "base64",
+        Codec::Base64Url => "base64url",
+        Codec::AsciiHex => "ascii-hex",
+        Codec::Hex => "hex",
+        Codec::Octal => "octal",
+        Codec::Binary => "binary",
+        Codec::Gzip => "gzip",
+    }
+}
+
+/// Read a comma-separated chain into transforms, naming the first one that is not a transform.
+fn parse_transforms(chain: &str) -> Result<Vec<Transform>, String> {
+    let mut out = Vec::new();
+    for raw in chain.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(transform_of(raw).ok_or_else(|| {
+            format!("{raw:?} is not a transform. Each is a <codec>-encode or <codec>-decode, or jwt-decode.")
+        })?);
+    }
+    if out.is_empty() {
+        return Err("the transform chain is empty.".to_string());
+    }
+    Ok(out)
+}
+
+/// Run `input` through a chain of transforms, naming the step that could not be done.
+fn run_chain(transforms: &[Transform], input: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut data = input;
+    for (n, t) in transforms.iter().enumerate() {
+        data = apply_transform(*t, &data).map_err(|e| format!("step {} ({}): {e}", n + 1, t.name()))?;
+    }
+    Ok(data)
+}
+
+fn transform_of(name: &str) -> Option<Transform> {
+    if name == "jwt-decode" {
+        return Some(Transform::JwtDecode);
+    }
+    let (slug, encode) = if let Some(s) = name.strip_suffix("-encode") {
+        (s, true)
+    } else {
+        (name.strip_suffix("-decode")?, false)
+    };
+    let codec = crate::decoder_ops::Codec::ALL.into_iter().find(|c| codec_slug(*c) == slug)?;
+    Some(Transform::Codec(codec, encode))
+}
+
+fn apply_transform(t: Transform, data: &[u8]) -> Result<Vec<u8>, String> {
+    match t {
+        Transform::Codec(c, true) => Ok(crate::decoder_ops::encode(c, data)),
+        Transform::Codec(c, false) => {
+            crate::decoder_ops::decode(c, data).ok_or_else(|| format!("the input is not valid {}", c.label()))
+        }
+        Transform::JwtDecode => {
+            let token = String::from_utf8_lossy(data);
+            let parts = crate::codec::parse_jwt_detailed(&token)?;
+            let value = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap_or(serde_json::Value::Null);
+            let combined = serde_json::json!({ "header": value(&parts.header_json), "payload": value(&parts.payload_json) });
+            Ok(serde_json::to_string_pretty(&combined).unwrap_or_default().into_bytes())
+        }
+    }
+}
+
+/// Settings for a subcommand, from `--config` (already set into the environment) or the usual
+/// place, warning on `err` if the file could not be read.
+fn settings_of_config(parsed: &SubArgs, err: &mut dyn Write) -> crate::state::UserSettings {
+    match crate::state::UserSettings::load(&config_dir_of(parsed)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            crate::state::UserSettings::default()
+        }
+    }
+}
+
+/// The configuration directory a subcommand uses: the one `--config` names, else the usual
+/// one. Read from the parsed flags rather than the environment, so a run acts on exactly the
+/// directory it was told to whatever else shares the process.
+fn config_dir_of(parsed: &SubArgs) -> PathBuf {
+    parsed.value("--config").map(PathBuf::from).unwrap_or_else(crate::ca::config_dir)
+}
+
+/// Say why a subcommand could not do what was asked, and give back the failure code.
+fn refuse(err: &mut dyn Write, message: &str) -> i32 {
+    let _ = writeln!(err, "{message}");
+    EXIT_FAILED
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1604,6 +2711,409 @@ mod tests {
         assert_eq!(code, Some(EXIT_OK), "err: {err}");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, ["Nightly sweep\t2 steps", "Header survey\t1 step"], "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod subcommand_tests {
+    use super::*;
+    use crate::test_utils::assert_table;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// Run a subcommand engine with these argument strings, returning (exit, stdout, stderr).
+    fn run(f: fn(&[String], &mut dyn Write, &mut dyn Write) -> i32, args: &[&str]) -> (i32, String, String) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = f(&argv, &mut out, &mut err);
+        (code, String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// A directory of this test's own.
+    fn work_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forge-sub-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a place to work");
+        dir
+    }
+
+    /// A local HTTP server that answers each request with `handler(path, body) -> (code, body)`,
+    /// serving on a loopback port for the life of the test. Returns its origin URL.
+    fn serve(handler: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let Ok(peek) = stream.try_clone() else { continue };
+                let mut reader = BufReader::new(peek);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let path = head.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("/").to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; clen];
+                let _ = reader.read_exact(&mut body);
+                let (code, rbody) = handler(&path, &String::from_utf8_lossy(&body));
+                let reason = if code == 200 { "OK" } else { "Not Found" };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    rbody.len(),
+                    rbody
+                );
+                let mut stream = stream;
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        origin
+    }
+
+    // ---- parsing and routing --------------------------------------------
+
+    /// A subcommand is the first argument when it names one; a flag or a path is not one, so
+    /// the flat flags keep it.
+    #[test]
+    fn a_leading_subcommand_name_routes_and_nothing_else_does() {
+        for name in SUBCOMMANDS {
+            assert_eq!(subcommand_of(&[name.to_string()]), Some(name));
+            assert_eq!(subcommand_of(&[name.to_string(), "--help".into()]), Some(name));
+        }
+        for not_a_sub in [vec!["--light"], vec!["triage.forge"], vec!["--run-plan", "scan"], vec![]] {
+            let argv: Vec<String> = not_a_sub.iter().map(|s| s.to_string()).collect();
+            assert_eq!(subcommand_of(&argv), None, "{not_a_sub:?} is not a subcommand");
+        }
+        // the top-level usage names every subcommand it routes
+        for name in SUBCOMMANDS {
+            assert!(USAGE.contains(name), "the usage text lists {name:?}");
+        }
+    }
+
+    /// Every subcommand prints its own help and stops, touching no network.
+    #[test]
+    fn each_subcommand_has_its_own_help() {
+        let subs: [(&str, fn(&[String], &mut dyn Write, &mut dyn Write) -> i32); 6] = [
+            ("scan", sub_scan),
+            ("intruder", sub_intruder),
+            ("repeat", sub_repeat),
+            ("proxy", sub_proxy),
+            ("sequence", sub_sequence),
+            ("decode", sub_decode),
+        ];
+        assert_table!(subs, |idx, (name, f)| {
+            let (code, out, err) = run(f, &["--help"]);
+            assert_eq!(code, EXIT_OK, "case #{idx}: {name} --help ends well");
+            assert!(out.contains(&format!("forgeproxy {name}")), "case #{idx}: {name} prints its own usage: {out}");
+            assert!(err.is_empty(), "case #{idx}: {name} --help says nothing on the error stream");
+        });
+        // an unknown flag on a subcommand is refused, naming it
+        let (code, _, err) = run(sub_decode, &["url-decode", "--nope"]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("--nope is not a flag"), "{err}");
+    }
+
+    /// The flat flags still parse exactly as before, subcommands or no subcommands.
+    #[test]
+    fn the_flat_flags_are_untouched() {
+        // a positional project path is still that, and is not mistaken for a subcommand
+        let o = parse(vec!["triage.forge".into()]).expect("reads");
+        assert_eq!(o.project.as_deref(), Some("triage.forge"));
+        // every top-level flag the earlier work added still reads
+        let o = parse(vec!["--run-plan".into(), "Nightly".into(), "--target".into(), "http://h/".into()]).expect("reads");
+        assert_eq!(o.run_plan.as_deref(), Some("Nightly"));
+        assert_eq!(o.target.as_deref(), Some("http://h/"));
+    }
+
+    // ---- decode ---------------------------------------------------------
+
+    /// Transform chains run left to right, encode and decode are inverses, and an unknown
+    /// transform (or a decode of input that does not fit) is reported with the step.
+    #[test]
+    fn decode_runs_transform_chains_matrix() {
+        let chain = |c: &str, input: &str| -> Result<String, String> {
+            let ts = parse_transforms(c)?;
+            run_chain(&ts, input.as_bytes().to_vec()).map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        // base64 of "hello" is "aGVsbG8="; url-decode first turns %3D into =
+        assert_eq!(chain("url-decode,base64-decode", "aGVsbG8%3D").unwrap(), "hello");
+        // a round trip returns the input
+        assert_eq!(chain("base64-encode,base64-decode", "round trip").unwrap(), "round trip");
+        assert_eq!(chain("url-encode,url-decode", "a b&c=d").unwrap(), "a b&c=d");
+        // gzip-encode then base64-encode is a pipeline that reverses cleanly
+        let packed = chain("gzip-encode,base64-encode", "compress me").unwrap();
+        assert_eq!(chain("base64-decode,gzip-decode", &packed).unwrap(), "compress me");
+        // an unknown transform is refused, naming it
+        let e = chain("url-decode,frobnicate", "x").unwrap_err();
+        assert!(e.contains("\"frobnicate\" is not a transform"), "{e}");
+        // a decode that cannot be done names the step and what it expected (plain text is
+        // not a gzip stream, so gzip-decode cannot make anything of it)
+        let e = chain("gzip-decode", "not compressed").unwrap_err();
+        assert!(e.contains("step 1") && e.to_lowercase().contains("gzip"), "{e}");
+    }
+
+    /// decode reads its input from --input or --file, and writes the result to stdout; --json
+    /// wraps it with the chain that produced it.
+    #[test]
+    fn decode_reads_input_and_writes_output() {
+        let (code, out, _) = run(sub_decode, &["base64-decode", "--input", "aGVsbG8="]);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "hello");
+
+        let dir = work_dir("decode-file");
+        let path = dir.join("in.txt");
+        std::fs::write(&path, "aGVsbG8=").unwrap();
+        let (code, out, _) = run(sub_decode, &["base64-decode", "--file", path.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "hello");
+
+        let (code, out, _) = run(sub_decode, &["base64-decode", "--input", "aGVsbG8=", "--json"]);
+        assert_eq!(code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["output"], "hello");
+        assert_eq!(v["transforms"][0], "base64-decode");
+
+        // a JWT is read into its header and payload
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMiLCJuYW1lIjoiQSJ9.sig";
+        let (code, out, _) = run(sub_decode, &["jwt-decode", "--input", jwt]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("\"sub\": \"123\"") && out.contains("HS256"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- sequence -------------------------------------------------------
+
+    /// A predictable set of tokens measures as low entropy and fails the bitstream test; a
+    /// high-entropy set measures near the maximum and passes.
+    #[test]
+    fn sequence_tells_predictable_tokens_from_random_ones() {
+        let dir = work_dir("sequence");
+        let low = dir.join("low.txt");
+        let high = dir.join("high.txt");
+        // counting in hex: each token differs from the last in only its lowest digits
+        std::fs::write(&low, (0..200).map(|i| format!("{i:032x}")).collect::<Vec<_>>().join("\n")).unwrap();
+        // a cheap but well-mixed sequence: a linear congruential generator, hex-encoded
+        let mut x: u128 = 0x1234_5678_9abc_def0;
+        let hi: Vec<String> = (0..200)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                format!("{x:032x}")
+            })
+            .collect();
+        std::fs::write(&high, hi.join("\n")).unwrap();
+
+        let analyse = |p: &std::path::Path| -> serde_json::Value {
+            let (code, out, _) = run(sub_sequence, &["--file", p.to_str().unwrap(), "--json"]);
+            assert_eq!(code, EXIT_OK, "{out}");
+            serde_json::from_str(&out).expect("json")
+        };
+        let lo = analyse(&low);
+        let hi = analyse(&high);
+        assert_eq!(lo["sample_count"], 200);
+        let lo_bits = lo["entropy_bits_per_char"].as_f64().unwrap();
+        let hi_bits = hi["entropy_bits_per_char"].as_f64().unwrap();
+        assert!(lo_bits < hi_bits, "predictable ({lo_bits}) is less random than mixed ({hi_bits})");
+        assert!(hi_bits > 3.5, "a well-mixed hex sample is near 4 bits per character: {hi_bits}");
+
+        // the text summary is served too
+        let (code, out, _) = run(sub_sequence, &["--file", high.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(out.contains("Tokens analysed: 200"), "{out}");
+
+        // neither source given is an error that says what is needed
+        let (code, _, err) = run(sub_sequence, &[]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("--file") && err.contains("--url"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- repeat ---------------------------------------------------------
+
+    /// repeat sends a raw request and shows the response, as text and as a JSON envelope, and
+    /// keeps the exchange in a project when one is named.
+    #[test]
+    fn repeat_sends_a_request_and_persists_it() {
+        let origin = serve(|path, _| (200, format!("you asked for {path}")));
+        let dir = work_dir("repeat");
+        let req = dir.join("req.txt");
+        std::fs::write(&req, "GET /hello HTTP/1.1\r\nHost: h.test\r\n\r\n").unwrap();
+
+        let (code, out, _) = run(sub_repeat, &["--req", req.to_str().unwrap(), "--target", &origin]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("200 OK") && out.contains("you asked for /hello"), "{out}");
+
+        let project = dir.join("r.forge");
+        let (code, out, _) = run(
+            sub_repeat,
+            &["--req", req.to_str().unwrap(), "--target", &origin, "--json", "--project", project.to_str().unwrap()],
+        );
+        assert_eq!(code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["status_code"], 200);
+        assert!(v["response"].as_str().unwrap().contains("you asked for /hello"));
+        let saved = crate::project::read(&project.display().to_string()).expect("the project");
+        assert_eq!(saved.history.len(), 1);
+        assert_eq!(saved.history[0].tool, "Repeater");
+        assert_eq!(saved.history[0].path, "/hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- intruder -------------------------------------------------------
+
+    /// intruder substitutes each word into the marked position, filters by status and length,
+    /// and records the exchanges.
+    #[test]
+    fn intruder_replays_filters_and_persists() {
+        // the server says 200 for the word "admin", 404 for anything else, echoing the body
+        let origin = serve(|_, body| if body.contains("admin") { (200, "welcome".into()) } else { (404, "no".into()) });
+        let dir = work_dir("intruder");
+        let req = dir.join("req.txt");
+        // the body is exactly the marked position, so each word becomes the whole body
+        std::fs::write(&req, "POST /login HTTP/1.1\r\nHost: h.test\r\nContent-Length: 1\r\n\r\n\u{00a7}x\u{00a7}").unwrap();
+        let words = dir.join("words.txt");
+        std::fs::write(&words, "admin\nguest\nroot\n").unwrap();
+
+        // all three, as JSON
+        let (code, out, _) = run(
+            sub_intruder,
+            &["--req", req.to_str().unwrap(), "--wordlist", words.to_str().unwrap(), "--target", &origin, "--json"],
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let results = v["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "one per word");
+        let admin = results.iter().find(|r| r["payload"] == "admin").unwrap();
+        assert_eq!(admin["status_code"], 200, "the substitution reached the body");
+        assert!(results.iter().any(|r| r["payload"] == "guest" && r["status_code"] == 404));
+
+        // keep only the 200s
+        let (code, out, _) = run(
+            sub_intruder,
+            &["--req", req.to_str().unwrap(), "--wordlist", words.to_str().unwrap(), "--target", &origin, "--match-status", "200"],
+        );
+        assert_eq!(code, EXIT_OK);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 1, "only the matching one: {out}");
+        assert!(lines[0].contains("admin") && lines[0].contains("200 OK"), "{out}");
+
+        // hide the length the 404s share ("no" -> 2)
+        let (code, out, _) = run(
+            sub_intruder,
+            &["--req", req.to_str().unwrap(), "--wordlist", words.to_str().unwrap(), "--target", &origin, "--hide-length", "2"],
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(out.lines().all(|l| l.contains("admin")), "the 404s were hidden by length: {out}");
+
+        // and the exchanges are kept
+        let project = dir.join("i.forge");
+        let (code, _, _) = run(
+            sub_intruder,
+            &["--req", req.to_str().unwrap(), "--wordlist", words.to_str().unwrap(), "--target", &origin, "--project", project.to_str().unwrap()],
+        );
+        assert_eq!(code, EXIT_OK);
+        let saved = crate::project::read(&project.display().to_string()).expect("the project");
+        assert_eq!(saved.history.len(), 3);
+        assert!(saved.history.iter().all(|e| e.tool == "Intruder"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- scan -----------------------------------------------------------
+
+    /// scan audits a page, reporting the issues it finds, writing a report and a project, and
+    /// ending with code 2 when asked to fail on findings.
+    #[test]
+    fn scan_detects_reports_and_sets_the_exit_code() {
+        // a directory-listing page that reflects the query value: two findings at least
+        let origin = serve(|path, _| {
+            let q = path.split("q=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
+            (200, format!("<title>Index of /files</title>reflected:{q}"))
+        });
+        let dir = work_dir("scan");
+        let report = dir.join("out").join("report.xml");
+        let project = dir.join("s.forge");
+        let url = format!("{origin}/files/");
+
+        let (code, out, _) = run(
+            sub_scan,
+            &[&url, "--report", report.to_str().unwrap(), "--project", project.to_str().unwrap()],
+        );
+        assert_eq!(code, EXIT_OK, "without --fail-on-findings a scan that found things still ends 0: {out}");
+        assert!(out.contains("Directory listing"), "{out}");
+        assert!(out.contains("reflected") || out.contains("Input returned"), "{out}");
+
+        let xml = std::fs::read_to_string(&report).expect("the report");
+        assert!(xml.starts_with("<?xml") && xml.contains("Directory listing"), "{xml}");
+        let saved = crate::project::read(&project.display().to_string()).expect("the project");
+        assert!(!saved.imported_findings.is_empty(), "findings kept");
+        assert!(!saved.history.is_empty(), "traffic kept");
+
+        // the JSON shape, and the exit code when told to fail on findings
+        let (code, out, _) = run(sub_scan, &[&url, "--json", "--fail-on-findings"]);
+        assert_eq!(code, EXIT_FINDINGS, "fail-on-findings turns a finding into exit 2");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["name"] == "Directory listing"), "{out}");
+
+        // a scan with no URL says so
+        let (code, _, err) = run(sub_scan, &["--json"]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("needs a URL"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- proxy ----------------------------------------------------------
+
+    /// proxy runs for its duration with no window, forwards a request to a real server, and
+    /// writes what it captured to the project.
+    #[test]
+    fn proxy_captures_a_request_and_writes_the_project() {
+        let origin = serve(|path, _| (200, format!("served {path}")));
+        let host_port = origin.trim_start_matches("http://").to_string();
+        let dir = work_dir("proxy");
+        let project = dir.join("cap.forge");
+
+        // the proxy runs on its own thread so this one can drive a request through it
+        let proxy_port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let project_arg = project.display().to_string();
+        let handle = std::thread::spawn(move || {
+            let argv: Vec<String> = ["--port", &proxy_port.to_string(), "--project", &project_arg, "--duration", "2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            sub_proxy(&argv, &mut out, &mut err)
+        });
+
+        // give the listener a moment, then send an absolute-form request as a browser's proxy would
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", proxy_port)) {
+            let req = format!("GET http://{host_port}/proxied HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(req.as_bytes());
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        }
+
+        let code = handle.join().expect("the proxy thread");
+        assert_eq!(code, EXIT_OK);
+        let saved = crate::project::read(&project.display().to_string()).expect("the project was written");
+        assert!(saved.history.iter().any(|e| e.path == "/proxied"), "the proxied request was captured: {:?}",
+            saved.history.iter().map(|e| e.path.clone()).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
