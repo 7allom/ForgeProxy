@@ -34,6 +34,7 @@ rand = "0.10.3"
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 2
