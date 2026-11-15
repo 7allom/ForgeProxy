@@ -4,7 +4,7 @@
 //! Standard vulnerability audit issue taxonomy and scanner definitions.
 
 /// AuditIssueSeverity: HIGH, MEDIUM, LOW, INFORMATION, FALSE_POSITIVE.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     FalsePositive,
     Info,
@@ -23,6 +23,18 @@ impl Severity {
             Severity::FalsePositive => "False positive",
         }
     }
+    /// A severity by the name a program writes in a findings document, however it is cased.
+    /// Anything else is taken as informational rather than refused, so one unfamiliar word
+    /// does not cost the whole finding.
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            _ => Severity::Info,
+        }
+    }
+
     /// Colors from LightTheme.json ui.issue.* (see MECHANICS.md).
     pub fn rgb(&self) -> (u8, u8, u8) {
         match self {
@@ -36,7 +48,7 @@ impl Severity {
 }
 
 /// AuditIssueConfidence: CERTAIN, FIRM, TENTATIVE.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Confidence {
     Certain,
     Firm,
@@ -44,6 +56,16 @@ pub enum Confidence {
 }
 
 impl Confidence {
+    /// A confidence by the name a program writes in a findings document, however it is cased.
+    /// Anything else is taken as firm, which is where an imported finding starts.
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "certain" => Confidence::Certain,
+            "tentative" => Confidence::Tentative,
+            _ => Confidence::Firm,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Confidence::Certain => "Certain",
@@ -78,7 +100,7 @@ pub const CACHEABLE_HTTPS: (u32, &str, Severity) = (0x0070_0100, "Cacheable HTTP
 pub const HSTS_NOT_ENFORCED: (u32, &str, Severity) =
     (0x0100_0300, "Strict transport security not enforced", Severity::Low);
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     pub type_index: u32,
     pub name: String,
@@ -87,6 +109,37 @@ pub struct Finding {
     pub host: String,
     pub path: String,
     pub detail: String,
+    /// What to do about it. The passive checks carry their advice in `detail`; a finding
+    /// reported by a program may give it separately. Absent from older project files.
+    #[serde(default)]
+    pub remediation: String,
+    /// The exchange the finding was reported against, when there is one to show. Kept as
+    /// text rather than as a reference, because a program may report a request that was
+    /// never recorded here.
+    #[serde(default)]
+    pub request: String,
+    #[serde(default)]
+    pub response: String,
+}
+
+/// A finding with nothing said about it: the shape a parser fills in field by field. Not a
+/// finding worth showing on its own -- `name` is empty, which is what every path that makes
+/// one checks for.
+impl Default for Finding {
+    fn default() -> Self {
+        Finding {
+            type_index: 0,
+            name: String::new(),
+            severity: Severity::Info,
+            confidence: Confidence::Firm,
+            host: String::new(),
+            path: String::new(),
+            detail: String::new(),
+            remediation: String::new(),
+            request: String::new(),
+            response: String::new(),
+        }
+    }
 }
 
 impl Finding {
@@ -105,14 +158,20 @@ impl Finding {
             host: host.into(),
             path: path.into(),
             detail: detail.into(),
+            ..Default::default()
         }
     }
 }
 
-/// consolidate_passive_issues = true: one issue per (type, host, path).
+/// One issue per (type, name, host, path), highest severity first.
+///
+/// The name is part of the key as well as the type number. Every check in this module gives
+/// one name to one type number, so for them the name adds nothing -- but findings reported by
+/// a program share a default type number while naming different things, and keying on the
+/// number alone would merge two unrelated issues into one.
 pub fn consolidate(mut fs: Vec<Finding>) -> Vec<Finding> {
     let mut seen = std::collections::HashSet::new();
-    fs.retain(|f| seen.insert((f.type_index, f.host.clone(), f.path.clone())));
+    fs.retain(|f| seen.insert((f.type_index, f.name.clone(), f.host.clone(), f.path.clone())));
     fs.sort_by(|a, b| b.severity.cmp(&a.severity));
     fs
 }

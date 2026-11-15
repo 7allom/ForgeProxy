@@ -63,7 +63,7 @@ const PAGES: &[PageInfo] = &[
         card("Polling", "How often the Collaborator tab asks its relay what has come in, while its timer is on.", Home::User),
     ]},
     PageInfo { page: SettingsPage::ExternalTools, group: Some("Tools"), name: "External tools", cards: &[
-        card("Registered programs", "Programs offered on the \"Send to\" menus. Each one is run directly with its arguments; no shell is involved.", Home::User),
+        card("Registered programs", "Programs offered on the \"Send to\" menus, and the pipelines built from them. Each one is run directly with its arguments; no shell is involved. The Automation tab is where they are set up and run.", Home::User),
     ]},
     PageInfo { page: SettingsPage::NetworkConnections, group: Some("Network"), name: "Connections", cards: &[
         card("Upstream proxy", "Send outgoing traffic through another proxy: the Proxy's connections to targets (including HTTPS and pass-through tunnels) and requests from Repeater, Intruder, Scanner and Sequencer.", Home::Override),
@@ -864,115 +864,105 @@ fn browser_profile(app: &mut App, ui: &mut Ui, p: &Palette) {
 }
 
 /// Settings > External tools: the programs offered on the "Send to" menus.
+/// Settings > External tools: what is registered, and the way to the tab that edits it.
+///
+/// The registry has one home, the Automation tab, which is also where a program is run and
+/// where its output is read. This page says what is in it and goes there; it deliberately
+/// holds no second set of editing controls, because two of them drift apart.
 fn external_tools(app: &mut App, ui: &mut Ui, p: &Palette) {
-    let count = app.settings.external_tools.len();
-    let sel = app.ext_tool_sel.filter(|&i| i < count);
-    let mut pick = None;
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            if theme::side_button(ui, p, "Add", true).clicked() {
-                app.settings.external_tools.push(crate::tooling::ExternalTool {
-                    name: "New tool".into(),
-                    ..Default::default()
-                });
-                pick = Some(app.settings.external_tools.len() - 1);
-            }
-            if theme::side_button(ui, p, "Remove", sel.is_some()).clicked() {
-                if let Some(i) = sel {
-                    app.settings.external_tools.remove(i);
-                    app.ext_tool_sel = None;
-                }
-            }
-            if theme::side_button(ui, p, "Up", sel.is_some_and(|i| i > 0)).clicked() {
-                if let Some(i) = sel {
-                    app.settings.external_tools.swap(i, i - 1);
-                    pick = Some(i - 1);
-                }
-            }
-            if theme::side_button(ui, p, "Down", sel.is_some_and(|i| i + 1 < count)).clicked() {
-                if let Some(i) = sel {
-                    app.settings.external_tools.swap(i, i + 1);
-                    pick = Some(i + 1);
-                }
-            }
-        });
-        // (minimum width, share of the spare width) for Name, Program, Input
-        const COLS: [(f32, f32); 3] = [(150.0, 0.35), (200.0, 0.45), (110.0, 0.2)];
-        let height = ((count.max(1) + 1) as f32) * theme::ROW_HEIGHT + 8.0;
-        let tools = app.settings.external_tools.clone();
-        theme::fitted_table(ui, p, "ext_tools_table", height, &COLS, |ui, w| {
-            theme::table_header(ui, p, &[("Name", w[0]), ("Program", w[1]), ("Input", w[2])]);
-            if tools.is_empty() {
-                ui.label(RichText::new("  No programs yet. Add one, and it appears on every \"Send to\" menu.").size(11.5).color(p.disabled));
-                return;
-            }
-            for (i, t) in tools.iter().enumerate() {
-                let open = sel == Some(i);
-                let fg = if t.is_runnable() { p.text } else { p.disabled };
+    let tools = &app.settings.external_tools;
+    let plans = &app.settings.automation_plans;
+    let runnable = tools.iter().filter(|t| t.is_runnable()).count();
+    let count = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    ui.label(
+        RichText::new(format!(
+            "{} registered, {} of them ready to run; {}.",
+            count(tools.len(), "program", "programs"),
+            runnable,
+            count(plans.len(), "pipeline", "pipelines")
+        ))
+        .size(12.0)
+        .color(p.text),
+    );
+    ui.add_space(6.0);
+
+    if tools.is_empty() && plans.is_empty() {
+        ui.label(
+            RichText::new("Nothing is registered yet. A program added in the Automation tab appears on the \"Send to\" menus, unless it is kept off them there.")
+                .size(11.5)
+                .color(p.disabled),
+        );
+    } else {
+        // (minimum width, share of the spare width) for Name, Program or steps, Input, Timeout
+        const COLS: [(f32, f32); 4] = [(140.0, 0.3), (190.0, 0.45), (100.0, 0.25), (70.0, 0.0)];
+        let rows = tools.len() + plans.len();
+        let height = ((rows + 1) as f32) * theme::ROW_HEIGHT + 8.0;
+        let listing: Vec<(String, String, String, String, bool)> = tools
+            .iter()
+            .map(|t| {
+                (
+                    t.display_name(),
+                    t.command.clone(),
+                    t.stdin_mode.label().to_string(),
+                    format!("{}s", t.timeout_secs),
+                    t.is_runnable(),
+                )
+            })
+            .chain(plans.iter().map(|pl| {
+                let steps = if pl.steps.len() == 1 {
+                    "1 step".to_string()
+                } else {
+                    format!("{} steps", pl.steps.len())
+                };
+                (pl.display_name(), steps, "Pipeline".to_string(), String::new(), pl.is_runnable())
+            }))
+            .collect();
+        theme::fitted_table(ui, p, "ext_tools_summary", height, &COLS, |ui, w| {
+            theme::table_header(
+                ui,
+                p,
+                &[("Name", w[0]), ("Program or steps", w[1]), ("Input", w[2]), ("Timeout", w[3])],
+            );
+            for (i, (name, what, input, timeout, ready)) in listing.iter().enumerate() {
+                let fg = if *ready { p.text } else { p.disabled };
                 let row = theme::table_row(
                     ui,
                     p,
                     &[
-                        (t.name.clone(), w[0], Some(fg)),
-                        (t.command.clone(), w[1], Some(fg)),
-                        (t.stdin_mode.label().to_string(), w[2], Some(p.disabled)),
+                        (name.clone(), w[0], Some(fg)),
+                        (what.clone(), w[1], Some(fg)),
+                        (input.clone(), w[2], Some(p.disabled)),
+                        (timeout.clone(), w[3], Some(p.disabled)),
                     ],
-                    open,
+                    false,
                     i % 2 == 1,
                 );
-                row.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, format!("Tool {}", t.name))
-                });
-                if row.clicked() {
-                    pick = Some(i);
-                }
+                // the cells are painted, not laid out as widgets, so the row says what it
+                // holds for anything reading the window rather than looking at it
+                let spoken = [name.as_str(), what.as_str(), input.as_str(), timeout.as_str()]
+                    .iter()
+                    .filter(|part| !part.is_empty())
+                    .cloned()
+                    .collect::<Vec<&str>>()
+                    .join(", ");
+                row.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &spoken));
             }
         });
-    });
-    if let Some(i) = pick {
-        app.ext_tool_sel = Some(i);
     }
 
-    let Some(i) = app.ext_tool_sel.filter(|&i| i < app.settings.external_tools.len()) else {
-        return;
-    };
     ui.add_space(8.0);
-    ui.label(bold("Edit selected program", 13.0).color(p.strong));
-    let tool = &mut app.settings.external_tools[i];
-    egui::Grid::new("ext_tool_edit").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        ui.label("Menu label:");
-        ui.add(egui::TextEdit::singleline(&mut tool.name).desired_width(300.0).hint_text("Inspect in script"));
-        ui.end_row();
-        ui.label("Program:");
-        ui.add(egui::TextEdit::singleline(&mut tool.command).desired_width(300.0).hint_text("a name on the path, or a full path"));
-        ui.end_row();
-        ui.label("Arguments:");
-        ui.add(egui::TextEdit::singleline(&mut tool.args).desired_width(380.0).hint_text("-r --url {url} {req_file}"));
-        ui.end_row();
-        ui.label("Give it on input:");
-        egui::ComboBox::from_id_salt("ext_tool_stdin")
-            .selected_text(tool.stdin_mode.label())
-            .show_ui(ui, |ui| {
-                for m in crate::tooling::ToolStdinMode::ALL {
-                    ui.selectable_value(&mut tool.stdin_mode, m, m.label());
-                }
-            });
-        ui.end_row();
-    });
-    ui.add_space(6.0);
-    ui.label(RichText::new("Placeholders").size(11.5).color(p.strong));
-    egui::Grid::new("ext_tool_placeholders").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
-        for (token, meaning) in crate::tooling::PLACEHOLDERS {
-            ui.label(RichText::new(token).size(11.0).monospace().color(p.badge_info));
-            ui.label(RichText::new(meaning).size(11.0).color(p.disabled));
-            ui.end_row();
-        }
-    });
+    if theme::primary_button(ui, p, "Open Automation tab").clicked() {
+        crate::ui_automation::open(app);
+    }
     ui.add_space(4.0);
     ui.label(
-        RichText::new("The program is started directly, so an address carrying ; or $( ) is passed to it as text and never run. A temporary file is written for your account only and removed when the program finishes.")
-            .size(11.5)
-            .color(p.disabled),
+        RichText::new(
+            "Programs and pipelines are set up in the Automation tab, where a run's output, its exit status \
+             and the issues it reported are shown as they arrive. A program is started directly, so an \
+             address carrying ; or $( ) reaches it as text and is never run.",
+        )
+        .size(11.5)
+        .color(p.disabled),
     );
 }
 
@@ -1411,10 +1401,11 @@ mod tests {
         assert!(app.hotkey_capturing.is_none(), "leaving the page ended it too");
     }
 
-    /// The External tools page is in the sidebar, findable by what it is for, and its card
-    /// draws for a registry that is empty as well as one with a program in it.
+    /// The External tools page is in the sidebar, findable by what it is for, says what is
+    /// registered, and goes to the one place that edits it -- with no second set of editing
+    /// controls of its own to drift out of step with the Automation tab.
     #[test]
-    fn the_external_tools_page_is_listed_and_draws() {
+    fn the_external_tools_page_summarises_the_registry_and_opens_the_automation_tab() {
         use crate::state::Tab;
         use crate::test_utils::MockAppBuilder;
         use eframe::egui;
@@ -1422,6 +1413,7 @@ mod tests {
         let page = info(SettingsPage::ExternalTools);
         assert!(page_visible(page, "external"), "found by name");
         assert!(page_visible(page, "send to"), "and by what its card is about");
+        assert!(page_visible(page, "automation"), "and by where the editing happens");
 
         let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
         ctx.enable_accesskit();
@@ -1445,23 +1437,45 @@ mod tests {
         // an empty registry still draws, and says what the page is for
         draw(&ctx, &mut app);
         let seen = labels(&draw(&ctx, &mut app));
-        assert!(seen.iter().any(|l| l == "Add"), "the controls are there: {seen:?}");
+        assert!(seen.iter().any(|l| l == "Open Automation tab"), "the way to the editor is there: {seen:?}");
+        assert!(seen.iter().any(|l| l.starts_with("0 programs registered")), "the count is shown: {seen:?}");
+        // and none of the editing controls that used to live here
+        for gone in ["Add", "Menu label:", "Arguments:", "Give it on input:"] {
+            assert!(!seen.iter().any(|l| l == gone), "{gone:?} belongs to the Automation tab now: {seen:?}");
+        }
 
-        // and one with a program in it shows that program, selected for editing
+        // with a program and a pipeline registered, both are listed with what they are
         app.settings.external_tools = vec![crate::tooling::ExternalTool {
             name: "Inspect in script".into(),
             command: "python3".into(),
             args: "-u check.py {url}".into(),
             stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+            timeout_secs: 90,
+            import_findings: true,
+            show_in_menu: true,
         }];
-        app.ext_tool_sel = Some(0);
+        app.settings.automation_plans = vec![crate::tooling::AutomationPlan {
+            name: "Collect and report".into(),
+            steps: vec![crate::tooling::PipelineStep::default()],
+        }];
         draw(&ctx, &mut app);
         let seen = labels(&draw(&ctx, &mut app));
-        assert!(seen.iter().any(|l| l == "Tool Inspect in script"), "the row is drawn: {seen:?}");
-        assert!(seen.iter().any(|l| l == "{url}"), "and the placeholders are listed: {seen:?}");
-        // the editor for the selected program is open, with its fields named
-        for field in ["Menu label:", "Program:", "Arguments:", "Give it on input:"] {
-            assert!(seen.iter().any(|l| l == field), "{field} is in the editor: {seen:?}");
-        }
+        assert!(
+            seen.iter().any(|l| l == "Inspect in script, python3, JSON envelope, 90s"),
+            "the program is listed with its program, input and timeout: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|l| l == "Collect and report, 1 step, Pipeline"),
+            "and the pipeline with how many steps it has: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|l| l == "1 program registered, 1 of them ready to run; 1 pipeline."),
+            "the counts read as a sentence: {seen:?}"
+        );
+
+        // the button goes to the Automation tab and closes the window behind it
+        crate::ui_automation::open(&mut app);
+        assert_eq!(app.tab, Tab::Automation);
+        assert!(!app.show_settings, "and the Settings window is out of the way");
     }
 }

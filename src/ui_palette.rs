@@ -63,6 +63,7 @@ pub fn default_commands() -> Vec<PaletteCommand> {
         go("Go to Comparer", None, |a| a.tab = Tab::Comparer),
         go("Go to Logger", Some("Ctrl+Shift+L"), |a| a.tab = Tab::Logger),
         go("Go to Organizer", Some("Ctrl+Shift+O"), |a| a.tab = Tab::Organizer),
+        go("Go to Automation", Some("Ctrl+Shift+A"), |a| a.tab = Tab::Automation),
         cmd("Forward intercepted message", "Intercept", Some("Ctrl+F"), "→", ui_proxy::forward, has_held),
         cmd("Drop intercepted message", "Intercept", Some("Ctrl+D"), "↓", ui_proxy::drop_held, has_held),
         cmd("Toggle interception on/off", "Intercept", Some("Ctrl+T"), "👁", ui_proxy::toggle_intercept, always),

@@ -177,6 +177,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     info(Action::GoTo(Tab::Comparer), "go_comparer", "Switch to Comparer", Binding::ctrl_shift(Key::M)),
     info(Action::GoTo(Tab::Logger), "go_logger", "Switch to Logger", Binding::ctrl_shift(Key::L)),
     info(Action::GoTo(Tab::Organizer), "go_organizer", "Switch to Organizer", Binding::ctrl_shift(Key::O)),
+    info(Action::GoTo(Tab::Automation), "go_automation", "Switch to Automation", Binding::ctrl_shift(Key::A)),
 ];
 
 /// The binding in force for every action: its default, unless the settings hold an override

@@ -616,6 +616,9 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
     let total = app.int_total.max(done);
     // a row's right-click choice: (history id, where to send it)
     let mut attack_pick: Option<(usize, actions::SendTo)> = None;
+    // the registry is read before the table is drawn: the rows hold a borrow of the results
+    // while their menu is up, so the menu reports what was picked instead of running it
+    let menu_tools = menu_external_tools(&app.settings);
     theme::show_resizable_window(ctx, egui::Id::new("intruder_attack"), bold(format!("Intruder attack — {}", app.int_target.trim()), 14.0).color(p.strong), &mut open, |ui| {
             // the area the window gives its contents. The panels below lay out inside it but
             // do not report it back, so the window would otherwise shrink to the few rows
@@ -723,6 +726,9 @@ pub fn attack_window(app: &mut App, ctx: &egui::Context, p: &Palette) {
                                             ui.close_menu();
                                         }
                                     }
+                                }
+                                if let Some(t) = external_tools_menu_pick(ui, &menu_tools) {
+                                    attack_pick = Some((id, actions::SendTo::External(t)));
                                 }
                             });
                         }
@@ -1357,6 +1363,9 @@ fn collab_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action:
                         *action = Some(CollabRowAction::Decoder(hit.id));
                         ui.close_menu();
                     }
+                    // and the programs the user registered, on the address the interaction
+                    // stands for with whatever transcript came with it
+                    append_external_tools_menu(ui, app, &actions::collab_interaction_url(hit), &hit.raw_request, &hit.raw_response);
                     ui.separator();
                     if ui.button("Remove").clicked() {
                         *action = Some(CollabRowAction::Remove(hit.id));
@@ -2312,7 +2321,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                                         let url = actions::entry_url(e);
                                         let prefix = url.split(['?', '#']).next().unwrap_or(&url).to_string();
                                         item.context_menu(|ui| {
-                                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, app, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                                         });
                                     }
                                 }
@@ -2320,7 +2329,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                             if let Some(e) = first {
                                 let prefix = actions::scope_prefix(&e);
                                 header.header_response.context_menu(|ui| {
-                                    if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, &e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                                    if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, app, &e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                                 });
                             }
                         }
@@ -2355,7 +2364,7 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                         if row.secondary_clicked() { clicked = Some(e.id); }
                         let prefix = actions::scope_prefix(e);
                         row.context_menu(|ui| {
-                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
+                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, app, e, &prefix, source_tab) { menu_pick = Some((e.clone(), prefix.clone(), a)); }
                         });
                     }
                 });
@@ -2489,28 +2498,96 @@ pub fn show_traffic_context_menu(
         ui.ctx().copy_text(crate::export::to_curl(request, &actions::origin_of(&full_url)));
         ui.close_menu();
     }
-    // the programs the user registered, under a line of their own. Added here rather than in
-    // each table, so every menu this builds -- history, Logger, site map, Organizer,
-    // Collaborator -- offers the same tools without being told about them.
-    let tools: Vec<(usize, String)> = app
-        .settings
+    // the programs the user registered, under a line of their own
+    append_external_tools_menu(ui, app, url, request, response.unwrap_or(""));
+}
+
+/// Up to this many programs are listed in a context menu one after another. Past it they go
+/// behind a submenu instead: a registry of twenty would otherwise draw a menu taller than the
+/// screen, and the part that hangs off the bottom cannot be scrolled to or clicked.
+pub const MENU_TOOLS_INLINE_MAX: usize = 5;
+/// What the submenu is called once the programs are grouped behind one.
+pub const MENU_TOOLS_SUBMENU: &str = "External tools";
+/// How tall the grouped submenu's list may grow before it scrolls instead.
+const MENU_TOOLS_SUBMENU_HEIGHT: f32 = 220.0;
+/// What a program's menu entry says it will do.
+const MENU_TOOLS_HINT: &str = "Runs the program set up in the Automation tab";
+
+/// The registered programs a right-click menu offers, as (place in the registry, menu label).
+///
+/// An entry too unfinished to run is left out, as is one the user has kept off the menus; the
+/// index is the one in the registry, so what comes back can be routed with
+/// [`actions::SendTo::External`] whatever the filtering left out.
+pub fn menu_external_tools(settings: &crate::state::UserSettings) -> Vec<(usize, String)> {
+    settings
         .external_tools
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.is_runnable())
+        .filter(|(_, t)| t.on_menus())
         .map(|(i, t)| (i, t.name.trim().to_string()))
-        .collect();
-    if !tools.is_empty() {
-        ui.separator();
-        let response_text = response.unwrap_or("").to_string();
+        .collect()
+}
+
+/// Draw `tools` at the end of an open context menu, under a line of their own, and report
+/// which one was picked. Nothing at all is drawn (not even the separator) for an empty list.
+///
+/// Up to [`MENU_TOOLS_INLINE_MAX`] of them are listed directly; beyond that they are grouped
+/// under a [`MENU_TOOLS_SUBMENU`] submenu holding a scrolling list, so a large registry cannot
+/// push a row's menu off the screen.
+///
+/// The answer is reported rather than acted on, so this can also be called from the tables
+/// that hold a borrow of the app while their row menu is up (the Intruder's results, the site
+/// map's tree); [`append_external_tools_menu`] is the same thing for callers that can act at
+/// once.
+pub fn external_tools_menu_pick(ui: &mut Ui, tools: &[(usize, String)]) -> Option<usize> {
+    if tools.is_empty() {
+        return None;
+    }
+    let mut pick = None;
+    ui.separator();
+    if tools.len() <= MENU_TOOLS_INLINE_MAX {
         for (i, name) in tools {
-            if ui.button(&name).on_hover_text("Runs the program set up in Settings > External tools").clicked() {
-                // routed as a destination like any other, so a registered program goes
-                // through the same dispatch the built-in tools do
-                actions::send_message_to(app, actions::SendTo::External(i), url, request, &response_text);
+            if ui.button(name).on_hover_text(MENU_TOOLS_HINT).clicked() {
+                pick = Some(*i);
                 ui.close_menu();
             }
         }
+        return pick;
+    }
+    ui.menu_button(MENU_TOOLS_SUBMENU, |ui| {
+        // bounded, and scrolling past the bound: the submenu stays on the screen however many
+        // programs are registered
+        egui::ScrollArea::vertical()
+            .id_salt("external_tools_submenu")
+            .max_height(MENU_TOOLS_SUBMENU_HEIGHT)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, name) in tools {
+                    if ui.button(name).on_hover_text(MENU_TOOLS_HINT).clicked() {
+                        pick = Some(*i);
+                        ui.close_menu();
+                    }
+                }
+            });
+    })
+    .response
+    .on_hover_text(format!("{} programs on offer, set up in the Automation tab", tools.len()));
+    pick
+}
+
+/// Append the programs the user registered to an open traffic context menu, under a line of
+/// their own, and start the one that is picked.
+///
+/// Called from every traffic menu -- the editors and viewers through
+/// [`show_traffic_context_menu`], and each table's rows: HTTP history, Logger, site map,
+/// Organizer, the Dashboard's live items and the Collaborator. A program set up once is then
+/// offered wherever a message is, without each table having to know what is registered.
+pub fn append_external_tools_menu(ui: &mut Ui, app: &mut App, url: &str, request: &str, response: &str) {
+    let tools = menu_external_tools(&app.settings);
+    if let Some(i) = external_tools_menu_pick(ui, &tools) {
+        // routed as a destination like any other, so a registered program goes through the
+        // same dispatch the built-in tools do
+        actions::send_message_to(app, actions::SendTo::External(i), url, request, response);
     }
 }
 
@@ -2550,6 +2627,144 @@ pub fn attach_view_context_menu(
     attach_editor_context_menu(&view.out, view.shown_text(raw_active), raw_active, app, source_tab, url, request, response, label);
 }
 
+
+#[cfg(test)]
+mod external_tools_menu_tests {
+    use crate::state::UserSettings;
+    use crate::test_utils::{assert_table, HttpFixture, MockAppBuilder};
+    use crate::tooling::ExternalTool;
+    use eframe::egui;
+
+    fn tool(name: &str, command: &str, show_in_menu: bool) -> ExternalTool {
+        ExternalTool { name: name.into(), command: command.into(), show_in_menu, ..Default::default() }
+    }
+
+    /// What a right-click menu offers: every program that can run and that the user has not
+    /// kept off the menus, labelled by its trimmed name and carrying the place in the registry
+    /// it is dispatched by.
+    #[test]
+    fn the_menus_offer_the_runnable_programs_that_are_not_hidden() {
+        let settings = UserSettings {
+            external_tools: vec![
+                tool("  Header survey  ", "/bin/echo", true),
+                tool("Unfinished", "", true),
+                tool("", "/bin/echo", true),
+                tool("Pipeline helper", "/bin/echo", false),
+                tool("Token report", "/bin/echo", true),
+            ],
+            ..Default::default()
+        };
+        let offered = super::menu_external_tools(&settings);
+        assert_eq!(
+            offered,
+            vec![(0, "Header survey".to_string()), (4, "Token report".to_string())],
+            "the index is the place in the registry, whatever the filtering left out"
+        );
+    }
+
+    /// A program is on the menus until it is taken off them, however it came to be registered.
+    #[test]
+    fn a_program_is_on_the_menus_by_default() {
+        assert!(ExternalTool::default().show_in_menu);
+        assert!(tool("Header survey", "/bin/echo", true).on_menus());
+        assert!(!tool("Pipeline helper", "/bin/echo", false).on_menus(), "until it is turned off");
+        assert!(!tool("Unfinished", "", true).on_menus(), "and one that cannot run is never on them");
+    }
+
+    /// One full frame of the app with these input events; returns the accessibility update.
+    fn frame(ctx: &egui::Context, app: &mut crate::state::App, events: Vec<egui::Event>) -> Option<egui::accesskit::TreeUpdate> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+    }
+
+    fn labels(update: &Option<egui::accesskit::TreeUpdate>) -> Vec<String> {
+        update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().map(str::to_string))
+            .collect()
+    }
+
+    /// Centre of the first row of the table whose header holds `column`, which must be on the
+    /// screen exactly once. Table cells are painted rather than laid out, so there is no node
+    /// of their own to find: inside a table well the rows follow the header with no spacing
+    /// between them, so the first one sits one half-row below the header's bottom edge.
+    fn first_row_under(update: &Option<egui::accesskit::TreeUpdate>, column: &str) -> egui::Pos2 {
+        let found: Vec<egui::accesskit::Rect> = update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.label() == Some(column))
+            .filter_map(|(_, n)| n.bounds())
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one column header labelled {column:?} is on the screen");
+        let r = &found[0];
+        egui::pos2(((r.x0 + r.x1) / 2.0) as f32, r.y1 as f32 + crate::theme::ROW_HEIGHT / 2.0)
+    }
+
+    /// The Intruder's attack window over one finished request, recorded in history so the row
+    /// has a message behind it, with `tools` registered.
+    fn attack_app(tools: Vec<ExternalTool>) -> (egui::Context, crate::state::App) {
+        let entry = HttpFixture::get("shop.test", "/orders?page=1")
+            .with_response("200 OK", "{}")
+            .into_history_entry(1, "Intruder");
+        let (ctx, mut app) = MockAppBuilder::new()
+            .with_tab(crate::state::Tab::Intruder)
+            .with_intruder_target("http://shop.test/orders")
+            .with_history_entry(entry)
+            .build_with_ctx();
+        ctx.enable_accesskit();
+        app.int_results = vec![crate::state::IntResult {
+            request: 1,
+            payload: "alpha".into(),
+            status: "200 OK".into(),
+            length: 2,
+            error: String::new(),
+            history_id: 1,
+        }];
+        app.int_total = 1;
+        app.show_attack = true;
+        app.settings.external_tools = tools;
+        (ctx, app)
+    }
+
+    /// A result row in the attack window offers the registered programs, the same as any other
+    /// traffic row. Its menu cannot run one where it is drawn -- the rows hold a borrow of the
+    /// results while it is up -- so this also covers the deferred route.
+    #[test]
+    fn an_intruder_result_row_offers_the_registered_programs() {
+        let cases = [1usize, super::MENU_TOOLS_INLINE_MAX + 1];
+        assert_table!(cases, |idx, count| {
+            let (ctx, mut app) = attack_app((1..=count).map(|n| tool(&format!("Survey {n}"), "/bin/echo", true)).collect());
+            frame(&ctx, &mut app, vec![]);
+            let at = first_row_under(&frame(&ctx, &mut app, vec![]), "Status code");
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at), button(true)]);
+            let open = labels(&frame(&ctx, &mut app, vec![button(false)]));
+            assert!(open.iter().any(|l| l == "Send to Repeater"), "case #{idx}: the row's menu is open: {open:?}");
+            if count <= super::MENU_TOOLS_INLINE_MAX {
+                assert!(open.iter().any(|l| l == "Survey 1"), "case #{idx}: the program is offered: {open:?}");
+            } else {
+                assert!(
+                    open.iter().any(|l| l == super::MENU_TOOLS_SUBMENU),
+                    "case #{idx}: {count} programs go behind the submenu here too: {open:?}"
+                );
+            }
+        });
+    }
+}
 
 #[cfg(test)]
 mod intruder_sync_tests {

@@ -407,23 +407,24 @@ fn pill(ui: &mut Ui, p: &Palette, label: &str, on: bool) -> egui::Response {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RowAction { AddToScope, RemoveFromScope, Send(crate::actions::SendTo) }
 
-/// Right-click menu for a history row or site map item. Drawing can't change the app, so
-/// it returns the choice; `scope_menu_apply` carries it out.
+/// Right-click menu for a history row or site map item. The scope and routing choices can't
+/// change the app while it is drawing, so they are returned for `scope_menu_apply` to carry
+/// out; a registered program is started where it is picked, which needs nothing undrawn.
 #[allow(dead_code)]
-pub fn scope_menu_pick(ui: &mut Ui, scope: &crate::scope::TargetScope, e: &crate::http::HttpEntry, prefix: &str) -> Option<RowAction> {
-    scope_menu_pick_for(ui, scope, e, prefix, crate::state::Tab::Proxy)
+pub fn scope_menu_pick(ui: &mut Ui, app: &mut App, e: &crate::http::HttpEntry, prefix: &str) -> Option<RowAction> {
+    scope_menu_pick_for(ui, app, e, prefix, crate::state::Tab::Proxy)
 }
 
 /// Right-click menu for a traffic row in `source_tab`, hiding any redundant link to `source_tab`.
 pub fn scope_menu_pick_for(
     ui: &mut Ui,
-    scope: &crate::scope::TargetScope,
+    app: &mut App,
     e: &crate::http::HttpEntry,
     prefix: &str,
     source_tab: crate::state::Tab,
 ) -> Option<RowAction> {
     use crate::actions::SendTo;
-    let in_scope = scope.is_in_scope(&crate::actions::entry_url(e));
+    let in_scope = app.target_scope.is_in_scope(&crate::actions::entry_url(e));
     let mut pick = None;
     ui.label(RichText::new(prefix).monospace().size(11.5));
     ui.separator();
@@ -444,6 +445,15 @@ pub fn scope_menu_pick_for(
         ui.ctx().copy_text(crate::actions::entry_as_curl(e));
         ui.close_menu();
     }
+    // the same programs the editors and viewers offer, so a row's menu is not the poorer for
+    // being a row's menu
+    crate::ui_tools::append_external_tools_menu(
+        ui,
+        app,
+        &crate::actions::entry_url(e),
+        &crate::actions::raw_request(e),
+        &e.response,
+    );
     if pick.is_some() { ui.close_menu(); }
     pick
 }
@@ -509,6 +519,7 @@ mod filter_tests {
 mod tests {
     use super::*;
     use crate::proxy::Held;
+    use crate::test_utils::assert_table;
     use std::sync::mpsc::{channel, Receiver};
 
     /// An app on Proxy > Intercept with Intercept on (no listener, no real config).
@@ -611,6 +622,121 @@ mod tests {
         let rx2 = hold(&app, "/second");
         forward(&mut app);
         assert!(matches!(rx2.try_recv(), Ok(Decision::Forward(raw)) if raw.contains("/second") && !raw.contains("/edited")));
+    }
+
+    /// Every label a frame's accessibility tree carries, menus included.
+    fn labels(update: &Option<egui::accesskit::TreeUpdate>) -> Vec<String> {
+        update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().map(str::to_string))
+            .collect()
+    }
+
+    /// Centre of the first row of the table whose header holds `column`. Table cells are
+    /// painted rather than laid out, so there is no node of their own to find: inside a table
+    /// well the rows follow the header with no spacing between them, so the first one sits one
+    /// half-row below the header's bottom edge.
+    fn first_row_under(update: &Option<egui::accesskit::TreeUpdate>, column: &str) -> egui::Pos2 {
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let r = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(column))
+            .and_then(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("no column header labelled {column:?}"));
+        egui::pos2(((r.x0 + r.x1) / 2.0) as f32, r.y1 as f32 + theme::ROW_HEIGHT / 2.0)
+    }
+
+    /// An app on Proxy > HTTP history with one recorded exchange to right-click.
+    fn history_app() -> (egui::Context, App) {
+        let (ctx, mut app) = intercept_app();
+        app.proxy_sub = 1; // HTTP history
+        let entry = crate::test_utils::HttpFixture::get("shop.test", "/orders")
+            .with_response("200 OK", "{\"orders\":[]}")
+            .into_history_entry(1, "Proxy");
+        app.history.lock().unwrap().push(std::sync::Arc::new(entry));
+        (ctx, app)
+    }
+
+    /// A registered program that can run, by the name its menu entry carries.
+    fn tool(name: &str) -> crate::tooling::ExternalTool {
+        crate::tooling::ExternalTool { name: name.into(), command: "/bin/echo".into(), ..Default::default() }
+    }
+
+    /// Right-click at `at` and return the labels of the frame the menu goes up in.
+    ///
+    /// That frame is the one the click completes in, which for a traffic row is also the frame
+    /// it is selected in: the detail pane the selection opens moves the table out from under
+    /// the menu and closes it again, so there is no later frame to read it from.
+    fn right_click_labels(ctx: &egui::Context, app: &mut App, at: egui::Pos2) -> Vec<String> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
+        labels(&frame(ctx, app, vec![button(false)]))
+    }
+
+    /// Right-click the first row of HTTP history and return what the menu offers.
+    fn history_row_menu(ctx: &egui::Context, app: &mut App) -> Vec<String> {
+        frame(ctx, app, vec![]);
+        let at = first_row_under(&frame(ctx, app, vec![]), "Host");
+        let open = right_click_labels(ctx, app, at);
+        assert_eq!(app.history_sel, Some(1), "the right-click landed on the history row");
+        assert!(open.iter().any(|l| l == "Add to scope"), "the row's menu is open: {open:?}");
+        open
+    }
+
+    /// A program registered in the Automation tab belongs on a history row's right-click menu,
+    /// not only on the menus the message editors and viewers put up -- and one the user has
+    /// kept off the menus stays off this one too.
+    #[test]
+    fn a_history_row_offers_the_programs_the_user_registered() {
+        let (ctx, mut app) = history_app();
+        app.settings.external_tools = vec![
+            tool("Header survey"),
+            crate::tooling::ExternalTool { show_in_menu: false, ..tool("Pipeline helper") },
+            crate::tooling::ExternalTool { command: String::new(), ..tool("Unfinished") },
+        ];
+        let open = history_row_menu(&ctx, &mut app);
+        assert!(
+            open.iter().any(|l| l == "Header survey"),
+            "the registered program is offered on the row's menu: {open:?}"
+        );
+        assert!(
+            !open.iter().any(|l| l == "Pipeline helper"),
+            "a program kept off the menus is not offered: {open:?}"
+        );
+        assert!(!open.iter().any(|l| l == "Unfinished"), "nor one that cannot run: {open:?}");
+        assert!(
+            !open.iter().any(|l| l == crate::ui_tools::MENU_TOOLS_SUBMENU),
+            "and one program needs no submenu to hold it: {open:?}"
+        );
+    }
+
+    /// A registry too long to list is grouped behind a submenu, so a row's menu cannot grow
+    /// taller than the screen it is drawn on.
+    #[test]
+    fn a_large_registry_is_grouped_behind_one_submenu() {
+        let inline_max = crate::ui_tools::MENU_TOOLS_INLINE_MAX;
+        assert_table!([inline_max, inline_max + 1], |idx, count| {
+            let (ctx, mut app) = history_app();
+            app.settings.external_tools = (1..=count).map(|n| tool(&format!("Survey {n}"))).collect();
+            let open = history_row_menu(&ctx, &mut app);
+            let grouped = open.iter().any(|l| l == crate::ui_tools::MENU_TOOLS_SUBMENU);
+            let listed = open.iter().filter(|l| l.starts_with("Survey ")).count();
+            if count <= inline_max {
+                assert!(!grouped, "case #{idx}: {count} programs are listed outright: {open:?}");
+                assert_eq!(listed, count, "case #{idx}: all {count} of them: {open:?}");
+            } else {
+                assert!(grouped, "case #{idx}: {count} programs go behind the submenu: {open:?}");
+                assert_eq!(listed, 0, "case #{idx}: and none of them is listed beside it: {open:?}");
+            }
+        });
     }
 
     /// Centre of the node labelled `label`, if there is one.

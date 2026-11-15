@@ -188,7 +188,7 @@ fn live_task(app: &mut App, ui: &mut Ui, p: &Palette, task: &Task, items: &[std:
                         }
                         let prefix = actions::scope_prefix(e);
                         row.context_menu(|ui| {
-                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, &app.target_scope, e, &prefix, Tab::Dashboard) {
+                            if let Some(a) = crate::ui_proxy::scope_menu_pick_for(ui, app, e, &prefix, Tab::Dashboard) {
                                 menu_pick = Some((e.clone(), prefix.clone(), a));
                             }
                         });
@@ -239,13 +239,30 @@ fn scan_summary(ui: &mut Ui, p: &Palette, task: &Task) {
     });
 }
 
-/// Issue list + detail. `task` = one scan task, or None for every task ("All issues").
+/// Where an issue in the listing came from: a scan task, or the Automation tab's imports.
+/// Kept with the issue so the false-positive switch writes back to the right place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IssueHome {
+    /// A scan task, by its place in `app.tasks`.
+    Task(usize),
+    /// Reported by a program, in `app.findings`.
+    Imported,
+}
+
+/// Issue list + detail. `task` = one scan task, or None for every issue in the project
+/// ("All issues"), which includes the ones a program reported through the Automation tab.
 pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<usize>) {
-    let mut list: Vec<(usize, usize, Finding)> = Vec::new();
+    let mut list: Vec<(IssueHome, usize, Finding)> = Vec::new();
     for (ti, t) in app.tasks.iter().enumerate() {
         if task.is_some_and(|x| x != ti) { continue; }
         for (fi, f) in t.findings.iter().enumerate() {
-            list.push((ti, fi, f.clone()));
+            list.push((IssueHome::Task(ti), fi, f.clone()));
+        }
+    }
+    // an imported issue belongs to no scan task, so it shows in "All issues" and nowhere else
+    if task.is_none() {
+        for (fi, f) in app.findings.iter().enumerate() {
+            list.push((IssueHome::Imported, fi, f.clone()));
         }
     }
     ui.horizontal(|ui| {
@@ -279,7 +296,7 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
                 }
             });
         });
-        let (ti, fi, f) = list[sel].clone();
+        let (home, fi, f) = list[sel].clone();
         let ui = &mut cols[1];
         ui.label(bold(&f.name, 15.0).color(p.strong));
         ui.horizontal(|ui| {
@@ -291,13 +308,25 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         let fp = f.severity == Severity::FalsePositive;
         if theme::plain_button(ui, p, if fp { "Undo false positive" } else { "Mark as false positive" }, true).clicked() {
             let typical = crate::issue_defs::ISSUE_DEFS.iter().find(|d| d.0 == f.type_index).map(|d| d.2).unwrap_or("Information");
-            app.tasks[ti].findings[fi].severity = if fp {
-                match typical { "High" => Severity::High, "Medium" => Severity::Medium, "Low" => Severity::Low, _ => Severity::Info }
-            } else { Severity::FalsePositive };
+            let restored = match typical { "High" => Severity::High, "Medium" => Severity::Medium, "Low" => Severity::Low, _ => Severity::Info };
+            let next = if fp { restored } else { Severity::FalsePositive };
+            // written back where the issue actually lives, which is not always a scan task
+            let slot = match home {
+                IssueHome::Task(ti) => app.tasks.get_mut(ti).and_then(|t| t.findings.get_mut(fi)),
+                IssueHome::Imported => app.findings.get_mut(fi),
+            };
+            if let Some(found) = slot {
+                found.severity = next;
+            }
         }
         ui.separator();
         ui.label(bold("Issue detail", 13.0).color(p.strong));
         ui.add(egui::Label::new(RichText::new(&f.detail).color(p.text)).wrap());
+        if !f.remediation.trim().is_empty() {
+            ui.add_space(4.0);
+            ui.label(bold("Remediation", 13.0).color(p.strong));
+            ui.add(egui::Label::new(RichText::new(&f.remediation).color(p.text)).wrap());
+        }
     });
 }
 

@@ -838,15 +838,12 @@ pub fn send_message_to(app: &mut App, to: SendTo, url: &str, request: &str, resp
     }
 }
 
-/// Hand one message to a registered program, off the drawing thread.
-pub fn run_external_tool(app: &App, index: usize, url: &str, request: &str, response: &str) {
-    let Some(tool) = app.settings.external_tools.get(index).filter(|t| t.is_runnable()) else {
-        return;
-    };
+/// What one message is, for filling a program's argument template in.
+pub fn tool_context(url: &str, request: &str, response: &str) -> crate::tooling::ToolContext {
     let (scheme, host, path) = url_parts(url);
     // the port the exchange actually used, worked out from the address and the request
     let port = HttpTarget::parse_or_infer(url, request.as_bytes(), None).port.to_string();
-    let ctx = crate::tooling::ToolContext {
+    crate::tooling::ToolContext {
         url: url.to_string(),
         scheme,
         host,
@@ -855,8 +852,140 @@ pub fn run_external_tool(app: &App, index: usize, url: &str, request: &str, resp
         path,
         request: request.to_string(),
         response: response.to_string(),
+        prev_out_file: String::new(),
+    }
+}
+
+/// Hand one message to a registered program, off the drawing thread.
+///
+/// The run is recorded like any other, so a program started from a "Send to" menu appears in
+/// the Automation tab's history with its output beside it, rather than only a line in the
+/// event log saying how it ended.
+pub fn run_external_tool(app: &App, index: usize, url: &str, request: &str, response: &str) {
+    let Some(tool) = app.settings.external_tools.get(index).filter(|t| t.is_runnable()) else {
+        return;
     };
-    crate::tooling::run(tool, &ctx, &app.event_log);
+    let ctx = tool_context(url, request, response);
+    crate::tooling::run_tracked(tool, &ctx, &app.runs, &app.event_log);
+}
+
+/// The message the Automation tab's target address stands for: the exchange it was picked
+/// from, or the most recent recorded one for the same address, or the address alone.
+pub fn automation_context(app: &App) -> crate::tooling::ToolContext {
+    let url = app.automation_target.trim().to_string();
+    let history = app.history.lock().unwrap_or_else(|e| e.into_inner());
+    let picked = app.automation_source.and_then(|id| history.iter().find(|e| e.id == id));
+    let entry = picked.or_else(|| {
+        (!url.is_empty()).then(|| history.iter().rev().find(|e| entry_url(e) == url)).flatten()
+    });
+    match entry {
+        Some(e) => {
+            let target = if url.is_empty() { entry_url(e) } else { url };
+            tool_context(&target, &raw_request(e), &e.response)
+        }
+        None => tool_context(&url, "", ""),
+    }
+}
+
+/// Start whatever the Automation tab has selected, on the address in its target bar.
+pub fn run_automation_selection(app: &mut App) {
+    let ctx = automation_context(app);
+    if ctx.url.is_empty() {
+        app.automation_msg = "Give a target address before running anything.".into();
+        return;
+    }
+    let started = match app.automation_sel {
+        crate::ui_automation::AutomationSel::Program(i) => {
+            match app.settings.external_tools.get(i).filter(|t| t.is_runnable()) {
+                Some(tool) => {
+                    let id = crate::tooling::run_tracked(tool, &ctx, &app.runs, &app.event_log);
+                    app.automation_msg = format!("Running {}.", tool.display_name());
+                    Some(id)
+                }
+                None => {
+                    app.automation_msg = "This program needs a menu label and an executable before it can run.".into();
+                    None
+                }
+            }
+        }
+        crate::ui_automation::AutomationSel::Pipeline(i) => {
+            match app.settings.automation_plans.get(i).filter(|pl| pl.is_runnable()) {
+                Some(plan) => {
+                    let id = crate::tooling::run_plan(plan, &app.settings.external_tools, &ctx, &app.runs, &app.event_log);
+                    app.automation_msg = format!("Running {}.", plan.display_name());
+                    Some(id)
+                }
+                None => {
+                    app.automation_msg = "This pipeline needs a name and at least one step before it can run.".into();
+                    None
+                }
+            }
+        }
+        crate::ui_automation::AutomationSel::None => {
+            app.automation_msg = "Choose a program or a pipeline on the left.".into();
+            None
+        }
+    };
+    if let Some(id) = started {
+        // the run that was just started is the one worth looking at
+        app.automation_run_sel = Some(id);
+    }
+}
+
+/// Start a recorded run again, on the message it was started on the first time.
+pub fn rerun_automation(app: &mut App, id: u64) {
+    let Some(run) = app.runs.get(id) else { return };
+    let ctx = run.context.clone();
+    let started = match &run.origin {
+        crate::tooling::RunOrigin::Program(name) => {
+            match app.settings.external_tools.iter().find(|t| t.name.trim() == name && t.is_runnable()) {
+                Some(tool) => Some(crate::tooling::run_tracked(tool, &ctx, &app.runs, &app.event_log)),
+                None => {
+                    app.automation_msg = format!("There is no registered program called \"{name}\" any more.");
+                    None
+                }
+            }
+        }
+        crate::tooling::RunOrigin::Pipeline(name) => {
+            match app.settings.automation_plans.iter().find(|pl| pl.name.trim() == name && pl.is_runnable()) {
+                Some(plan) => {
+                    Some(crate::tooling::run_plan(plan, &app.settings.external_tools, &ctx, &app.runs, &app.event_log))
+                }
+                None => {
+                    app.automation_msg = format!("There is no pipeline called \"{name}\" any more.");
+                    None
+                }
+            }
+        }
+    };
+    if let Some(id) = started {
+        app.automation_run_sel = Some(id);
+    }
+}
+
+/// Take findings reported by a program into the issue store, through the same consolidation
+/// the audit engine uses: a repeat of one already there is merged rather than listed twice.
+pub fn take_in_findings(app: &mut App, incoming: Vec<crate::scan::Finding>) -> usize {
+    let before = app.findings.len();
+    let mut all = std::mem::take(&mut app.findings);
+    all.extend(incoming);
+    app.findings = crate::scan::consolidate(all);
+    app.findings.len().saturating_sub(before)
+}
+
+/// Move findings parsed by background runs into the issue store, once a frame.
+///
+/// A worker thread cannot reach the store, so it leaves what it parsed on the run record and
+/// this takes it from there -- which is also where the imported count on the run comes from.
+pub fn drain_tool_findings(app: &mut App) {
+    for (id, findings) in app.runs.take_findings() {
+        let lines: Vec<String> = findings
+            .iter()
+            .map(|f| format!("[{}] {} — {}{}", f.severity.label(), f.name, f.host, f.path))
+            .collect();
+        let added = take_in_findings(app, findings);
+        app.runs.record_imported(id, added, lines);
+    }
 }
 
 /// The scope prefix for an entry: its origin ("https://host:port/").
@@ -1747,6 +1876,7 @@ mod tests {
             command: "true".into(),
             args: "--target {url}".into(),
             stdin_mode: crate::tooling::ToolStdinMode::RawRequest,
+            ..Default::default()
         }];
         let e = crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: "/cart".into(),
@@ -1766,5 +1896,268 @@ mod tests {
         app.settings.external_tools[0].command.clear();
         send_to(&mut app, &e, SendTo::External(0));
         assert_eq!(app.tab, before);
+    }
+
+    /// Findings a program reported reach the issue store through the same consolidation the
+    /// audit engine uses: a repeat of one already there is merged rather than listed twice,
+    /// and what is really new is counted on the run that found it.
+    #[test]
+    fn imported_findings_reach_the_issue_store_deduplicated() {
+        let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new().build_with_ctx();
+        let ctx = crate::tooling::ToolContext {
+            url: "https://shop.test/cart".into(),
+            request: "GET /cart HTTP/1.1\r\nHost: shop.test\r\n\r\n".into(),
+            response: "HTTP/1.1 200 OK\r\n\r\nok".into(),
+            ..Default::default()
+        };
+        let doc = r#"{"findings":[
+            {"title":"Reflected input","severity":"medium"},
+            {"title":"Reflected input","severity":"medium"},
+            {"title":"Directory listing","severity":"low","url":"https://shop.test/files/"}
+        ]}"#;
+        let parsed = crate::tooling::parse_findings(doc, &ctx).expect("it reads");
+        assert_eq!(parsed.len(), 3, "the document named three");
+
+        // left on a run, as a worker thread leaves them, and taken from there
+        let id = app.runs.begin(
+            "reporter",
+            crate::tooling::RunOrigin::Program("reporter".into()),
+            &ctx,
+        );
+        app.runs.offer_findings(id, parsed);
+        drain_tool_findings(&mut app);
+
+        assert_eq!(app.findings.len(), 2, "the repeat was merged: {:?}", app.findings);
+        let names: Vec<&str> = app.findings.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"Reflected input") && names.contains(&"Directory listing"), "{names:?}");
+        assert_eq!(app.findings[0].severity, crate::scan::Severity::Medium, "highest severity first");
+        let run = app.runs.get(id).expect("the run was recorded");
+        assert_eq!(run.imported_count, 2, "and the run counted what it put there");
+        assert_eq!(run.imported.len(), 3, "while listing every one it reported");
+        assert!(run.imported[0].contains("Reflected input"), "{:?}", run.imported);
+
+        // the same document again adds nothing, and says so
+        let again = crate::tooling::parse_findings(doc, &ctx).expect("it reads");
+        let id2 = app.runs.begin("reporter", crate::tooling::RunOrigin::Program("reporter".into()), &ctx);
+        app.runs.offer_findings(id2, again);
+        drain_tool_findings(&mut app);
+        assert_eq!(app.findings.len(), 2, "nothing new the second time");
+        assert_eq!(app.runs.get(id2).expect("recorded").imported_count, 0);
+
+        // a project with imported issues in it is a project worth saving
+        assert!(app.has_project_data(), "the issues are project data");
+    }
+
+    /// The Automation tab's target bar stands for a whole exchange: the one it was picked
+    /// from, or the most recent recorded one for the address, or the address alone.
+    #[test]
+    fn the_automation_target_resolves_to_an_exchange_matrix() {
+        let fixture = crate::test_utils::HttpFixture::get("shop.test", "/cart").with_response("200 OK", "cart");
+        let url = fixture.url();
+        let entry = fixture.into_history_entry(7, "Proxy");
+        let request = entry.request.clone();
+
+        struct Case {
+            name: &'static str,
+            open: fn(&mut App),
+            url: &'static str,
+            has_request: bool,
+        }
+        let cases = [
+            Case {
+                name: "picked from the history",
+                open: |app| {
+                    app.automation_source = Some(7);
+                    app.automation_target = "http://shop.test/cart".into();
+                },
+                url: "http://shop.test/cart",
+                has_request: true,
+            },
+            Case {
+                name: "typed, and matching a recorded exchange",
+                open: |app| {
+                    app.automation_source = None;
+                    app.automation_target = "http://shop.test/cart".into();
+                },
+                url: "http://shop.test/cart",
+                has_request: true,
+            },
+            Case {
+                name: "typed, matching nothing recorded",
+                open: |app| {
+                    app.automation_source = None;
+                    app.automation_target = "https://other.test/x".into();
+                },
+                url: "https://other.test/x",
+                has_request: false,
+            },
+            Case {
+                name: "nothing given at all",
+                open: |app| {
+                    app.automation_source = None;
+                    app.automation_target.clear();
+                },
+                url: "",
+                has_request: false,
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new()
+                .with_history_entry(entry.clone())
+                .build_with_ctx();
+            assert_eq!(url, "http://shop.test/cart", "the fixture's address");
+            (case.open)(&mut app);
+            let ctx = automation_context(&app);
+            assert_eq!(ctx.url, case.url, "case #{idx} ({})", case.name);
+            assert_eq!(
+                !ctx.request.is_empty(),
+                case.has_request,
+                "case #{idx} ({}): the exchange {}",
+                case.name,
+                if case.has_request { "came with it" } else { "is not there to find" }
+            );
+            if case.has_request {
+                assert_eq!(ctx.request, request, "case #{idx} ({}): and it is the right one", case.name);
+                assert_eq!(ctx.method, "GET", "case #{idx} ({})", case.name);
+                assert_eq!(ctx.host, "shop.test", "case #{idx} ({})", case.name);
+                assert_eq!(ctx.port, "80", "case #{idx} ({})", case.name);
+            }
+        });
+    }
+
+    /// Running with nothing selected, or with an unfinished program selected, says why rather
+    /// than starting something: the run history stays as it was.
+    #[test]
+    fn running_without_something_to_run_says_why_matrix() {
+        use crate::ui_automation::AutomationSel;
+        struct Case {
+            name: &'static str,
+            open: fn(&mut App),
+            says: &'static str,
+        }
+        let cases = [
+            Case { name: "no target", open: |app| { app.automation_target.clear(); }, says: "target address" },
+            Case {
+                name: "nothing selected",
+                open: |app| {
+                    app.automation_target = "http://h.test/".into();
+                    app.automation_sel = AutomationSel::None;
+                },
+                says: "Choose a program",
+            },
+            Case {
+                name: "an unfinished program",
+                open: |app| {
+                    app.automation_target = "http://h.test/".into();
+                    app.settings.external_tools = vec![crate::tooling::ExternalTool::default()];
+                    app.automation_sel = AutomationSel::Program(0);
+                },
+                says: "menu label",
+            },
+            Case {
+                name: "a pipeline with no steps",
+                open: |app| {
+                    app.automation_target = "http://h.test/".into();
+                    app.settings.automation_plans =
+                        vec![crate::tooling::AutomationPlan { name: "empty".into(), steps: Vec::new() }];
+                    app.automation_sel = AutomationSel::Pipeline(0);
+                },
+                says: "at least one step",
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new().build_with_ctx();
+            (case.open)(&mut app);
+            run_automation_selection(&mut app);
+            assert!(
+                app.automation_msg.contains(case.says),
+                "case #{idx} ({}): expected {:?} in {:?}",
+                case.name,
+                case.says,
+                app.automation_msg
+            );
+            assert!(app.runs.snapshot().is_empty(), "case #{idx} ({}): nothing was started", case.name);
+        });
+    }
+
+    /// A run started from the Automation tab, and one started from a "Send to" menu, both
+    /// appear in the run history -- the one place a run's output can be read.
+    #[test]
+    fn every_way_of_starting_a_program_is_recorded_matrix() {
+        use crate::ui_automation::AutomationSel;
+        let tool = crate::tooling::ExternalTool {
+            name: "probe".into(),
+            command: "true".into(),
+            args: "--target {url}".into(),
+            ..Default::default()
+        };
+        let cases: [(&str, fn(&mut App)); 2] = [
+            ("the Automation tab's Run button", |app| {
+                app.automation_target = "http://shop.test/cart".into();
+                app.automation_sel = AutomationSel::Program(0);
+                run_automation_selection(app);
+            }),
+            ("a \"Send to\" menu", |app| {
+                send_message_to(
+                    app,
+                    SendTo::External(0),
+                    "http://shop.test/cart",
+                    "GET /cart HTTP/1.1\r\nHost: shop.test\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\n\r\nok",
+                );
+            }),
+        ];
+        assert_table!(cases, |idx, (what, start)| {
+            let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new().build_with_ctx();
+            app.settings.external_tools = vec![tool.clone()];
+            let before = app.tab;
+            start(&mut app);
+            assert_eq!(app.tab, before, "case #{idx} ({what}): running does not move the user");
+            let runs = app.runs.snapshot();
+            assert_eq!(runs.len(), 1, "case #{idx} ({what}): the run was recorded");
+            assert_eq!(runs[0].label, "probe", "case #{idx} ({what})");
+            assert_eq!(runs[0].target_url, "http://shop.test/cart", "case #{idx} ({what})");
+            assert_eq!(
+                runs[0].origin,
+                crate::tooling::RunOrigin::Program("probe".into()),
+                "case #{idx} ({what}): and it knows what to start again"
+            );
+        });
+    }
+
+    /// Starting a recorded run again runs the same thing on the same message; one whose
+    /// program has since been removed says so instead of running something else.
+    #[test]
+    fn a_recorded_run_can_be_started_again() {
+        let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new().build_with_ctx();
+        app.settings.external_tools = vec![crate::tooling::ExternalTool {
+            name: "probe".into(),
+            command: "true".into(),
+            ..Default::default()
+        }];
+        let ctx = crate::tooling::ToolContext {
+            url: "http://shop.test/cart".into(),
+            request: "GET /cart HTTP/1.1\r\nHost: shop.test\r\n\r\n".into(),
+            ..Default::default()
+        };
+        let first = app.runs.begin("probe", crate::tooling::RunOrigin::Program("probe".into()), &ctx);
+        app.runs.finish(first, crate::tooling::RunStatus::Succeeded, Some(0), 5);
+
+        rerun_automation(&mut app, first);
+        let runs = app.runs.snapshot();
+        assert_eq!(runs.len(), 2, "a second run was opened");
+        assert_eq!(runs[1].target_url, ctx.url, "on the same message as the first");
+        assert_eq!(runs[1].context.request, ctx.request);
+        assert_eq!(app.automation_run_sel, Some(runs[1].id), "and it is the one being watched");
+
+        // the program it ran is gone: nothing is started, and the reason is on screen
+        app.settings.external_tools.clear();
+        rerun_automation(&mut app, first);
+        assert_eq!(app.runs.snapshot().len(), 2, "nothing further was started");
+        assert!(app.automation_msg.contains("probe"), "{:?}", app.automation_msg);
+
+        // and a run id that is not there at all is simply no-op
+        rerun_automation(&mut app, 9999);
+        assert_eq!(app.runs.snapshot().len(), 2);
     }
 }

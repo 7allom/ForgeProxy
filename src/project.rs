@@ -73,6 +73,10 @@ pub struct ProjectFile {
     /// in older files, which inherit all global settings.
     #[serde(default)]
     pub overrides: crate::state::Overrides,
+    /// Issues a program reported through the Automation tab. They belong to no scan task, so
+    /// they are kept here rather than inside one. Absent in older files.
+    #[serde(default)]
+    pub imported_findings: Vec<crate::scan::Finding>,
 }
 
 pub fn snapshot(app: &App) -> ProjectFile {
@@ -107,6 +111,7 @@ pub fn snapshot(app: &App) -> ProjectFile {
         tls_passthrough: app.tls_passthrough.clone(),
         skip_extensions: app.skip_extensions.clone(),
         overrides: app.overrides.clone(),
+        imported_findings: app.findings.clone(),
     }
 }
 
@@ -174,6 +179,8 @@ pub fn reset(app: &mut App) {
     app.skip_extensions_sel = None;
     app.tasks = default_tasks();
     app.task_sel = 0;
+    app.findings.clear();
+    app.finding_sel = 0;
     app.show_new_scan = false;
     app.new_scan_urls.clear();
     app.new_scan_crawl = true;
@@ -219,6 +226,8 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     if !f.tasks.is_empty() {
         app.tasks = f.tasks;
     }
+    app.findings = f.imported_findings;
+    app.finding_sel = 0;
     // the collections first, then the items, then the mending of anything the file was
     // saved too early to hold: ids of their own for the items, and a collection that is
     // really there for each of them

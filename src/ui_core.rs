@@ -41,6 +41,7 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
             Tab::Comparer => crate::ui_comparer::comparer(app, ui, &p),
             Tab::Logger => crate::ui_tools::logger(app, ui, &p),
             Tab::Organizer => crate::ui_organizer::organizer(app, ui, &p),
+            Tab::Automation => crate::ui_automation::automation(app, ui, &p),
         }
     });
 }

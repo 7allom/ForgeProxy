@@ -28,7 +28,8 @@ fn first_id(node: &SiteMapNode) -> Option<usize> {
 }
 
 /// The node's right-click menu. Returns the choice; `apply_node_action` carries it out.
-fn node_menu(ui: &mut Ui, node: &SiteMapNode) -> Option<NodeAction> {
+/// `tools` is the registered programs on offer, from `crate::ui_tools::menu_external_tools`.
+fn node_menu(ui: &mut Ui, node: &SiteMapNode, tools: &[(usize, String)]) -> Option<NodeAction> {
     let mut pick = None;
     ui.label(RichText::new(&node.full_url).monospace().size(11.5));
     ui.separator();
@@ -54,6 +55,13 @@ fn node_menu(ui: &mut Ui, node: &SiteMapNode) -> Option<NodeAction> {
     }
     if ui.button("Copy URL").clicked() {
         pick = Some(NodeAction::CopyUrl(node.full_url.clone()));
+    }
+    // a program is given a message to work on, so it is offered only for a node that has one
+    // recorded under it -- the same condition the "Send to" entries above are drawn under
+    if let Some(id) = first_id(node) {
+        if let Some(t) = crate::ui_tools::external_tools_menu_pick(ui, tools) {
+            pick = Some(NodeAction::Send(id, actions::SendTo::External(t)));
+        }
     }
     if pick.is_some() {
         ui.close_menu();
@@ -90,6 +98,7 @@ fn draw_node(
     default_open: bool,
     pick: &mut Option<String>,
     menu: &mut Option<NodeAction>,
+    tools: &[(usize, String)],
 ) {
     if !filter.keeps(node) {
         return;
@@ -106,7 +115,7 @@ fn draw_node(
             *pick = Some(node.full_url.clone());
         }
         resp.context_menu(|ui| {
-            if let Some(a) = node_menu(ui, node) {
+            if let Some(a) = node_menu(ui, node, tools) {
                 *menu = Some(a);
             }
         });
@@ -116,14 +125,14 @@ fn draw_node(
             .default_open(default_open)
             .show(ui, |ui| {
                 for child in node.children.values() {
-                    draw_node(ui, p, child, below, selected, false, pick, menu);
+                    draw_node(ui, p, child, below, selected, false, pick, menu, tools);
                 }
             });
         if header.header_response.clicked() {
             *pick = Some(node.full_url.clone());
         }
         header.header_response.context_menu(|ui| {
-            if let Some(a) = node_menu(ui, node) {
+            if let Some(a) = node_menu(ui, node, tools) {
                 *menu = Some(a);
             }
         });
@@ -181,6 +190,8 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
     // rules are a handful of short strings, beside the history snapshot already cloned above
     let (scope, query) = (app.target_scope.clone(), app.site_map_search.clone());
     let filter = crate::target::SiteMapFilter { scope: &scope, scope_only: app.site_map_scope_only, query: &query };
+    // likewise the registered programs the node menus offer: the tree is drawn from `app`
+    let menu_tools = crate::ui_tools::menu_external_tools(&app.settings);
 
     // the tree gives way as the window narrows: it keeps at most 60% of whatever width there
     // is, so the requests beside it always have room, and the splitter cannot be dragged past
@@ -202,7 +213,7 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                 }
                 let shown = app.site_map.roots.values().filter(|r| filter.keeps(r)).count();
                 for root in app.site_map.roots.values() {
-                    draw_node(ui, p, root, filter, &app.target_selected_node, true, &mut pick_node, &mut menu);
+                    draw_node(ui, p, root, filter, &app.target_selected_node, true, &mut pick_node, &mut menu, &menu_tools);
                 }
                 if shown == 0 && !app.site_map.roots.is_empty() {
                     ui.label(RichText::new("Nothing here matches the filter.").size(12.0).color(p.disabled));
@@ -353,6 +364,15 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                                 ui.ctx().copy_text(actions::entry_url(e));
                                 ui.close_menu();
                             }
+                            // the programs the user registered, offered here as they are on
+                            // every other traffic row
+                            crate::ui_tools::append_external_tools_menu(
+                                ui,
+                                app,
+                                &actions::entry_url(e),
+                                &actions::raw_request(e),
+                                &e.response,
+                            );
                         });
                     }
                 });
@@ -372,6 +392,110 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     if let Some(a) = menu {
         apply_node_action(app, &all, a, ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod node_menu_tests {
+    use crate::state::{App, Tab};
+    use crate::test_utils::{assert_table, HttpFixture, MockAppBuilder};
+    use crate::tooling::ExternalTool;
+    use eframe::egui;
+
+    /// The Target tab with one recorded exchange filed in the site map, nothing selected, and
+    /// `tools` registered.
+    fn tree_app(tools: Vec<ExternalTool>) -> (egui::Context, App) {
+        let entry = HttpFixture::get("shop.test", "/orders")
+            .with_response("200 OK", "{}")
+            .into_history_entry(1, "Proxy");
+        let (ctx, mut app) =
+            MockAppBuilder::new().with_tab(Tab::Target).with_history_entry(entry).build_with_ctx();
+        ctx.enable_accesskit();
+        crate::actions::sync_site_map(&mut app);
+        app.target_sub = 0;
+        app.settings.external_tools = tools;
+        (ctx, app)
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> Option<egui::accesskit::TreeUpdate> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 950.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+    }
+
+    fn labels(update: &Option<egui::accesskit::TreeUpdate>) -> Vec<String> {
+        update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().or_else(|| n.value()).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Right-click the tree node labelled `node` and return what its menu offers.
+    fn node_menu(ctx: &egui::Context, app: &mut App, node: &str) -> Vec<String> {
+        frame(ctx, app, Vec::new());
+        let update = frame(ctx, app, Vec::new());
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let r = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(node) || n.value() == Some(node))
+            .and_then(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("no tree node labelled {node:?} among {:?}", labels(&update)));
+        let at = egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(ctx, app, vec![egui::Event::PointerMoved(at), button(true)]);
+        let open = labels(&frame(ctx, app, vec![button(false)]));
+        assert!(open.iter().any(|l| l == "Copy URL"), "the node's menu is open: {open:?}");
+        open
+    }
+
+    /// A tree node's menu offers the registered programs, on the exchange filed under it, and
+    /// groups them once there are more than fit a menu. Both shapes of node are covered: the
+    /// host, which is a branch with a collapsing header, and the leaf under it.
+    #[test]
+    fn a_tree_node_offers_the_registered_programs_matrix() {
+        let cases = ["http://shop.test", "orders"];
+        assert_table!(cases, |idx, node| {
+            let one = vec![ExternalTool {
+                name: "Header survey".into(),
+                command: "/bin/echo".into(),
+                ..Default::default()
+            }];
+            let (ctx, mut app) = tree_app(one);
+            let open = node_menu(&ctx, &mut app, node);
+            assert!(
+                open.iter().any(|l| l == "Header survey"),
+                "case #{idx} ({node:?}): the registered program is offered: {open:?}"
+            );
+
+            let many: Vec<ExternalTool> = (1..=crate::ui_tools::MENU_TOOLS_INLINE_MAX + 1)
+                .map(|n| ExternalTool {
+                    name: format!("Survey {n}"),
+                    command: "/bin/echo".into(),
+                    ..Default::default()
+                })
+                .collect();
+            let (ctx, mut app) = tree_app(many);
+            let open = node_menu(&ctx, &mut app, node);
+            assert!(
+                open.iter().any(|l| l == crate::ui_tools::MENU_TOOLS_SUBMENU),
+                "case #{idx} ({node:?}): a long registry is grouped: {open:?}"
+            );
+            assert!(
+                !open.iter().any(|l| l.starts_with("Survey ")),
+                "case #{idx} ({node:?}): and none of them is listed beside it: {open:?}"
+            );
+        });
     }
 }
 

@@ -14,21 +14,21 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard, Target, Proxy, Intruder, Repeater, Collaborator, Sequencer,
-    Decoder, Comparer, Logger, Organizer,
+    Decoder, Comparer, Logger, Organizer, Automation,
 }
 impl Copy for Tab {}
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Dashboard, Tab::Target, Tab::Proxy, Tab::Intruder, Tab::Repeater, Tab::Collaborator,
-        Tab::Sequencer, Tab::Decoder, Tab::Comparer, Tab::Logger, Tab::Organizer,
+        Tab::Sequencer, Tab::Decoder, Tab::Comparer, Tab::Logger, Tab::Organizer, Tab::Automation,
     ];
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard", Tab::Target => "Target", Tab::Proxy => "Proxy",
             Tab::Intruder => "Intruder", Tab::Repeater => "Repeater", Tab::Collaborator => "Collaborator",
             Tab::Sequencer => "Sequencer", Tab::Decoder => "Decoder", Tab::Comparer => "Comparer",
-            Tab::Logger => "Logger", Tab::Organizer => "Organizer",
+            Tab::Logger => "Logger", Tab::Organizer => "Organizer", Tab::Automation => "Automation",
         }
     }
 }
@@ -227,8 +227,11 @@ pub struct UserSettings {
     pub display_limit_kib: usize,
     /// Hold the capture when the store is full, instead of dropping the oldest entries.
     pub pause_when_full: bool,
-    /// Settings > External tools: programs offered on the "Send to" menus.
+    /// The one program registry: the Automation tab edits it, and every "Send to" menu
+    /// offers what is in it.
     pub external_tools: Vec<crate::tooling::ExternalTool>,
+    /// Pipelines: registered programs run one after another, from the Automation tab.
+    pub automation_plans: Vec<crate::tooling::AutomationPlan>,
     /// Settings > Proxy > Browser: how the proxy browser is launched. Empty fields mean
     /// "work it out", which is what the app did before any of this was configurable.
     pub browser_binary: String,
@@ -266,6 +269,7 @@ impl Default for UserSettings {
             display_limit_kib: crate::rules::DEFAULT_DISPLAY_LIMIT_KIB,
             pause_when_full: false,
             external_tools: Vec::new(),
+            automation_plans: Vec::new(),
             browser_binary: String::new(),
             browser_profile_dir: String::new(),
             browser_extra_args: String::new(),
@@ -300,6 +304,10 @@ impl UserSettings {
         self.max_body_kib = self.max_body_kib.clamp(*b.start(), *b.end());
         let d = crate::rules::DISPLAY_LIMIT_KIB_RANGE;
         self.display_limit_kib = self.display_limit_kib.clamp(*d.start(), *d.end());
+        let t = crate::tooling::TIMEOUT_RANGE;
+        for tool in &mut self.external_tools {
+            tool.timeout_secs = tool.timeout_secs.clamp(*t.start(), *t.end());
+        }
         self
     }
 
@@ -545,8 +553,26 @@ pub struct App {
     pub settings_page: SettingsPage,
     /// Card the Settings window scrolls to once (deep links from the command palette).
     pub settings_focus: Option<&'static str>,
-    /// Which registered program the External tools page has open for editing.
-    pub ext_tool_sel: Option<usize>,
+    // automation
+    /// Which registered program or pipeline the Automation tab has open for editing.
+    pub automation_sel: crate::ui_automation::AutomationSel,
+    /// What the Automation sidebar's search box holds: it narrows both of the lists under it
+    /// and is a view of the session, not something registered, so it is never saved.
+    pub automation_filter: String,
+    /// The address a run is started on, and the recorded exchange it was picked from (None
+    /// when it was typed by hand).
+    pub automation_target: String,
+    pub automation_source: Option<usize>,
+    /// Which of the console's three tabs is showing, and which run it is showing.
+    pub automation_console: crate::ui_automation::ConsoleTab,
+    pub automation_run_sel: Option<u64>,
+    /// The line under the run bar: what was started, or why nothing was.
+    pub automation_msg: String,
+    /// Every program and pipeline run this session, newest last, bounded.
+    pub runs: crate::tooling::RunLog,
+    /// Issues reported by a program, through the Automation tab. Kept beside the scan tasks'
+    /// own findings, and shown with them in the Dashboard and the All issues drawer.
+    pub findings: Vec<Finding>,
     /// The shortcut editor is listening for the keys to give this action. While it is, the
     /// dispatch stands down: otherwise the keys being offered are swallowed by whatever they
     /// are currently bound to, and a shortcut already in use could never be moved.
@@ -785,7 +811,15 @@ impl App {
             show_settings: false,
             settings_page: SettingsPage::Proxy,
             settings_focus: None,
-            ext_tool_sel: None,
+            automation_sel: crate::ui_automation::AutomationSel::None,
+            automation_filter: String::new(),
+            automation_target: String::new(),
+            automation_source: None,
+            automation_console: crate::ui_automation::ConsoleTab::Stdout,
+            automation_run_sel: None,
+            automation_msg: String::new(),
+            runs: crate::tooling::RunLog::new(Some(cc.egui_ctx.clone())),
+            findings: Vec::new(),
             hotkey_capturing: None,
             rep_unpack: true,
             intercept_default: rules::INTERCEPT_AT_STARTUP,
@@ -980,6 +1014,7 @@ impl App {
             || self.repeater_tabs.len() > 1
             || self.repeater_tabs.iter().any(|t| t.has_data())
             || !self.organizer.is_empty()
+            || !self.findings.is_empty()
             || self.target_scope != crate::scope::TargetScope::default()
             || !self.int_payloads.trim().is_empty()
     }
@@ -1256,8 +1291,12 @@ impl eframe::App for App {
             let mut up = self.proxy.upstream_proxy.lock().unwrap_or_else(|e| e.into_inner());
             if *up != eff.upstream_proxy { *up = eff.upstream_proxy.clone(); }
         }
-        if self.int_running || self.collab_polling {
-            // Intruder and Collaborator results arrive from worker threads; keep the UI moving
+        // findings a background run parsed reach the issue store here, on the one thread
+        // that may touch it
+        crate::actions::drain_tool_findings(self);
+        if self.int_running || self.collab_polling || self.runs.running() > 0 {
+            // Intruder, Collaborator and Automation results arrive from worker threads; keep
+            // the UI moving
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         } else if !self.proxy.held.lock().unwrap_or_else(|e| e.into_inner()).is_empty() || self.proxy.running.load(std::sync::atomic::Ordering::SeqCst) {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1632,6 +1671,20 @@ mod settings_tests {
             command: "python3".into(),
             args: "-u check.py {url} {req_file}".into(),
             stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+            timeout_secs: 120,
+            import_findings: true,
+            // off, so the round trip proves the flag is written and read back rather than
+            // landing on its default either way
+            show_in_menu: false,
+        }];
+        s.automation_plans = vec![crate::tooling::AutomationPlan {
+            name: "Collect and report".into(),
+            steps: vec![crate::tooling::PipelineStep {
+                tool_index: 0,
+                args_override: "--from {prev_out_file}".into(),
+                on_failure: crate::tooling::StepFailurePolicy::Continue,
+                import_findings: true,
+            }],
         }];
         s.save(&dir).unwrap();
         assert_eq!(UserSettings::load(&dir).unwrap(), s, "everything came back as written");
@@ -1655,6 +1708,7 @@ mod settings_tests {
         assert_eq!(older.display_limit_kib, crate::rules::DEFAULT_DISPLAY_LIMIT_KIB);
         assert!(!older.pause_when_full, "the oldest entries give way, as they always did");
         assert!(older.external_tools.is_empty(), "no program is offered that was not set up");
+        assert!(older.automation_plans.is_empty(), "and no pipeline that was not built");
         assert!(older.browser_binary.is_empty() && older.browser_profile_dir.is_empty());
         assert_eq!(older.browser_start_url, crate::browser::DEFAULT_START_URL);
 
@@ -1664,6 +1718,38 @@ mod settings_tests {
         assert_eq!(partial.external_tools.len(), 1);
         assert!(!partial.external_tools[0].is_runnable(), "and it is not offered on a menu");
         assert_eq!(partial.external_tools[0].stdin_mode, crate::tooling::ToolStdinMode::None);
+        assert_eq!(
+            partial.external_tools[0].timeout_secs,
+            crate::tooling::DEFAULT_TIMEOUT_SECS,
+            "and it is given the usual amount of time, not none at all"
+        );
+        assert!(!partial.external_tools[0].import_findings);
+        assert!(
+            partial.external_tools[0].show_in_menu,
+            "a file written before the menus could be turned off had every program on them"
+        );
+
+        // and the flag is honoured when the file does carry it, either way round
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"external_tools":[{"name":"a","command":"b","show_in_menu":false},{"name":"c","command":"d","show_in_menu":true}]}"#,
+        )
+        .unwrap();
+        let hidden = UserSettings::load(&dir).expect("it still loads");
+        assert!(!hidden.external_tools[0].show_in_menu);
+        assert!(!hidden.external_tools[0].on_menus(), "runnable, but kept off the menus");
+        assert!(hidden.external_tools[1].on_menus(), "while the one beside it is offered");
+
+        // a timeout nobody wants, from a file edited by hand, is brought into range on load
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"external_tools":[{"name":"a","command":"b","timeout_secs":0},{"name":"c","command":"d","timeout_secs":999999}]}"#,
+        )
+        .unwrap();
+        let clamped = UserSettings::load(&dir).expect("it still loads");
+        let range = crate::tooling::TIMEOUT_RANGE;
+        assert_eq!(clamped.external_tools[0].timeout_secs, *range.start());
+        assert_eq!(clamped.external_tools[1].timeout_secs, *range.end());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

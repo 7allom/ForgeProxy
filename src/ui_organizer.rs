@@ -1125,6 +1125,7 @@ mod tests {
                 command: "python3".into(),
                 args: "-u check.py {url}".into(),
                 stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+                ..Default::default()
             },
             // unfinished: named, but with nothing to run
             crate::tooling::ExternalTool { name: "Half done".into(), ..Default::default() },

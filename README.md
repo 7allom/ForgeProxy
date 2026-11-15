@@ -46,6 +46,7 @@ ForgeProxy sits between your browser and the applications you are testing. It re
   | **Sequencer** | Captures session tokens and analyses their randomness |
   | **Decoder** | URL, HTML, Base64, Base64URL, hex, octal, binary and GZIP encoding, hashing, smart decode and a JWT inspector |
   | **Comparer** | Word-level (Myers diff) and byte-level comparisons in synchronized side-by-side panes |
+  | **Automation** | Registers your own programs, chains them into sequential pipelines, runs them on a recorded exchange with a live output console, and imports the JSON findings they report straight into the issue list |
 
   Also included: Logger, Organizer, Collaborator payloads, a command palette (`Ctrl+K`) and an Event log drawer.
 
