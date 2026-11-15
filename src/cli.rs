@@ -7,7 +7,10 @@
 //! drives, and the report it writes is the same document the Dashboard's buttons write; only
 //! the way in is different.
 
-use crate::tooling::{AutomationPlan, RunStatus};
+use crate::tooling::{
+    AutomationBundle, AutomationPlan, ConflictPolicy, ExternalTool, HeadlessOutcome, RunStatus, ToolContext,
+};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -35,16 +38,36 @@ Opening:
                          one. For an isolated run on a build agent or in a container.
   --bind <host>          Listen for proxy traffic on this address instead of the saved one.
   --port <1-65535>       Listen on this port instead of the saved one.
-  --target <url>         The address a pipeline runs on. Without --run-plan it is filled into
+  --target <url>         The address a run is made against. Without a run it is filled into
                          the Automation tab's target bar.
 
 Running without a window:
   --list-plans           Print each saved pipeline with its number of steps, and exit.
-  --run-plan <name>      Run this pipeline and exit. No display server is needed. The name is
-                         matched exactly first, then ignoring capitals.
+  --run-plan <name>      Run this saved pipeline and exit. No display server is needed. The
+                         name is matched exactly first, then ignoring capitals.
+  --run-file <path>      Run the pipeline in this bundle file, using the programs the bundle
+                         carries and falling back to the registered ones for any it does not.
+                         Nothing has to be imported first. With --run-plan, that names which
+                         of the bundle's pipelines to run.
+  --tool <name>          Run one registered program and exit.
+  --req <path>           A file holding the raw request the run is about, for {req_file} and
+                         for a program given the request on its input.
+  --res <path>           The same for the raw response, and for {res_file}.
+  --var KEY=VALUE        A value the templates reach as {var:KEY}. May be given more than
+                         once, and applies to --run-plan, --run-file and --tool alike.
   --report <path>        Write the issues the run ends with to this file. A .xml path writes
                          the XML report; anything else writes HTML.
   --fail-on-findings     Exit 2 when the run finishes having reported one issue or more.
+
+Sharing programs and pipelines:
+  --import <path>        Register what a bundle file holds, and exit.
+  --on-conflict <word>   What to do with a name already registered, when importing: rename
+                         (the default), replace, or skip.
+  --export <name>        Write the pipeline or program of this name out as a bundle, and exit.
+                         A pipeline takes every program its steps run with it, so the file
+                         stands on its own.
+  --export-all           Write every program and pipeline out as one bundle, and exit.
+  --out <path>           Where --export and --export-all write to.
 
 Other:
   --tab <name>           Open on this tab.
@@ -73,9 +96,27 @@ pub struct Options {
     pub port: Option<u16>,
     pub list_plans: bool,
     pub run_plan: Option<String>,
+    /// A bundle file to run the pipeline out of, without registering anything.
+    pub run_file: Option<PathBuf>,
+    /// One registered program to run on its own.
+    pub tool: Option<String>,
+    /// Files holding the raw request and response a run is about.
+    pub req: Option<PathBuf>,
+    pub res: Option<PathBuf>,
     pub target: Option<String>,
     pub report: Option<PathBuf>,
     pub fail_on_findings: bool,
+    /// Values the templates reach as `{var:KEY}`.
+    pub vars: BTreeMap<String, String>,
+    /// A bundle file to register what is in.
+    pub import: Option<PathBuf>,
+    /// How a name already registered is settled on import. `None` leaves it to the default.
+    pub on_conflict: Option<ConflictPolicy>,
+    /// The pipeline or program to write out as a bundle.
+    pub export: Option<String>,
+    pub export_all: bool,
+    /// Where a bundle is written.
+    pub out: Option<PathBuf>,
     pub screenshot: Option<String>,
     pub tab: Option<String>,
     pub light: bool,
@@ -95,6 +136,12 @@ impl Options {
     /// Where settings.json is read from and written to for this run.
     pub fn config_dir(&self) -> PathBuf {
         self.config.clone().unwrap_or_else(crate::ca::config_dir)
+    }
+
+    /// How a name already registered is settled on import: what was asked for, else a
+    /// rename, which is the one answer that loses nothing.
+    pub fn conflict_policy(&self) -> ConflictPolicy {
+        self.on_conflict.unwrap_or(ConflictPolicy::KeepBoth)
     }
 
     /// What the app itself needs from the command line at startup.
@@ -201,6 +248,56 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 o.run_plan = Some(value("a pipeline name")?);
                 step = with_value;
             }
+            "--run-file" => {
+                o.run_file = Some(PathBuf::from(value("a bundle path")?));
+                step = with_value;
+            }
+            "--tool" => {
+                o.tool = Some(value("a program name")?);
+                step = with_value;
+            }
+            "--req" => {
+                o.req = Some(PathBuf::from(value("a file path")?));
+                step = with_value;
+            }
+            "--res" => {
+                o.res = Some(PathBuf::from(value("a file path")?));
+                step = with_value;
+            }
+            "--var" => {
+                let pair = value("KEY=VALUE")?;
+                let (key, val) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("--var takes KEY=VALUE; {pair:?} has no equals sign in it."))?;
+                if key.trim().is_empty() {
+                    return Err(format!("--var takes KEY=VALUE; {pair:?} names no key."));
+                }
+                o.vars.insert(key.trim().to_string(), val.to_string());
+                step = with_value;
+            }
+            "--import" => {
+                o.import = Some(PathBuf::from(value("a bundle path")?));
+                step = with_value;
+            }
+            "--on-conflict" => {
+                let word = value("rename, replace or skip")?;
+                o.on_conflict = Some(ConflictPolicy::from_word(&word).ok_or_else(|| {
+                    format!("{word:?} is not one of rename, replace or skip.")
+                })?);
+                step = with_value;
+            }
+            "--export" => {
+                o.export = Some(value("a pipeline or program name")?);
+                step = with_value;
+            }
+            "--export-all" => {
+                no_value()?;
+                o.export_all = true;
+            }
+            "--out" => {
+                o.out = Some(PathBuf::from(value("a file path")?));
+                step = with_value;
+            }
             "--target" => {
                 o.target = Some(value("an address")?);
                 step = with_value;
@@ -266,6 +363,33 @@ fn plan_list(plans: &[AutomationPlan]) -> String {
     format!("\nThe pipelines saved are:\n{}", names.join("\n"))
 }
 
+/// The registered program `name` asks for: exactly, else but for its capitals, and never
+/// guessed at between two that both answer to it.
+pub fn find_tool<'a>(tools: &'a [ExternalTool], name: &str) -> Result<&'a ExternalTool, String> {
+    let wanted = name.trim();
+    if let Some(t) = tools.iter().find(|t| t.name.trim() == wanted) {
+        return Ok(t);
+    }
+    let mut folded = tools.iter().filter(|t| t.name.trim().eq_ignore_ascii_case(wanted));
+    match (folded.next(), folded.next()) {
+        (Some(t), None) => Ok(t),
+        (Some(_), Some(_)) => Err(format!(
+            "More than one program is called {wanted:?} but for its capitals. Ask for one of them exactly.{}",
+            tool_list(tools)
+        )),
+        _ => Err(format!("No program is called {wanted:?}.{}", tool_list(tools))),
+    }
+}
+
+/// The registered programs, for an error that has to say what there is instead.
+fn tool_list(tools: &[ExternalTool]) -> String {
+    if tools.is_empty() {
+        return " No programs are registered; the Automation tab registers them.".to_string();
+    }
+    let names: Vec<String> = tools.iter().map(|t| format!("  {}", t.display_name())).collect();
+    format!("\nThe programs registered are:\n{}", names.join("\n"))
+}
+
 /// The settings for this run, saying on `err` when the file could not be read (the defaults
 /// stand in that case, exactly as they do for the app).
 fn settings_of(opts: &Options, err: &mut dyn Write) -> crate::state::UserSettings {
@@ -292,10 +416,97 @@ pub fn run(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> Option<i
     if opts.list_plans {
         return Some(list_plans(opts, out, err));
     }
+    if opts.import.is_some() {
+        return Some(import_bundle(opts, out, err));
+    }
+    if opts.export.is_some() || opts.export_all {
+        return Some(export_bundle(opts, out, err));
+    }
+    // a bundle file is run from where it is; --run-plan beside it names which of its pipelines
+    if opts.run_file.is_some() {
+        return Some(run_file(opts, out, err));
+    }
+    if opts.tool.is_some() {
+        return Some(run_one_tool(opts, out, err));
+    }
     if opts.run_plan.is_some() {
         return Some(run_plan(opts, out, err));
     }
     None
+}
+
+/// `--import`: register what a bundle holds, settling any name already taken.
+fn import_bundle(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(path) = &opts.import else { return EXIT_FAILED };
+    let bundle = match crate::tooling::read_bundle(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_FAILED;
+        }
+    };
+    let mut settings = settings_of(opts, err);
+    let policy = opts.conflict_policy();
+    let report = bundle.merge_into(&mut settings, policy);
+    let dir = opts.config_dir();
+    if let Err(e) = settings.save(&dir) {
+        let _ = writeln!(err, "Couldn't save the settings in {}: {e}", dir.display());
+        return EXIT_FAILED;
+    }
+    let name = match bundle.name.trim() {
+        "" => path.display().to_string(),
+        named => named.to_string(),
+    };
+    let _ = writeln!(out, "{name}: a name already registered was set to {}.", policy.word());
+    for line in report.lines() {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = writeln!(
+        out,
+        "{} of {} registered in {}.",
+        report.taken(),
+        report.tools.len() + report.plans.len(),
+        dir.join(crate::state::SETTINGS_FILE).display()
+    );
+    EXIT_OK
+}
+
+/// `--export` and `--export-all`: write a bundle out to `--out`.
+fn export_bundle(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(path) = &opts.out else {
+        let _ = writeln!(err, "--export needs --out <path.json>: there is nowhere to write it otherwise.");
+        return EXIT_FAILED;
+    };
+    let settings = settings_of(opts, err);
+    // the author is left for whoever shares the file to fill in; nothing here signs it for them
+    let bundle = match &opts.export {
+        None => AutomationBundle::from_all(&settings.external_tools, &settings.automation_plans, ""),
+        Some(name) => match find_plan(&settings.automation_plans, name) {
+            Ok(plan) => AutomationBundle::from_plan(plan, &settings.external_tools, ""),
+            // a name that is no pipeline may still be a program
+            Err(no_plan) => match find_tool(&settings.external_tools, name) {
+                Ok(tool) => AutomationBundle::from_tool(tool, ""),
+                Err(no_tool) => {
+                    let _ = writeln!(err, "{no_plan}\n{no_tool}");
+                    return EXIT_FAILED;
+                }
+            },
+        },
+    };
+    if let Err(e) = crate::tooling::write_bundle(&bundle, path) {
+        let _ = writeln!(err, "{e}");
+        return EXIT_FAILED;
+    }
+    let _ = writeln!(
+        out,
+        "Wrote {} {} and {} {} to {}.",
+        bundle.tools.len(),
+        if bundle.tools.len() == 1 { "program" } else { "programs" },
+        bundle.plans.len(),
+        if bundle.plans.len() == 1 { "pipeline" } else { "pipelines" },
+        path.display()
+    );
+    EXIT_OK
 }
 
 /// `--list-plans`: every saved pipeline with how many steps it has.
@@ -321,26 +532,38 @@ fn finding_line(f: &crate::scan::Finding) -> String {
     format!("[{}] {} — {}{}", f.severity.label(), f.name, f.host, f.path)
 }
 
-/// `--run-plan`: run one pipeline unattended, from the settings in `--config`, over the
-/// address in `--target`, keeping what it reports in `--project` and `--report`.
-fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let wanted = opts.run_plan.clone().unwrap_or_default();
-    let settings = settings_of(opts, err);
-    let plan = match find_plan(&settings.automation_plans, &wanted) {
-        Ok(p) => p.clone(),
-        Err(e) => {
-            let _ = writeln!(err, "{e}");
-            return EXIT_FAILED;
-        }
-    };
+/// What the three ways of running something unattended all need: where it is pointed, the
+/// message it is about, and the project that is to carry what it finds.
+struct RunSetup {
+    target: String,
+    ctx: ToolContext,
+    /// The project to write back, when one was named, and what it already held.
+    project: Option<(String, crate::project::ProjectFile)>,
+    prior: Vec<crate::scan::Finding>,
+}
+
+/// Work out what a run is pointed at, from `--target`, `--var`, `--req`, `--res` and
+/// `--project`. `Err` is the exit code to end with, the reason having been said on `err`.
+fn setup(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> Result<RunSetup, i32> {
     let target = opts.target.as_deref().unwrap_or_default().trim().to_string();
     if target.is_empty() {
-        let _ = writeln!(err, "--run-plan needs --target <url>: a pipeline is run on an address.");
-        return EXIT_FAILED;
+        let _ = writeln!(err, "A run needs --target <url>: something is run against an address.");
+        return Err(EXIT_FAILED);
     }
+    // the raw request and response, when files for them were given: a program is handed these
+    // on its input and through {req_file} and {res_file}
+    let mut read = |what: &str, path: Option<&PathBuf>| -> Result<String, i32> {
+        let Some(path) = path else { return Ok(String::new()) };
+        std::fs::read_to_string(path).map_err(|e| {
+            let _ = writeln!(err, "Couldn't read the {what} from {}: {e}", path.display());
+            EXIT_FAILED
+        })
+    };
+    let request = read("request", opts.req.as_ref())?;
+    let response = read("response", opts.res.as_ref())?;
+    let mut ctx = crate::actions::tool_context(&target, &request, &response);
+    ctx.vars = opts.vars.clone();
 
-    // the project the findings are to be kept in, read first so they can be merged with what
-    // is already there; a path that is not there yet becomes a new project when the run ends
     let mut project: Option<(String, crate::project::ProjectFile)> = None;
     if let Some(path) = &opts.project {
         if Path::new(path).exists() {
@@ -348,26 +571,23 @@ fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 Ok(f) => project = Some((path.clone(), f)),
                 Err(e) => {
                     let _ = writeln!(err, "{e}");
-                    return EXIT_FAILED;
+                    return Err(EXIT_FAILED);
                 }
             }
         } else {
             let _ = writeln!(out, "{path} is not there yet; it will be written when the run ends.");
-            project = Some((path.clone(), crate::project::ProjectFile::fresh(&plan.display_name())));
+            project = Some((path.clone(), crate::project::ProjectFile::fresh(&target)));
         }
     }
-    let prior: Vec<crate::scan::Finding> =
-        project.as_ref().map(|(_, f)| f.imported_findings.clone()).unwrap_or_default();
+    let prior = project.as_ref().map(|(_, f)| f.imported_findings.clone()).unwrap_or_default();
+    Ok(RunSetup { target, ctx, project, prior })
+}
 
-    let steps = plan.steps.len();
-    let _ = writeln!(
-        out,
-        "{} on {target}: {steps} {}",
-        plan.display_name(),
-        if steps == 1 { "step." } else { "steps." }
-    );
-    let ctx = crate::actions::tool_context(&target, "", "");
-    let outcome = crate::tooling::run_plan_streaming(&plan, &settings.external_tools, &ctx, out);
+/// Say how a run ended, keep what it found, and give back the exit code for it.
+///
+/// The findings go through the same consolidation the app uses, against what the project
+/// already held, so a run repeated on the same project does not list everything twice.
+fn settle(opts: &Options, out: &mut dyn Write, err: &mut dyn Write, outcome: HeadlessOutcome, setup: RunSetup) -> i32 {
     // with the exit status when the run did not succeed, which is worth knowing without
     // reading back through the output; a run that did succeed says only that, as the run
     // history in the app does
@@ -378,11 +598,9 @@ fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(out, "\n{ended} after {} ms.", outcome.elapsed_ms);
 
-    // through the same consolidation the app uses, against what the project already held, so
-    // a run repeated on the same project does not list everything twice
     let reported = outcome.findings.len();
-    let before = prior.len();
-    let mut all = prior;
+    let before = setup.prior.len();
+    let mut all = setup.prior;
     all.extend(outcome.findings.iter().cloned());
     let kept = crate::scan::consolidate(all);
     let added = kept.len().saturating_sub(before);
@@ -391,7 +609,7 @@ fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let _ = writeln!(out, "{reported} reported, {added} new.");
 
-    if let Some((path, mut file)) = project {
+    if let Some((path, mut file)) = setup.project {
         file.imported_findings = kept.clone();
         match crate::project::write(&file, &path) {
             Ok(()) => {
@@ -425,6 +643,141 @@ fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         _ if opts.fail_on_findings && reported >= 1 => EXIT_FINDINGS,
         _ => EXIT_OK,
     }
+}
+
+/// The line a run opens with, saying what is about to be run on what.
+fn announce(out: &mut dyn Write, what: &str, target: &str, steps: Option<usize>, vars: &BTreeMap<String, String>) {
+    match steps {
+        Some(1) => {
+            let _ = writeln!(out, "{what} on {target}: 1 step.");
+        }
+        Some(n) => {
+            let _ = writeln!(out, "{what} on {target}: {n} steps.");
+        }
+        None => {
+            let _ = writeln!(out, "{what} on {target}.");
+        }
+    }
+    if !vars.is_empty() {
+        let given: Vec<String> = vars.keys().map(|k| format!("{{var:{k}}}")).collect();
+        let _ = writeln!(out, "Values given for {}.", given.join(", "));
+    }
+}
+
+/// `--run-plan`: run one saved pipeline unattended, from the settings in `--config`.
+fn run_plan(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let wanted = opts.run_plan.clone().unwrap_or_default();
+    let settings = settings_of(opts, err);
+    let plan = match find_plan(&settings.automation_plans, &wanted) {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_FAILED;
+        }
+    };
+    let setup = match setup(opts, out, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    announce(out, &plan.display_name(), &setup.target, Some(plan.steps.len()), &opts.vars);
+    let outcome = crate::tooling::run_plan_streaming(&plan, &settings.external_tools, &setup.ctx, out);
+    settle(opts, out, err, outcome, setup)
+}
+
+/// `--run-file`: run a pipeline straight out of a bundle, with the programs the bundle carries.
+///
+/// Nothing is registered: the file is read, the pipeline in it is run, and the settings are
+/// left exactly as they were. Programs the bundle does not carry are looked for among the
+/// registered ones, so a bundle holding only a pipeline still works for whoever has the
+/// programs it names.
+fn run_file(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(path) = &opts.run_file else { return EXIT_FAILED };
+    let bundle = match crate::tooling::read_bundle(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_FAILED;
+        }
+    };
+    let plan = match (&opts.run_plan, bundle.plans.len()) {
+        // --run-plan beside --run-file names which of the bundle's pipelines is meant
+        (Some(name), _) => match find_plan(&bundle.plans, name) {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                let _ = writeln!(err, "{} holds no such pipeline. {e}", path.display());
+                return EXIT_FAILED;
+            }
+        },
+        (None, 1) => bundle.plans[0].clone(),
+        (None, 0) => {
+            let _ = writeln!(err, "{} holds no pipeline to run; --tool runs a single program.", path.display());
+            return EXIT_FAILED;
+        }
+        (None, _) => {
+            let names: Vec<String> = bundle.plans.iter().map(|p| format!("  {}", p.display_name())).collect();
+            let _ = writeln!(
+                err,
+                "{} holds more than one pipeline; name the one to run with --run-plan.\nThe pipelines in it are:\n{}",
+                path.display(),
+                names.join("\n")
+            );
+            return EXIT_FAILED;
+        }
+    };
+    let settings = settings_of(opts, err);
+    // the bundle's own programs first; anything it did not carry falls back to the registry
+    let mut tools = bundle.tools.clone();
+    for registered in &settings.external_tools {
+        if !tools.iter().any(|t| t.name.trim() == registered.name.trim()) {
+            tools.push(registered.clone());
+        }
+    }
+    let mut plan = plan;
+    crate::tooling::bind_steps(&tools, std::slice::from_mut(&mut plan));
+    let setup = match setup(opts, out, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let _ = writeln!(
+        out,
+        "From {}: {} {} carried, {} registered.",
+        path.display(),
+        bundle.tools.len(),
+        if bundle.tools.len() == 1 { "program" } else { "programs" },
+        settings.external_tools.len()
+    );
+    announce(out, &plan.display_name(), &setup.target, Some(plan.steps.len()), &opts.vars);
+    let outcome = crate::tooling::run_plan_streaming(&plan, &tools, &setup.ctx, out);
+    settle(opts, out, err, outcome, setup)
+}
+
+/// `--tool`: run one registered program on its own.
+fn run_one_tool(opts: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let wanted = opts.tool.clone().unwrap_or_default();
+    let settings = settings_of(opts, err);
+    let tool = match find_tool(&settings.external_tools, &wanted) {
+        Ok(t) if t.is_runnable() => t.clone(),
+        Ok(t) => {
+            let _ = writeln!(
+                err,
+                "{:?} is registered but cannot be run: it names {}.",
+                t.display_name(),
+                if t.command.trim().is_empty() { "no program" } else { "no menu label" }
+            );
+            return EXIT_FAILED;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return EXIT_FAILED;
+        }
+    };
+    let setup = match setup(opts, out, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    announce(out, &tool.display_name(), &setup.target, None, &opts.vars);
+    let outcome = crate::tooling::run_tool_streaming(&tool, &setup.ctx, out);
+    settle(opts, out, err, outcome, setup)
 }
 
 #[cfg(test)]
@@ -590,7 +943,7 @@ mod tests {
     }
 
     fn plan(name: &str, steps: usize) -> AutomationPlan {
-        AutomationPlan { name: name.into(), steps: vec![PipelineStep::default(); steps] }
+        AutomationPlan { name: name.into(), steps: vec![PipelineStep::default(); steps], ..Default::default() }
     }
 
     /// The pipeline a name asks for: exactly, else but for its capitals, and never guessed at
@@ -706,6 +1059,7 @@ mod tests {
                     PipelineStep { tool_index: 0, ..Default::default() },
                     PipelineStep { tool_index: 1, ..Default::default() },
                 ],
+                ..Default::default()
             }],
         );
 
@@ -763,7 +1117,7 @@ mod tests {
         saved_settings(
             &cfg,
             vec![survey],
-            vec![AutomationPlan { name: "Survey".into(), steps: vec![PipelineStep::default()] }],
+            vec![AutomationPlan { name: "Survey".into(), steps: vec![PipelineStep::default()], ..Default::default() }],
         );
         let report = dir.join("report.xml");
         let (code, out, err) = headless(&format!(
@@ -795,8 +1149,8 @@ mod tests {
             &cfg,
             vec![quiet, noisy],
             vec![
-                AutomationPlan { name: "Quiet".into(), steps: vec![PipelineStep { tool_index: 0, ..Default::default() }] },
-                AutomationPlan { name: "Noisy".into(), steps: vec![PipelineStep { tool_index: 1, ..Default::default() }] },
+                AutomationPlan { name: "Quiet".into(), steps: vec![PipelineStep { tool_index: 0, ..Default::default() }], ..Default::default() },
+                AutomationPlan { name: "Noisy".into(), steps: vec![PipelineStep { tool_index: 1, ..Default::default() }], ..Default::default() },
             ],
         );
         let cases: [(&str, bool, Option<i32>); 4] = [
@@ -828,15 +1182,16 @@ mod tests {
             &cfg,
             vec![refuse, note],
             vec![
-                AutomationPlan { name: "Broken".into(), steps: vec![PipelineStep { tool_index: 0, ..Default::default() }] },
+                AutomationPlan { name: "Broken".into(), steps: vec![PipelineStep { tool_index: 0, ..Default::default() }], ..Default::default() },
                 AutomationPlan {
                     name: "Broken then on".into(),
                     steps: vec![
                         PipelineStep { tool_index: 0, on_failure: StepFailurePolicy::Continue, ..Default::default() },
                         PipelineStep { tool_index: 1, ..Default::default() },
                     ],
+                    ..Default::default()
                 },
-                AutomationPlan { name: "Fine".into(), steps: vec![PipelineStep { tool_index: 1, ..Default::default() }] },
+                AutomationPlan { name: "Fine".into(), steps: vec![PipelineStep { tool_index: 1, ..Default::default() }], ..Default::default() },
             ],
         );
         struct Case {
@@ -910,6 +1265,324 @@ mod tests {
                 case.says
             );
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The flags that came with bundles and variables read the same both ways round, and
+    /// `--var` may be given more than once.
+    #[test]
+    fn the_bundle_and_variable_flags_read_both_ways_round() {
+        for (apart, joined) in [
+            ("--run-file /tmp/b.json", "--run-file=/tmp/b.json"),
+            ("--tool Survey", "--tool=Survey"),
+            ("--req /tmp/req.txt", "--req=/tmp/req.txt"),
+            ("--res /tmp/res.txt", "--res=/tmp/res.txt"),
+            ("--import /tmp/b.json", "--import=/tmp/b.json"),
+            ("--on-conflict replace", "--on-conflict=replace"),
+            ("--export Nightly", "--export=Nightly"),
+            ("--out /tmp/b.json", "--out=/tmp/b.json"),
+            ("--var KEY=VALUE", "--var=KEY=VALUE"),
+        ] {
+            assert_eq!(parsed(apart), parsed(joined), "{apart:?} and {joined:?} read the same");
+        }
+        let o = parsed("--run-file /tmp/b.json --tool Survey --req /tmp/q --res /tmp/s --export-all --out /tmp/o.json");
+        assert_eq!(o.run_file.as_deref(), Some(Path::new("/tmp/b.json")));
+        assert_eq!(o.tool.as_deref(), Some("Survey"));
+        assert_eq!(o.req.as_deref(), Some(Path::new("/tmp/q")));
+        assert_eq!(o.res.as_deref(), Some(Path::new("/tmp/s")));
+        assert!(o.export_all);
+        assert_eq!(o.out.as_deref(), Some(Path::new("/tmp/o.json")));
+
+        // --var carries a value with anything in it, equals signs included, and stacks up
+        let o = parsed("--var ONE=first --var TWO=a=b --var THREE=");
+        assert_eq!(o.vars.get("ONE").map(String::as_str), Some("first"));
+        assert_eq!(o.vars.get("TWO").map(String::as_str), Some("a=b"), "only the first equals sign separates");
+        assert_eq!(o.vars.get("THREE").map(String::as_str), Some(""), "and a key may be given as nothing");
+        assert_eq!(o.vars.len(), 3);
+        // the later of two for the same key wins, as an assignment does
+        assert_eq!(parsed("--var K=one --var K=two").vars.get("K").map(String::as_str), Some("two"));
+
+        // how a name already registered is settled, and its default
+        assert_eq!(parsed("--on-conflict skip").conflict_policy(), crate::tooling::ConflictPolicy::Skip);
+        assert_eq!(parsed("--on-conflict rename").conflict_policy(), crate::tooling::ConflictPolicy::KeepBoth);
+        assert_eq!(parsed("--import /tmp/b.json").conflict_policy(), crate::tooling::ConflictPolicy::KeepBoth);
+
+        // and what these can get wrong
+        for (text, want) in [
+            ("--var", "needs KEY=VALUE"),
+            ("--var NOEQUALS", "no equals sign"),
+            ("--var =value", "names no key"),
+            ("--on-conflict sideways", "not one of rename, replace or skip"),
+            ("--export-all=yes", "takes no value"),
+            ("--run-file", "needs a bundle path"),
+        ] {
+            let got = refused(text);
+            assert!(got.contains(want), "{text:?} should mention {want:?}, said {got:?}");
+        }
+        // every flag the usage text advertises is one the parser knows
+        for word in USAGE.split_whitespace().filter(|w| w.starts_with("--") && w.len() > 2) {
+            let flag = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+            let e = parse(vec![flag.to_string()]).err().unwrap_or_default();
+            assert!(!e.contains("is not a flag"), "{flag:?} is in the usage text but not in the parser");
+        }
+    }
+
+    /// A bundle exported from one registry runs on a workstation with nothing registered at
+    /// all, straight out of the file: the programs it carries are enough.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_is_exported_and_then_run_from_the_file_it_was_written_to() {
+        let dir = work_dir("bundle-round-trip");
+        let (theirs, mine) = (dir.join("theirs"), dir.join("mine"));
+        let note = shell_tool(&dir, "note", "echo \"step one saw $1\"\n", "{url}");
+        let mut survey = shell_tool(&dir, "survey", &format!("cat <<'DOC'\n{TWO_FINDINGS}\nDOC\n"), "");
+        survey.import_findings = true;
+        // their registry: two programs, a pipeline over both, and one program it never runs
+        saved_settings(
+            &theirs,
+            vec![note.clone(), survey.clone(), shell_tool(&dir, "unrelated", "true\n", "")],
+            vec![AutomationPlan {
+                name: "Nightly".into(),
+                description: "Looks, then reports.".into(),
+                steps: vec![
+                    PipelineStep { tool_name: "note".into(), ..Default::default() },
+                    PipelineStep { tool_name: "survey".into(), ..Default::default() },
+                ],
+            }],
+        );
+
+        // exported by name, with the programs its steps run and nothing else
+        let bundle_path = dir.join("nightly.json");
+        let (code, out, err) = headless(&format!(
+            "--config {} --export Nightly --out {}",
+            theirs.display(),
+            bundle_path.display()
+        ));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("Wrote 2 programs and 1 pipeline"), "{out}");
+        let written = std::fs::read_to_string(&bundle_path).expect("the bundle");
+        assert!(written.contains("\"name\": \"Nightly\""), "{written}");
+        assert!(!written.contains("unrelated"), "only what the steps run: {written}");
+
+        // and run from the file, against a config directory with nothing registered in it
+        let project = dir.join("triage.forge");
+        let (code, out, err) = headless(&format!(
+            "--config {} --run-file {} --target http://shop.test/account --project {}",
+            mine.display(),
+            bundle_path.display(),
+            project.display()
+        ));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("2 programs carried, 0 registered"), "{out}");
+        assert!(out.contains("step one saw http://shop.test/account"), "the carried program ran: {out}");
+        assert!(out.contains("2 reported, 2 new."), "{out}");
+        let saved = crate::project::read(&project.display().to_string()).expect("the project");
+        assert_eq!(saved.imported_findings.len(), 2);
+        // nothing was registered by running it
+        let after = crate::state::UserSettings::load(&mine).expect("still readable");
+        assert!(after.external_tools.is_empty() && after.automation_plans.is_empty(), "a run registers nothing");
+
+        // the same bundle imported, and then the pipeline run by name from the registry
+        let (code, out, err) = headless(&format!("--config {} --import {}", mine.display(), bundle_path.display()));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("Program \"note\": added"), "{out}");
+        assert!(out.contains("Pipeline \"Nightly\": added"), "{out}");
+        assert!(out.contains("3 of 3 registered in"), "{out}");
+        let after = crate::state::UserSettings::load(&mine).expect("the settings were written");
+        assert_eq!(after.external_tools.len(), 2);
+        assert_eq!(after.automation_plans.len(), 1);
+        assert_eq!(after.automation_plans[0].description, "Looks, then reports.", "the words came with it");
+        let (code, out, err) = headless(&format!(
+            "--config {} --run-plan Nightly --target http://shop.test/",
+            mine.display()
+        ));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("step one saw http://shop.test/"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--export-all` writes the whole registry, and importing it a second time settles the
+    /// names already there the way `--on-conflict` says.
+    #[cfg(unix)]
+    #[test]
+    fn export_all_writes_the_registry_and_on_conflict_settles_a_second_import_matrix() {
+        let dir = work_dir("export-all");
+        let cfg = dir.join("config");
+        let note = shell_tool(&dir, "note", "echo first\n", "");
+        saved_settings(
+            &cfg,
+            vec![note],
+            vec![AutomationPlan {
+                name: "Nightly".into(),
+                steps: vec![PipelineStep { tool_name: "note".into(), ..Default::default() }],
+                ..Default::default()
+            }],
+        );
+        let whole = dir.join("all.json");
+        let (code, out, err) = headless(&format!("--config {} --export-all --out {}", cfg.display(), whole.display()));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("Wrote 1 program and 1 pipeline"), "{out}");
+
+        let cases: [(&str, usize, usize, &str); 3] = [
+            ("rename", 2, 2, "already taken, registered as"),
+            ("replace", 1, 1, "replaced the one already registered"),
+            ("skip", 1, 1, "skipped: already registered"),
+        ];
+        assert_table!(cases, |idx, (word, tools, plans, says)| {
+            // a fresh copy of the registry each time, so the cases do not build on each other
+            let into = dir.join(format!("into-{word}"));
+            let _ = std::fs::remove_dir_all(&into);
+            std::fs::create_dir_all(&into).expect("a place to work");
+            std::fs::copy(cfg.join(crate::state::SETTINGS_FILE), into.join(crate::state::SETTINGS_FILE))
+                .expect("the settings");
+            let (code, out, err) = headless(&format!(
+                "--config {} --import {} --on-conflict {word}",
+                into.display(),
+                whole.display()
+            ));
+            assert_eq!(code, Some(EXIT_OK), "case #{idx} ({word}): out: {out}\nerr: {err}");
+            assert!(out.contains(says), "case #{idx} ({word}): {out}");
+            let after = crate::state::UserSettings::load(&into).expect("readable");
+            assert_eq!(after.external_tools.len(), tools, "case #{idx} ({word}): programs");
+            assert_eq!(after.automation_plans.len(), plans, "case #{idx} ({word}): pipelines");
+            // whatever happened, every step still runs a program that is there
+            for plan in &after.automation_plans {
+                for step in &plan.steps {
+                    assert!(
+                        step.resolve(&after.external_tools).is_some(),
+                        "case #{idx} ({word}): {:?} runs nothing",
+                        step.display_target()
+                    );
+                }
+            }
+        });
+
+        // --export needs somewhere to write, and says so
+        let e = headless(&format!("--config {} --export-all", cfg.display())).2;
+        assert!(e.contains("needs --out"), "{e}");
+        // and a name that is neither a pipeline nor a program says both
+        let e = headless(&format!("--config {} --export Nothing --out {}", cfg.display(), whole.display())).2;
+        assert!(e.contains("No pipeline is called") && e.contains("No program is called"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--tool` runs one registered program, given the request and the response from files and
+    /// a value for a template variable.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_program_runs_with_the_files_and_values_it_was_given() {
+        let dir = work_dir("single-tool");
+        let cfg = dir.join("config");
+        // it reads the request file it was handed, and echoes the value it was given
+        let mut survey = shell_tool(
+            &dir,
+            "survey",
+            "echo \"token=$1\"\nhead -n 1 \"$2\"\nhead -n 1 \"$3\"\n",
+            "{var:TOKEN} {req_file} {res_file}",
+        );
+        survey.stdin_mode = crate::tooling::ToolStdinMode::RawRequest;
+        // and one entry too unfinished to run: a name, but no program named
+        let unfinished = ExternalTool { name: "unfinished".into(), ..Default::default() };
+        saved_settings(&cfg, vec![survey, unfinished], Vec::new());
+        let req = dir.join("request.txt");
+        let res = dir.join("response.txt");
+        std::fs::write(&req, "GET /account HTTP/1.1\r\nHost: shop.test\r\n\r\n").expect("a request");
+        std::fs::write(&res, "HTTP/1.1 200 OK\r\n\r\nok").expect("a response");
+
+        let (code, out, err) = headless(&format!(
+            "--config {} --tool survey --target http://shop.test/account --req {} --res {} --var TOKEN=a-b-c",
+            cfg.display(),
+            req.display(),
+            res.display()
+        ));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("survey on http://shop.test/account."), "{out}");
+        assert!(out.contains("Values given for {var:TOKEN}."), "it says what it was given: {out}");
+        assert!(out.contains("token=a-b-c"), "the value reached the template: {out}");
+        assert!(out.contains("GET /account HTTP/1.1"), "{{req_file}} held the request: {out}");
+        assert!(out.contains("HTTP/1.1 200 OK"), "{{res_file}} held the response: {out}");
+        assert!(out.contains("0 reported, 0 new."), "{out}");
+
+        // a program not registered, one that cannot run, and a file that is not there
+        let cases: [(String, &str); 3] = [
+            (format!("--config {} --tool nothing --target http://shop.test/", cfg.display()), "No program is called"),
+            (
+                format!("--config {} --tool unfinished --target http://shop.test/", cfg.display()),
+                "cannot be run",
+            ),
+            (
+                format!(
+                    "--config {} --tool survey --target http://shop.test/ --req {}",
+                    cfg.display(),
+                    dir.join("not-there.txt").display()
+                ),
+                "Couldn't read the request",
+            ),
+        ];
+        assert_table!(cases, |idx, (text, says)| {
+            let (code, out, err) = headless(&text);
+            assert_eq!(code, Some(EXIT_FAILED), "case #{idx}: out: {out}\nerr: {err}");
+            assert!(err.contains(says), "case #{idx}: wanted {says:?}, said {err:?}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bundle holding more than one pipeline is not picked between, and `--run-plan` beside
+    /// `--run-file` names which one is meant.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_of_several_pipelines_is_run_by_name() {
+        let dir = work_dir("several-pipelines");
+        let cfg = dir.join("config");
+        let first = shell_tool(&dir, "first", "echo 'the first one'\n", "");
+        let second = shell_tool(&dir, "second", "echo 'the second one'\n", "");
+        let bundle = crate::tooling::AutomationBundle {
+            format_version: crate::tooling::BUNDLE_FORMAT_VERSION,
+            name: "Two of them".into(),
+            tools: vec![first, second],
+            plans: vec![
+                AutomationPlan {
+                    name: "One".into(),
+                    steps: vec![PipelineStep { tool_name: "first".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+                AutomationPlan {
+                    name: "Two".into(),
+                    steps: vec![PipelineStep { tool_name: "second".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let path = dir.join("two.json");
+        crate::tooling::write_bundle(&bundle, &path).expect("the bundle");
+
+        // without a name it will not choose for you, and says what there is
+        let (code, _, err) = headless(&format!(
+            "--config {} --run-file {} --target http://shop.test/",
+            cfg.display(),
+            path.display()
+        ));
+        assert_eq!(code, Some(EXIT_FAILED));
+        assert!(err.contains("more than one pipeline") && err.contains("One") && err.contains("Two"), "{err}");
+
+        // with one, that is the one that runs
+        let (code, out, err) = headless(&format!(
+            "--config {} --run-file {} --run-plan two --target http://shop.test/",
+            cfg.display(),
+            path.display()
+        ));
+        assert_eq!(code, Some(EXIT_OK), "out: {out}\nerr: {err}");
+        assert!(out.contains("the second one") && !out.contains("the first one"), "{out}");
+
+        // a name that is in no pipeline of the bundle's
+        let (code, _, err) = headless(&format!(
+            "--config {} --run-file {} --run-plan three --target http://shop.test/",
+            cfg.display(),
+            path.display()
+        ));
+        assert_eq!(code, Some(EXIT_FAILED));
+        assert!(err.contains("holds no such pipeline"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

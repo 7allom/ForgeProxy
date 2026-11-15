@@ -308,6 +308,11 @@ impl UserSettings {
         for tool in &mut self.external_tools {
             tool.timeout_secs = tool.timeout_secs.clamp(*t.start(), *t.end());
         }
+        // every step knows the name of the program it runs, not only where it sat in the
+        // registry when the file was written: a settings file from before names were kept
+        // gains them here, and one whose registry was reordered by hand is put right
+        let tools = self.external_tools.clone();
+        crate::tooling::bind_steps(&tools, &mut self.automation_plans);
         self
     }
 
@@ -559,6 +564,9 @@ pub struct App {
     /// What the Automation sidebar's search box holds: it narrows both of the lists under it
     /// and is a view of the session, not something registered, so it is never saved.
     pub automation_filter: String,
+    /// A bundle chosen for import, waiting at the preview dialog for the user to look it over.
+    /// `None` when no import is being considered.
+    pub automation_import: Option<crate::ui_automation::ImportPreview>,
     /// The address a run is started on, and the recorded exchange it was picked from (None
     /// when it was typed by hand).
     pub automation_target: String,
@@ -830,6 +838,7 @@ impl App {
             settings_focus: None,
             automation_sel: crate::ui_automation::AutomationSel::None,
             automation_filter: String::new(),
+            automation_import: None,
             automation_target: String::new(),
             automation_source: None,
             automation_console: crate::ui_automation::ConsoleTab::Stdout,
@@ -1799,11 +1808,14 @@ mod settings_tests {
             // off, so the round trip proves the flag is written and read back rather than
             // landing on its default either way
             show_in_menu: false,
+            description: "Reads the response and reports what it finds.".into(),
         }];
         s.automation_plans = vec![crate::tooling::AutomationPlan {
             name: "Collect and report".into(),
+            description: "One step, for the round trip.".into(),
             steps: vec![crate::tooling::PipelineStep {
                 tool_index: 0,
+                tool_name: "Inspect in script".into(),
                 args_override: "--from {prev_out_file}".into(),
                 on_failure: crate::tooling::StepFailurePolicy::Continue,
                 import_findings: true,

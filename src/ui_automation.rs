@@ -10,7 +10,8 @@
 use crate::state::{App, Tab};
 use crate::theme::{self, bold, Palette};
 use crate::tooling::{
-    AutomationPlan, ExternalTool, PipelineStep, StepFailurePolicy, ToolRun, ToolStdinMode,
+    AutomationBundle, AutomationPlan, ConflictPolicy, ExternalTool, PipelineStep, StepFailurePolicy,
+    ToolRun, ToolStdinMode,
 };
 use eframe::egui;
 use egui::{RichText, Ui};
@@ -65,7 +66,29 @@ enum SidebarEdit {
     NewPipeline,
     Duplicate,
     Delete,
+    /// Choose a bundle file and put its contents up for review.
+    Import,
+    /// Write whatever is selected -- or the whole registry -- out as a bundle file.
+    Export,
 }
+
+/// A bundle chosen for import, held while the user looks over what is in it.
+///
+/// Nothing is registered until they say so: a bundle is a file from somewhere else naming
+/// programs to run on this machine, so what it holds is shown first and imported second.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportPreview {
+    /// Where it was read from, to show which file is being considered.
+    pub path: String,
+    pub bundle: AutomationBundle,
+    /// How names already registered are to be settled.
+    pub policy: ConflictPolicy,
+}
+
+/// What the preview dialog warns about. A bundle is someone else's list of programs to start.
+const IMPORT_WARNING: &str = "This file came from somewhere else and names programs to run on \
+     this machine, with the arguments below. Read them over before importing, and import only \
+     from someone you trust.";
 
 pub fn automation(app: &mut App, ui: &mut Ui, p: &Palette) {
     header(app, ui, p);
@@ -96,6 +119,170 @@ pub fn automation(app: &mut App, ui: &mut Ui, p: &Palette) {
             |ui| editor(app, ui, p),
         );
     });
+    import_dialog(app, ui, p);
+}
+
+/// Column widths in the preview dialog's tables: name, program or steps, arguments, input,
+/// and whether that name is already registered.
+const PREVIEW_COLS: [f32; 5] = [150.0, 160.0, 180.0, 95.0, 70.0];
+/// What the dialog is called, and what its two buttons say.
+pub const IMPORT_TITLE: &str = "Import Automation Bundle";
+pub const IMPORT_CONFIRM: &str = "Import";
+
+/// What a painted table row says about itself: its cells, in order, with the empty ones left
+/// out so a row reads as a sentence rather than as a run of separators.
+fn row_label(cells: &[(String, f32, Option<egui::Color32>)]) -> String {
+    let said: Vec<&str> = cells.iter().map(|(text, _, _)| text.trim()).filter(|t| !t.is_empty()).collect();
+    said.join(" — ")
+}
+
+/// The review dialog for a bundle chosen with "Import...": what is in the file, how names
+/// already registered are to be settled, and nothing registered until it is confirmed.
+fn import_dialog(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let Some(preview) = app.automation_import.clone() else { return };
+    /// What the dialog was closed with.
+    enum Choice {
+        Import(ConflictPolicy),
+        Cancel,
+    }
+    let mut policy = preview.policy;
+    let modal = egui::Modal::new(egui::Id::new("automation_import_preview")).show(ui.ctx(), |ui| {
+        ui.set_width(760.0);
+        ui.label(bold(IMPORT_TITLE, 15.0).color(p.strong));
+        ui.label(RichText::new(&preview.path).size(11.0).monospace().color(p.disabled));
+        ui.add_space(6.0);
+
+        // what the file says about itself
+        let b = &preview.bundle;
+        egui::Grid::new("automation_import_about").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
+            for (label, text) in [
+                ("Bundle:", b.name.trim()),
+                ("Description:", b.description.trim()),
+                ("Author:", b.author.trim()),
+            ] {
+                ui.label(RichText::new(label).size(11.5).color(p.disabled));
+                let (text, colour) = match text.is_empty() {
+                    true => ("not given", p.disabled),
+                    false => (text, p.text),
+                };
+                ui.add(egui::Label::new(RichText::new(text).size(11.5).color(colour)).wrap());
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        // the banner: this is someone else's list of programs to start
+        egui::Frame::new()
+            .fill(p.banner)
+            .stroke(egui::Stroke::new(1.0_f32, p.warning))
+            .corner_radius(theme::CORNER)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 16.0);
+                ui.add(egui::Label::new(RichText::new(IMPORT_WARNING).size(11.5).color(p.medium)).wrap());
+            });
+        ui.add_space(8.0);
+
+        let w = PREVIEW_COLS;
+        let badge = |exists: bool| if exists { ("Exists", p.warning) } else { ("New", p.success) };
+        egui::ScrollArea::vertical().id_salt("automation_import_rows").max_height(280.0).show(ui, |ui| {
+            if !b.tools.is_empty() {
+                ui.label(bold("Programs", 12.5).color(p.strong));
+                theme::table_well(ui, p, ((b.tools.len() + 1) as f32) * theme::ROW_HEIGHT + 6.0, |ui| {
+                    theme::table_header(
+                        ui,
+                        p,
+                        &[("Name", w[0]), ("Program", w[1]), ("Arguments", w[2]), ("Given on input", w[3]), ("", w[4])],
+                    );
+                    for (n, tool) in b.tools.iter().enumerate() {
+                        let (word, colour) = badge(AutomationBundle::tool_is_registered(&app.settings, &tool.name));
+                        let cells = [
+                            (tool.display_name(), w[0], None),
+                            (tool.command.clone(), w[1], None),
+                            (tool.args.clone(), w[2], None),
+                            (tool.stdin_mode.label().to_string(), w[3], None),
+                            (word.to_string(), w[4], Some(colour)),
+                        ];
+                        // a painted row announces itself whole, so what is on offer can be
+                        // read out as well as looked at
+                        let said = row_label(&cells);
+                        theme::table_row(ui, p, &cells, false, n % 2 == 1)
+                            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &said));
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            if !b.plans.is_empty() {
+                ui.label(bold("Pipelines", 12.5).color(p.strong));
+                theme::table_well(ui, p, ((b.plans.len() + 1) as f32) * theme::ROW_HEIGHT + 6.0, |ui| {
+                    theme::table_header(ui, p, &[("Name", w[0]), ("Steps", w[1]), ("Runs", w[2] + w[3]), ("", w[4])]);
+                    for (n, plan) in b.plans.iter().enumerate() {
+                        let (word, colour) = badge(AutomationBundle::plan_is_registered(&app.settings, &plan.name));
+                        let steps = match plan.steps.len() {
+                            1 => "1 step".to_string(),
+                            k => format!("{k} steps"),
+                        };
+                        let runs: Vec<String> = plan.steps.iter().map(|s| s.display_target()).collect();
+                        let cells = [
+                            (plan.display_name(), w[0], None),
+                            (steps, w[1], None),
+                            (runs.join(", "), w[2] + w[3], None),
+                            (word.to_string(), w[4], Some(colour)),
+                        ];
+                        let said = row_label(&cells);
+                        theme::table_row(ui, p, &cells, false, n % 2 == 1)
+                            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &said));
+                    }
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("A name already registered:").size(11.5).color(p.text));
+            for choice in ConflictPolicy::ALL {
+                if theme::pill(ui, p, choice.label(), policy == choice).clicked() {
+                    policy = choice;
+                }
+            }
+        });
+        ui.add_space(10.0);
+        let mut chosen = None;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::primary_button(ui, p, IMPORT_CONFIRM).clicked() {
+                chosen = Some(Choice::Import(policy));
+            }
+            if theme::plain_button(ui, p, "Cancel", true).clicked() {
+                chosen = Some(Choice::Cancel);
+            }
+        });
+        chosen
+    });
+
+    let closed = modal.should_close();
+    match modal.inner.or_else(|| closed.then_some(Choice::Cancel)) {
+        Some(Choice::Import(policy)) => {
+            let report = preview.bundle.merge_into(&mut app.settings, policy);
+            app.automation_import = None;
+            app.automation_sel = AutomationSel::None;
+            app.automation_msg = format!(
+                "Imported {} of {} from {}: {}",
+                report.taken(),
+                report.tools.len() + report.plans.len(),
+                preview.path,
+                report.lines().join("; ")
+            );
+        }
+        Some(Choice::Cancel) => {
+            app.automation_import = None;
+            app.automation_msg = "Nothing was imported.".into();
+        }
+        // still open: keep whichever policy is showing
+        None => {
+            if let Some(open) = &mut app.automation_import {
+                open.policy = policy;
+            }
+        }
+    }
 }
 
 fn header(app: &mut App, ui: &mut Ui, p: &Palette) {
@@ -141,6 +328,24 @@ fn sidebar(app: &mut App, ui: &mut Ui, p: &Palette) {
         }
         if theme::plain_button(ui, p, "Delete", chosen).clicked() {
             edit = Some(SidebarEdit::Delete);
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if theme::plain_button(ui, p, "Import...", true)
+            .on_hover_text("Read a bundle file someone sent you. What is in it is shown before anything is registered.")
+            .clicked()
+        {
+            edit = Some(SidebarEdit::Import);
+        }
+        let what = match app.automation_sel {
+            AutomationSel::Program(_) => "Write the selected program out as a bundle file.",
+            AutomationSel::Pipeline(_) => {
+                "Write the selected pipeline out as a bundle file, with every program its steps run."
+            }
+            AutomationSel::None => "Write every program and pipeline out as one bundle file.",
+        };
+        if theme::plain_button(ui, p, "Export...", true).on_hover_text(what).clicked() {
+            edit = Some(SidebarEdit::Export);
         }
     });
     search_box(app, ui);
@@ -309,7 +514,7 @@ fn apply_sidebar_edit(app: &mut App, edit: SidebarEdit) {
         SidebarEdit::NewPipeline => {
             app.settings
                 .automation_plans
-                .push(AutomationPlan { name: "New pipeline".into(), steps: Vec::new() });
+                .push(AutomationPlan { name: "New pipeline".into(), steps: Vec::new(), ..Default::default() });
             app.automation_sel = AutomationSel::Pipeline(app.settings.automation_plans.len() - 1);
         }
         SidebarEdit::Duplicate => match app.automation_sel {
@@ -350,6 +555,92 @@ fn apply_sidebar_edit(app: &mut App, edit: SidebarEdit) {
             }
             _ => app.automation_sel = AutomationSel::None,
         },
+        SidebarEdit::Import => choose_bundle_to_import(app),
+        SidebarEdit::Export => export_selection(app),
+    }
+    // either list may have changed; every step is pointed back at the program it names
+    let tools = app.settings.external_tools.clone();
+    crate::tooling::bind_steps(&tools, &mut app.settings.automation_plans);
+}
+
+/// What the selected program or pipeline -- or the whole registry -- looks like as a bundle,
+/// and the file name to offer for it.
+fn selection_as_bundle(app: &App) -> (AutomationBundle, String) {
+    // the author is left for whoever shares the file to fill in: nothing here puts a name to
+    // it on their behalf
+    let tools = &app.settings.external_tools;
+    match app.automation_sel {
+        AutomationSel::Program(i) if i < tools.len() => {
+            (AutomationBundle::from_tool(&tools[i], ""), bundle_file_name(&tools[i].display_name()))
+        }
+        AutomationSel::Pipeline(i) if i < app.settings.automation_plans.len() => {
+            let plan = &app.settings.automation_plans[i];
+            (AutomationBundle::from_plan(plan, tools, ""), bundle_file_name(&plan.display_name()))
+        }
+        _ => (
+            AutomationBundle::from_all(tools, &app.settings.automation_plans, ""),
+            "forgeproxy-automation.json".to_string(),
+        ),
+    }
+}
+
+/// A file name for a bundle of this name: its words joined with underscores, as project files
+/// are named.
+fn bundle_file_name(name: &str) -> String {
+    let stem: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    let stem = if stem.is_empty() { "automation".to_string() } else { stem };
+    format!("{stem}.json")
+}
+
+/// "Export...": the native dialog, then the bundle is written there.
+fn export_selection(app: &mut App) {
+    let (bundle, suggested) = selection_as_bundle(app);
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export an automation bundle")
+        .add_filter("Automation bundle", &["json"])
+        .set_file_name(&suggested)
+        .save_file()
+    else {
+        return;
+    };
+    app.automation_msg = match crate::tooling::write_bundle(&bundle, &path) {
+        Ok(()) => format!(
+            "Wrote {} {} and {} {} to {}.",
+            bundle.tools.len(),
+            if bundle.tools.len() == 1 { "program" } else { "programs" },
+            bundle.plans.len(),
+            if bundle.plans.len() == 1 { "pipeline" } else { "pipelines" },
+            path.display()
+        ),
+        Err(e) => e,
+    };
+}
+
+/// "Import...": the native dialog, then what the file holds goes up for review.
+fn choose_bundle_to_import(app: &mut App) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Import an automation bundle")
+        .add_filter("Automation bundle", &["json"])
+        .pick_file()
+    else {
+        return;
+    };
+    match crate::tooling::read_bundle(&path) {
+        Ok(bundle) => {
+            app.automation_msg.clear();
+            app.automation_import = Some(ImportPreview {
+                path: path.display().to_string(),
+                bundle,
+                policy: ConflictPolicy::default(),
+            });
+        }
+        Err(e) => app.automation_msg = e,
     }
 }
 
@@ -392,11 +683,23 @@ fn program_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
     ui.label(bold("Program", theme::FONT_TITLE - 1.0).color(p.strong));
     let mut browse = false;
     let mut copy_schema = false;
+    // the name before this frame's editing, so a rename can be followed into the pipelines
+    // whose steps name this program
+    let was_called = app.settings.external_tools[index].name.clone();
     {
         let tool = &mut app.settings.external_tools[index];
         egui::Grid::new("automation_tool_edit").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Menu label:");
             ui.add(egui::TextEdit::singleline(&mut tool.name).desired_width(320.0).hint_text("Inspect in script"));
+            ui.end_row();
+
+            ui.label("Description:");
+            ui.add(
+                egui::TextEdit::singleline(&mut tool.description)
+                    .desired_width(400.0)
+                    .hint_text("what it does, for whoever you share it with"),
+            )
+            .on_hover_text("Carried in an exported bundle, so whoever receives it can see what it is for.");
             ui.end_row();
 
             ui.label("Program:");
@@ -454,6 +757,12 @@ fn program_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
             app.settings.external_tools[index].command = path.display().to_string();
         }
     }
+    // a program renamed here keeps the pipelines that run it: their steps hold its name, so
+    // the new one is carried into them rather than leaving them naming something gone
+    let now_called = app.settings.external_tools[index].name.clone();
+    if now_called.trim() != was_called.trim() {
+        crate::tooling::rename_in_steps(&mut app.settings.automation_plans, &was_called, &now_called);
+    }
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -504,12 +813,24 @@ fn pipeline_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
         .enumerate()
         .map(|(i, t)| format!("{}. {}", i + 1, t.display_name()))
         .collect();
+    // the registered names as they are, for the step that is picked to hold
+    let raw_names: Vec<String> =
+        app.settings.external_tools.iter().map(|t| t.name.trim().to_string()).collect();
     let mut edit: Option<StepEdit> = None;
     {
         let plan = &mut app.settings.automation_plans[index];
         ui.horizontal(|ui| {
             ui.label("Pipeline name:");
             ui.add(egui::TextEdit::singleline(&mut plan.name).desired_width(320.0).hint_text("Collect and report"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Description:");
+            ui.add(
+                egui::TextEdit::singleline(&mut plan.description)
+                    .desired_width(400.0)
+                    .hint_text("what this pipeline is for"),
+            )
+            .on_hover_text("Carried in an exported bundle, beside the programs its steps run.");
         });
         ui.add_space(6.0);
         if plan.steps.is_empty() {
@@ -529,15 +850,27 @@ fn pipeline_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(bold(format!("Step {}", n + 1), 12.5).color(p.strong));
-                        let selected = names.get(step.tool_index).cloned().unwrap_or_else(|| {
-                            format!("{}. (no program here any more)", step.tool_index + 1)
-                        });
+                        // the step names its program, so what is showing is whichever entry
+                        // answers to that name, and the place is only the fallback
+                        let at = raw_names
+                            .iter()
+                            .position(|known| !step.tool_name.trim().is_empty() && known == step.tool_name.trim())
+                            .or(Some(step.tool_index).filter(|i| *i < names.len()));
+                        let selected = match at {
+                            Some(i) => names[i].clone(),
+                            None => format!("{} (not registered here)", step.display_target()),
+                        };
                         egui::ComboBox::from_id_salt(("automation_step_tool", index, n))
                             .selected_text(selected)
                             .width(220.0)
                             .show_ui(ui, |ui| {
                                 for (i, name) in names.iter().enumerate() {
-                                    ui.selectable_value(&mut step.tool_index, i, name);
+                                    if ui.selectable_label(at == Some(i), name).clicked() {
+                                        // both are set together: the name is what binds, the
+                                        // place is kept beside it and in step with it
+                                        step.tool_index = i;
+                                        step.tool_name = raw_names[i].clone();
+                                    }
                                 }
                             });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -581,9 +914,11 @@ fn pipeline_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
         }
     }
     if let Some(edit) = edit {
+        let first = app.settings.external_tools.first().map(|t| t.name.trim().to_string());
         let steps = &mut app.settings.automation_plans[index].steps;
         match edit {
-            StepEdit::Add => steps.push(PipelineStep::default()),
+            // a new step runs the first registered program until it is pointed at another
+            StepEdit::Add => steps.push(PipelineStep { tool_name: first.unwrap_or_default(), ..Default::default() }),
             StepEdit::Remove(n) if n < steps.len() => {
                 steps.remove(n);
             }
@@ -592,6 +927,9 @@ fn pipeline_editor(app: &mut App, ui: &mut Ui, p: &Palette, index: usize) {
             _ => {}
         }
     }
+    // the name is what binds a step; the place beside it is brought back into line here
+    let tools = app.settings.external_tools.clone();
+    crate::tooling::bind_steps(&tools, &mut app.settings.automation_plans);
     ui.add_space(4.0);
     ui.label(
         RichText::new(
@@ -901,7 +1239,7 @@ mod tests {
             Case {
                 name: "nothing selected yet",
                 open: |_| {},
-                wants: &["Automation", "+ New tool", "+ New pipeline", "Nothing selected"],
+                wants: &["Automation", "+ New tool", "+ New pipeline", "Import...", "Export...", "Nothing selected"],
             },
             Case {
                 name: "a program selected",
@@ -916,9 +1254,11 @@ mod tests {
                 },
                 wants: &[
                     "Menu label:",
+                    "Description:",
                     "Arguments:",
                     "Timeout (seconds):",
                     "{prev_out_file}",
+                    "{var:KEY}",
                     "Copy sample JSON schema",
                     MENU_VISIBILITY_LABEL,
                 ],
@@ -931,10 +1271,11 @@ mod tests {
                     app.settings.automation_plans = vec![AutomationPlan {
                         name: "Collect and report".into(),
                         steps: vec![PipelineStep::default(), PipelineStep::default()],
+                        ..Default::default()
                     }];
                     app.automation_sel = AutomationSel::Pipeline(0);
                 },
-                wants: &["Pipeline name:", "Step 1", "Step 2", "+ Add step", "Import findings"],
+                wants: &["Pipeline name:", "Description:", "Step 1", "Step 2", "+ Add step", "Import findings"],
             },
         ];
         assert_table!(cases, |idx, case| {
@@ -983,10 +1324,12 @@ mod tests {
             AutomationPlan {
                 name: "Collect and report".into(),
                 steps: vec![PipelineStep { tool_index: 1, ..Default::default() }],
+                ..Default::default()
             },
             AutomationPlan {
                 name: "Headers only".into(),
                 steps: vec![PipelineStep { tool_index: 0, ..Default::default() }],
+                ..Default::default()
             },
         ];
         // nothing is selected while the lists are read, so the editor's own text boxes are
@@ -1035,6 +1378,111 @@ mod tests {
         app.automation_filter = "token".into();
         click(&ctx, &mut app, "Token report");
         assert_eq!(app.automation_sel, AutomationSel::Program(1), "the place in the registry travels with the row");
+    }
+
+    /// The import dialog shows what a bundle holds -- what it says about itself, every program
+    /// with its arguments, every pipeline with what its steps run, and which names are already
+    /// registered -- and registers nothing until it is confirmed.
+    #[test]
+    fn the_import_dialog_shows_a_bundle_and_registers_it_only_when_confirmed() {
+        let bundle = || AutomationBundle {
+            format_version: crate::tooling::BUNDLE_FORMAT_VERSION,
+            name: "Nightly sweep".into(),
+            description: "Looks over a response, then reports.".into(),
+            author: "a colleague".into(),
+            tools: vec![
+                ExternalTool {
+                    name: "Collect".into(),
+                    command: "/opt/collect".into(),
+                    args: "--url {url} --token {var:TOKEN}".into(),
+                    stdin_mode: ToolStdinMode::RawResponse,
+                    ..Default::default()
+                },
+                ExternalTool { name: "Report".into(), command: "/opt/report".into(), ..Default::default() },
+            ],
+            plans: vec![AutomationPlan {
+                name: "Nightly".into(),
+                steps: vec![
+                    PipelineStep { tool_name: "Collect".into(), ..Default::default() },
+                    PipelineStep { tool_name: "Report".into(), ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+        };
+        let opened = |app: &mut App| {
+            app.automation_import = Some(ImportPreview {
+                path: "/tmp/nightly.json".into(),
+                bundle: bundle(),
+                policy: ConflictPolicy::default(),
+            });
+        };
+
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Automation).build_with_ctx();
+        ctx.enable_accesskit();
+        // one of the names is already registered, so the dialog has both badges to show
+        app.settings.external_tools =
+            vec![ExternalTool { name: "Report".into(), command: "/usr/bin/mine".into(), ..Default::default() }];
+        opened(&mut app);
+        frame(&ctx, &mut app);
+        let seen = labels(&frame(&ctx, &mut app));
+
+        for want in [
+            IMPORT_TITLE,
+            "/tmp/nightly.json",
+            "Nightly sweep",
+            "Looks over a response, then reports.",
+            "a colleague",
+            IMPORT_CONFIRM,
+            "Cancel",
+        ] {
+            assert!(seen.iter().any(|l| l == want), "the dialog shows {want:?}: {seen:?}");
+        }
+        assert!(
+            seen.iter().any(|l| l.contains("came from somewhere else")),
+            "and warns about what it is: {seen:?}"
+        );
+        for choice in ConflictPolicy::ALL {
+            assert!(seen.iter().any(|l| l == choice.label()), "{:?} is on offer: {seen:?}", choice.label());
+        }
+        // the programs, with their arguments and whether the name is taken
+        let row = |part: &str| seen.iter().find(|l| l.contains(part)).cloned();
+        let collect = row("/opt/collect").unwrap_or_else(|| panic!("no row for the first program: {seen:?}"));
+        for part in ["Collect", "/opt/collect", "--url {url} --token {var:TOKEN}", "Raw response", "New"] {
+            assert!(collect.contains(part), "the row says {part:?}: {collect:?}");
+        }
+        let report = row("/opt/report").expect("a row for the second program");
+        assert!(report.contains("Exists"), "the name already registered is marked: {report:?}");
+        // and the pipeline, with what its steps run
+        let pipeline = row("2 steps").expect("a row for the pipeline");
+        for part in ["Nightly", "Collect, Report", "New"] {
+            assert!(pipeline.contains(part), "the pipeline row says {part:?}: {pipeline:?}");
+        }
+        // nothing has been registered by looking at it
+        assert_eq!(app.settings.external_tools.len(), 1, "still only ours");
+        assert!(app.settings.automation_plans.is_empty());
+
+        // cancelling leaves the registry alone and closes the dialog
+        click(&ctx, &mut app, "Cancel");
+        assert!(app.automation_import.is_none(), "the dialog closed");
+        assert_eq!(app.settings.external_tools.len(), 1, "and registered nothing");
+        assert_eq!(app.automation_msg, "Nothing was imported.");
+
+        // confirming registers it, keeping both where a name was taken
+        opened(&mut app);
+        click(&ctx, &mut app, IMPORT_CONFIRM);
+        assert!(app.automation_import.is_none(), "the dialog closed");
+        let names: Vec<&str> = app.settings.external_tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Report", "Collect", "Report (2)"], "the taken name was kept and theirs renamed");
+        assert_eq!(app.settings.automation_plans.len(), 1);
+        // and the imported pipeline runs the programs it arrived with, not ours
+        let runs: Vec<String> = app.settings.automation_plans[0]
+            .steps
+            .iter()
+            .map(|s| s.resolve(&app.settings.external_tools).map(|t| t.command.clone()).unwrap_or_default())
+            .collect();
+        assert_eq!(runs, ["/opt/collect", "/opt/report"], "{:?}", app.settings.automation_plans[0].steps);
+        assert!(app.automation_msg.contains("Imported 3 of 3"), "{}", app.automation_msg);
+        assert!(app.automation_msg.contains("registered as \"Report (2)\""), "{}", app.automation_msg);
     }
 
     /// Both of the tab's splitters hold where they were let go, and neither can be dragged
@@ -1199,6 +1647,7 @@ mod tests {
                 PipelineStep { tool_index: 0, ..Default::default() },
                 PipelineStep { tool_index: 2, ..Default::default() },
             ],
+            ..Default::default()
         };
         app.settings.automation_plans = vec![plan];
 

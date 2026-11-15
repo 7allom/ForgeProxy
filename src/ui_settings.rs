@@ -1453,10 +1453,12 @@ mod tests {
             timeout_secs: 90,
             import_findings: true,
             show_in_menu: true,
+            description: "Reads the response and reports what it finds.".into(),
         }];
         app.settings.automation_plans = vec![crate::tooling::AutomationPlan {
             name: "Collect and report".into(),
             steps: vec![crate::tooling::PipelineStep::default()],
+            ..Default::default()
         }];
         draw(&ctx, &mut app);
         let seen = labels(&draw(&ctx, &mut app));

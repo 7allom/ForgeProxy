@@ -82,6 +82,10 @@ pub struct ExternalTool {
     /// a missing one reads as on.
     #[serde(default = "default_true")]
     pub show_in_menu: bool,
+    /// What this program is for, in the author's own words. Carried in a bundle so whoever
+    /// receives one can see what they are being offered before they register it.
+    #[serde(default)]
+    pub description: String,
 }
 
 impl Default for ExternalTool {
@@ -94,6 +98,7 @@ impl Default for ExternalTool {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             import_findings: false,
             show_in_menu: true,
+            description: String::new(),
         }
     }
 }
@@ -150,8 +155,14 @@ impl StepFailurePolicy {
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PipelineStep {
-    /// Which registered program, by its place in the registry.
+    /// Which registered program, by its place in the registry. Kept beside `tool_name` and
+    /// brought back into line with it whenever the registry changes.
     pub tool_index: usize,
+    /// Which registered program, by name. A name survives the registry being reordered, a
+    /// program being added above this one, or a pipeline travelling to another workstation in
+    /// a bundle, none of which a place in a list survives. Blank in a plan saved before names
+    /// were kept, which is read by its place instead.
+    pub tool_name: String,
     /// Arguments for this step only. Blank leaves the program's own template in place.
     pub args_override: String,
     pub on_failure: StepFailurePolicy,
@@ -159,11 +170,41 @@ pub struct PipelineStep {
     pub import_findings: bool,
 }
 
+impl PipelineStep {
+    /// The program this step runs, out of `tools`: the one it names, else the one at the place
+    /// it holds.
+    ///
+    /// The name comes first, so a pipeline keeps working when the registry is reordered. The
+    /// place is the fallback for a step that names nothing (a plan saved before names were
+    /// kept) and for one whose program has since been renamed, which is better than a step
+    /// that suddenly runs nothing at all.
+    pub fn resolve<'a>(&self, tools: &'a [ExternalTool]) -> Option<&'a ExternalTool> {
+        let wanted = self.tool_name.trim();
+        if !wanted.is_empty() {
+            if let Some(found) = tools.iter().find(|t| t.name.trim() == wanted) {
+                return Some(found);
+            }
+        }
+        tools.get(self.tool_index)
+    }
+
+    /// What this step says it runs, for a message about it: the name it holds, else the place.
+    pub fn display_target(&self) -> String {
+        match self.tool_name.trim() {
+            "" => format!("the program in slot {}", self.tool_index + 1),
+            name => name.to_string(),
+        }
+    }
+}
+
 /// A run of registered programs, one after another.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AutomationPlan {
     pub name: String,
+    /// What this pipeline is for, in the author's own words.
+    #[serde(default)]
+    pub description: String,
     pub steps: Vec<PipelineStep>,
 }
 
@@ -180,10 +221,47 @@ impl AutomationPlan {
     }
 }
 
+/// Bring every step back into line with the registry, both ways round.
+///
+/// A step that names a program is pointed at wherever that program now is; one that names
+/// none takes the name of the program its place holds, which is how a plan saved before names
+/// were kept gains them. Run whenever either list changes -- on load, after an edit, and after
+/// a bundle is merged -- so the name and the place never disagree about which program is meant.
+pub fn bind_steps(tools: &[ExternalTool], plans: &mut [AutomationPlan]) {
+    for plan in plans {
+        for step in &mut plan.steps {
+            let named = step.tool_name.trim();
+            if named.is_empty() {
+                if let Some(tool) = tools.get(step.tool_index) {
+                    step.tool_name = tool.name.trim().to_string();
+                }
+            } else if let Some(at) = tools.iter().position(|t| t.name.trim() == named) {
+                step.tool_index = at;
+            }
+        }
+    }
+}
+
+/// Follow a program's new name into every step that named its old one, so renaming a program
+/// does not quietly leave the pipelines that use it pointing at nothing.
+pub fn rename_in_steps(plans: &mut [AutomationPlan], from: &str, to: &str) {
+    let (from, to) = (from.trim(), to.trim());
+    if from.is_empty() || from == to {
+        return;
+    }
+    for plan in plans {
+        for step in &mut plan.steps {
+            if step.tool_name.trim() == from {
+                step.tool_name = to.to_string();
+            }
+        }
+    }
+}
+
 /// Every placeholder an argument template may carry, with what each one stands for.
 ///
 /// Shown on the Settings page, and held by a test to matching what [`fill`] replaces.
-pub const PLACEHOLDERS: [(&str, &str); 9] = [
+pub const PLACEHOLDERS: [(&str, &str); 10] = [
     ("{url}", "the whole address"),
     ("{scheme}", "http or https"),
     ("{host}", "host name, with the port when there is one"),
@@ -193,6 +271,7 @@ pub const PLACEHOLDERS: [(&str, &str); 9] = [
     ("{req_file}", "a temporary file holding the raw request"),
     ("{res_file}", "a temporary file holding the raw response"),
     ("{prev_out_file}", "a temporary file holding the previous pipeline step's output"),
+    ("{var:KEY}", "a value given for KEY when the run was started"),
 ];
 
 /// What one message is, for filling a template in.
@@ -209,6 +288,9 @@ pub struct ToolContext {
     /// The file holding the output of the step before this one, while a pipeline is running.
     /// Blank for a program run on its own, which has no step before it.
     pub prev_out_file: String,
+    /// Values given for this run, reached from a template as `{var:KEY}`. Ordered, so a
+    /// message about them reads the same every time.
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 /// Split an argument template into separate arguments.
@@ -245,6 +327,35 @@ pub fn tokenize(template: &str) -> Vec<String> {
     out
 }
 
+/// Replace every `{var:KEY}` in one argument with the value given for `KEY`, or with nothing
+/// when none was given.
+///
+/// Scanned once from the left, so a value that itself looks like a placeholder is left as the
+/// text it is rather than being filled in again. Like every other substitution here this
+/// happens inside one argument and cannot split it, so a value carrying spaces, quotes or
+/// shell metacharacters reaches the program as the single argument it was written as.
+fn fill_vars(arg: &str, vars: &std::collections::BTreeMap<String, String>) -> String {
+    const OPEN: &str = "{var:";
+    if !arg.contains(OPEN) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(at) = rest.find(OPEN) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + OPEN.len()..];
+        let Some(end) = after.find('}') else {
+            // an opening with no closing brace is not a placeholder; it is text
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        out.push_str(vars.get(after[..end].trim()).map(String::as_str).unwrap_or(""));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Fill the placeholders in each argument, leaving the arguments themselves as they were.
 ///
 /// Substitution is per argument, never across them: whatever a placeholder stands for becomes
@@ -252,7 +363,7 @@ pub fn tokenize(template: &str) -> Vec<String> {
 pub fn fill(args: &[String], ctx: &ToolContext, req_file: Option<&str>, res_file: Option<&str>) -> Vec<String> {
     args.iter()
         .map(|arg| {
-            let mut out = arg.clone();
+            let mut out = fill_vars(arg, &ctx.vars);
             for (token, value) in [
                 ("{url}", ctx.url.as_str()),
                 ("{scheme}", ctx.scheme.as_str()),
@@ -967,10 +1078,10 @@ pub fn run_plan_blocking(
             runs.note(id, &format!("Stopped at your request before step {step_no}."));
             break;
         }
-        let Some(base) = tools.get(step.tool_index).filter(|t| t.is_runnable()) else {
+        let Some(base) = step.resolve(tools).filter(|t| t.is_runnable()) else {
             runs.append_stderr(
                 id,
-                &format!("Step {step_no}: there is no finished program in registry slot {}.\n", step.tool_index + 1),
+                &format!("Step {step_no}: there is no finished program for {}.\n", step.display_target()),
             );
             outcome_status = RunStatus::Failed;
             if step.on_failure == StepFailurePolicy::Stop {
@@ -1020,6 +1131,351 @@ pub fn run_plan_blocking(
     report(events, &plan.display_name(), outcome_status, last_code);
 }
 
+// ---- shareable bundles ---------------------------------------------------
+
+/// The bundle format this build writes. A bundle naming a later one is refused rather than
+/// read as far as it goes: a pipeline half understood is worse than one not imported.
+pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+
+/// What becomes of one entry arriving in a bundle when something is already registered under
+/// its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// Register the arriving one under a name of its own, keeping both.
+    #[default]
+    KeepBoth,
+    /// Let the arriving one take the place of the one already registered.
+    Replace,
+    /// Leave the one already registered and pass the arriving one over.
+    Skip,
+}
+
+impl ConflictPolicy {
+    pub const ALL: [ConflictPolicy; 3] = [ConflictPolicy::KeepBoth, ConflictPolicy::Replace, ConflictPolicy::Skip];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ConflictPolicy::KeepBoth => "Keep both (rename)",
+            ConflictPolicy::Replace => "Replace existing",
+            ConflictPolicy::Skip => "Skip existing",
+        }
+    }
+
+    /// The word for this policy on a command line.
+    pub fn word(self) -> &'static str {
+        match self {
+            ConflictPolicy::KeepBoth => "rename",
+            ConflictPolicy::Replace => "replace",
+            ConflictPolicy::Skip => "skip",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.word().eq_ignore_ascii_case(word.trim()))
+    }
+}
+
+/// What became of one entry that arrived in a bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Nothing was registered under that name, so it was registered as it came.
+    Added,
+    /// It took the place of the one already registered under that name.
+    Replaced,
+    /// Something was already registered under that name, so it was registered under this one.
+    Renamed(String),
+    /// Something was already registered under that name and was left alone.
+    Skipped,
+}
+
+impl MergeOutcome {
+    /// How this reads in the line that says what an import did.
+    pub fn describe(&self) -> String {
+        match self {
+            MergeOutcome::Added => "added".to_string(),
+            MergeOutcome::Replaced => "replaced the one already registered".to_string(),
+            MergeOutcome::Renamed(to) => format!("already taken, registered as {to:?}"),
+            MergeOutcome::Skipped => "skipped: already registered".to_string(),
+        }
+    }
+}
+
+/// What one import did, entry by entry, so it can be printed or shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    /// Each program that arrived, by the name it arrived under, and what became of it.
+    pub tools: Vec<(String, MergeOutcome)>,
+    pub plans: Vec<(String, MergeOutcome)>,
+}
+
+impl MergeReport {
+    /// How many entries actually reached the registry.
+    pub fn taken(&self) -> usize {
+        self.tools.iter().chain(self.plans.iter()).filter(|(_, o)| *o != MergeOutcome::Skipped).count()
+    }
+
+    /// One line per entry, for a terminal or a status line.
+    pub fn lines(&self) -> Vec<String> {
+        let one = |kind: &str, (name, outcome): &(String, MergeOutcome)| {
+            format!("{kind} {name:?}: {}", outcome.describe())
+        };
+        self.tools
+            .iter()
+            .map(|e| one("Program", e))
+            .chain(self.plans.iter().map(|e| one("Pipeline", e)))
+            .collect()
+    }
+}
+
+/// Programs and pipelines as one file, to be sent to someone else and registered by them.
+///
+/// A bundle holding a pipeline carries the programs its steps run, so the file is enough on
+/// its own: nothing has to be registered beforehand for it to work. Steps are bound by the
+/// program's name rather than its place in a registry, which is what lets a pipeline arrive
+/// into a registry that already has programs of its own.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutomationBundle {
+    pub format_version: u32,
+    pub name: String,
+    pub description: String,
+    /// Whoever put the bundle together, as they chose to be named. Never filled in from the
+    /// account this is running as.
+    pub author: String,
+    pub tools: Vec<ExternalTool>,
+    pub plans: Vec<AutomationPlan>,
+}
+
+impl AutomationBundle {
+    /// A bundle holding one program.
+    pub fn from_tool(tool: &ExternalTool, author: &str) -> Self {
+        AutomationBundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            name: tool.display_name(),
+            description: tool.description.clone(),
+            author: author.trim().to_string(),
+            tools: vec![tool.clone()],
+            plans: Vec::new(),
+        }
+    }
+
+    /// A bundle holding one pipeline and every program its steps run.
+    ///
+    /// The programs are gathered from `all_tools` as the steps are walked, so the bundle is
+    /// self-contained: whoever imports it needs nothing registered beforehand. A step whose
+    /// program is not in `all_tools` any more is carried as it is, and binds to a program of
+    /// that name wherever it lands.
+    pub fn from_plan(plan: &AutomationPlan, all_tools: &[ExternalTool], author: &str) -> Self {
+        let mut tools: Vec<ExternalTool> = Vec::new();
+        let mut plan = plan.clone();
+        for step in &mut plan.steps {
+            let Some(tool) = step.resolve(all_tools) else { continue };
+            // bound by name from here on, so the place it had in this registry means nothing
+            // to whoever receives it
+            step.tool_name = tool.name.trim().to_string();
+            if !tools.iter().any(|t| t.name.trim() == tool.name.trim()) {
+                tools.push(tool.clone());
+            }
+        }
+        // the places in the bundle's own, smaller list
+        bind_steps(&tools, std::slice::from_mut(&mut plan));
+        AutomationBundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            name: plan.display_name(),
+            description: plan.description.clone(),
+            author: author.trim().to_string(),
+            tools,
+            plans: vec![plan],
+        }
+    }
+
+    /// A bundle holding a whole registry.
+    pub fn from_all(tools: &[ExternalTool], plans: &[AutomationPlan], author: &str) -> Self {
+        let mut plans = plans.to_vec();
+        bind_steps(tools, &mut plans);
+        AutomationBundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            name: "Automation registry".to_string(),
+            description: String::new(),
+            author: author.trim().to_string(),
+            tools: tools.to_vec(),
+            plans,
+        }
+    }
+
+    /// Read a bundle from JSON.
+    ///
+    /// A whole bundle is read as one. So is a bare program or a bare pipeline, which is what
+    /// someone pasting a single entry out of a settings file will have: either is wrapped in a
+    /// bundle of its own rather than refused on a technicality.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim()).map_err(|e| format!("this is not JSON ({e})."))?;
+        let fields = doc.as_object().ok_or("a bundle is a JSON object, and this is not one.")?;
+        let named = |key: &str| fields.contains_key(key);
+        if named("steps") && !named("plans") {
+            let plan: AutomationPlan =
+                serde_json::from_value(doc).map_err(|e| format!("this is not a pipeline ({e})."))?;
+            return Ok(AutomationBundle {
+                format_version: BUNDLE_FORMAT_VERSION,
+                name: plan.display_name(),
+                description: plan.description.clone(),
+                plans: vec![plan],
+                ..Default::default()
+            });
+        }
+        if named("command") && !named("tools") {
+            let tool: ExternalTool =
+                serde_json::from_value(doc).map_err(|e| format!("this is not a program ({e})."))?;
+            return Ok(Self::from_tool(&tool, ""));
+        }
+        let mut bundle: Self =
+            serde_json::from_value(doc).map_err(|e| format!("this is not a bundle ({e})."))?;
+        if bundle.format_version > BUNDLE_FORMAT_VERSION {
+            return Err(format!(
+                "this bundle is in format {}, which this build does not read; it understands up to {BUNDLE_FORMAT_VERSION}.",
+                bundle.format_version
+            ));
+        }
+        if bundle.tools.is_empty() && bundle.plans.is_empty() {
+            return Err("this bundle holds no programs and no pipelines.".to_string());
+        }
+        bundle.format_version = BUNDLE_FORMAT_VERSION;
+        Ok(bundle)
+    }
+
+    /// The bundle as the file that is sent: laid out to be read and reviewed before it is
+    /// trusted, not packed as small as it will go.
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map(|mut s| {
+            s.push('\n');
+            s
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Is a program of this name already registered?
+    pub fn tool_is_registered(settings: &crate::state::UserSettings, name: &str) -> bool {
+        settings.external_tools.iter().any(|t| t.name.trim() == name.trim())
+    }
+
+    /// Is a pipeline of this name already saved?
+    pub fn plan_is_registered(settings: &crate::state::UserSettings, name: &str) -> bool {
+        settings.automation_plans.iter().any(|p| p.name.trim() == name.trim())
+    }
+
+    /// Register everything in this bundle, settling each name that is already taken the way
+    /// `policy` says.
+    ///
+    /// Each step is then pointed at whatever the program it named actually became: renamed if
+    /// it had to be, left where it was if the arriving one was skipped. Every step's place in
+    /// the registry is worked out again at the end, so the merged settings are consistent
+    /// however the two lists happened to be ordered.
+    pub fn merge_into(&self, settings: &mut crate::state::UserSettings, policy: ConflictPolicy) -> MergeReport {
+        let mut report = MergeReport::default();
+        // what each program in the bundle is called once it is registered, so the steps that
+        // name it can be pointed at the right one
+        let mut landed: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for tool in &self.tools {
+            let arrived = tool.name.trim().to_string();
+            let at = settings.external_tools.iter().position(|t| t.name.trim() == arrived);
+            let outcome = match (at, policy) {
+                (None, _) => {
+                    settings.external_tools.push(tool.clone());
+                    MergeOutcome::Added
+                }
+                (Some(i), ConflictPolicy::Replace) => {
+                    settings.external_tools[i] = tool.clone();
+                    MergeOutcome::Replaced
+                }
+                (Some(_), ConflictPolicy::Skip) => MergeOutcome::Skipped,
+                (Some(_), ConflictPolicy::KeepBoth) => {
+                    let taken: Vec<String> =
+                        settings.external_tools.iter().map(|t| t.name.trim().to_string()).collect();
+                    let free = free_name(&arrived, &taken);
+                    settings.external_tools.push(ExternalTool { name: free.clone(), ..tool.clone() });
+                    MergeOutcome::Renamed(free)
+                }
+            };
+            let now = match &outcome {
+                MergeOutcome::Renamed(to) => to.clone(),
+                _ => arrived.clone(),
+            };
+            landed.insert(arrived.clone(), now);
+            report.tools.push((arrived, outcome));
+        }
+
+        for plan in &self.plans {
+            let mut plan = plan.clone();
+            // each step follows the program it named to wherever that program ended up; a step
+            // naming one the bundle did not carry is left to bind against what is registered
+            for step in &mut plan.steps {
+                let named = match step.resolve(&self.tools) {
+                    Some(tool) => tool.name.trim().to_string(),
+                    None => step.tool_name.trim().to_string(),
+                };
+                if let Some(now) = landed.get(&named) {
+                    step.tool_name = now.clone();
+                } else if !named.is_empty() {
+                    step.tool_name = named;
+                }
+            }
+            let arrived = plan.name.trim().to_string();
+            let at = settings.automation_plans.iter().position(|p| p.name.trim() == arrived);
+            let outcome = match (at, policy) {
+                (None, _) => {
+                    settings.automation_plans.push(plan);
+                    MergeOutcome::Added
+                }
+                (Some(i), ConflictPolicy::Replace) => {
+                    settings.automation_plans[i] = plan;
+                    MergeOutcome::Replaced
+                }
+                (Some(_), ConflictPolicy::Skip) => MergeOutcome::Skipped,
+                (Some(_), ConflictPolicy::KeepBoth) => {
+                    let taken: Vec<String> =
+                        settings.automation_plans.iter().map(|p| p.name.trim().to_string()).collect();
+                    let free = free_name(&arrived, &taken);
+                    plan.name = free.clone();
+                    settings.automation_plans.push(plan);
+                    MergeOutcome::Renamed(free)
+                }
+            };
+            report.plans.push((arrived, outcome));
+        }
+
+        let tools = settings.external_tools.clone();
+        bind_steps(&tools, &mut settings.automation_plans);
+        report
+    }
+}
+
+/// A name like `base` that nothing in `taken` already answers to, by numbering it.
+fn free_name(base: &str, taken: &[String]) -> String {
+    let base = base.trim();
+    let free = |candidate: &str| !taken.iter().any(|t| t.trim() == candidate);
+    if free(base) {
+        return base.to_string();
+    }
+    // `taken` is finite, so some number is free
+    (2..).map(|n| format!("{base} ({n})")).find(|c| free(c)).unwrap_or_else(|| base.to_string())
+}
+
+/// Read a bundle from a file.
+pub fn read_bundle(path: &std::path::Path) -> Result<AutomationBundle, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    AutomationBundle::from_json(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Write a bundle to a file, making the folder above it if it is not there yet.
+pub fn write_bundle(bundle: &AutomationBundle, path: &std::path::Path) -> Result<(), String> {
+    let json = bundle.to_json()?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Couldn't make {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, json).map_err(|e| format!("Couldn't write {}: {e}", path.display()))
+}
+
 /// What a pipeline run with no window behind it came to.
 #[derive(Clone, Debug)]
 pub struct HeadlessOutcome {
@@ -1034,6 +1490,19 @@ pub struct HeadlessOutcome {
 /// How often an unattended run looks for more output to pass on to the terminal. Short enough
 /// that a step's output reads as it arrives, long enough not to spin.
 const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Run one registered program to completion with no drawn app behind it, writing the account
+/// of it to `out` as it arrives. The pipeline runner's own account of itself, for one program.
+pub fn run_tool_streaming(tool: &ExternalTool, ctx: &ToolContext, out: &mut dyn std::io::Write) -> HeadlessOutcome {
+    let runs = RunLog::new(None);
+    let events: crate::proxy::Events = Default::default();
+    let id = runs.begin(&tool.display_name(), RunOrigin::Program(tool.name.trim().to_string()), ctx);
+    let worker = {
+        let (tool, ctx, runs, events) = (tool.clone(), ctx.clone(), runs.clone(), events.clone());
+        std::thread::spawn(move || run_tool_blocking(&tool, &ctx, &runs, id, &events))
+    };
+    stream_until_done(&runs, id, worker, out)
+}
 
 /// Run `plan` to completion with no drawn app behind it, writing the account of it to `out`
 /// as it arrives.
@@ -1061,7 +1530,16 @@ pub fn run_plan_streaming(
             (plan.clone(), tools.to_vec(), ctx.clone(), runs.clone(), events.clone());
         std::thread::spawn(move || run_plan_blocking(&plan, &tools, &ctx, &runs, id, &events))
     };
+    stream_until_done(&runs, id, worker, out)
+}
 
+/// Pass run `id`'s output on to `out` until it has finished, then say what it came to.
+fn stream_until_done(
+    runs: &RunLog,
+    id: u64,
+    worker: std::thread::JoinHandle<()>,
+    out: &mut dyn std::io::Write,
+) -> HeadlessOutcome {
     // what has already been passed on, so each look only writes what is new
     let (mut sent_out, mut sent_err) = (0usize, 0usize);
     let mut pass_on = |run: &ToolRun, out: &mut dyn std::io::Write| {
@@ -1302,6 +1780,9 @@ mod tests {
             path: "/cart?a=1".into(),
             request: "POST /cart?a=1 HTTP/1.1\r\nHost: shop.test\r\n\r\nx=1".into(),
             response: "HTTP/1.1 200 OK\r\n\r\nok".into(),
+            // `{var:KEY}` is advertised like the rest, so a value for KEY is part of the
+            // message this is filled from
+            vars: [("KEY".to_string(), "given".to_string())].into_iter().collect(),
         };
         for (token, _) in PLACEHOLDERS {
             let argv = fill(&tokenize(token), &ctx, Some("/tmp/req"), Some("/tmp/res"));
@@ -1627,6 +2108,7 @@ mod tests {
                 PipelineStep { tool_index: 0, ..Default::default() },
                 PipelineStep { tool_index: 1, ..Default::default() },
             ],
+            ..Default::default()
         };
         let ctx = ToolContext { url: "http://h.test/a".into(), ..Default::default() };
         let (runs, events) = harness();
@@ -1673,6 +2155,7 @@ mod tests {
                     PipelineStep { tool_index: 0, on_failure: policy, ..Default::default() },
                     PipelineStep { tool_index: 1, ..Default::default() },
                 ],
+                ..Default::default()
             };
             let ctx = ToolContext { url: "http://h.test/a".into(), ..Default::default() };
             let (runs, events) = harness();
@@ -1693,6 +2176,7 @@ mod tests {
         let plan = AutomationPlan {
             name: "p".into(),
             steps: vec![PipelineStep { tool_index: 9, ..Default::default() }],
+            ..Default::default()
         };
         let ctx = ToolContext::default();
         let (runs, events) = harness();
@@ -1842,9 +2326,10 @@ mod tests {
         let plan = AutomationPlan {
             name: "Collect and report".into(),
             steps: vec![
-                PipelineStep { tool_index: 0, args_override: "--first {url}".into(), on_failure: StepFailurePolicy::Continue, import_findings: false },
-                PipelineStep { tool_index: 1, args_override: String::new(), on_failure: StepFailurePolicy::Stop, import_findings: true },
+                PipelineStep { tool_index: 0, tool_name: String::new(), args_override: "--first {url}".into(), on_failure: StepFailurePolicy::Continue, import_findings: false },
+                PipelineStep { tool_index: 1, tool_name: String::new(), args_override: String::new(), on_failure: StepFailurePolicy::Stop, import_findings: true },
             ],
+            ..Default::default()
         };
         let json = serde_json::to_string(&plan).expect("it writes");
         assert_eq!(serde_json::from_str::<AutomationPlan>(&json).expect("it reads"), plan);
@@ -1859,7 +2344,302 @@ mod tests {
 
         // and what is worth running
         assert!(plan.is_runnable());
-        assert!(!AutomationPlan { name: "named".into(), steps: Vec::new() }.is_runnable(), "no steps, nothing to do");
-        assert!(!AutomationPlan { name: "  ".into(), steps: plan.steps.clone() }.is_runnable(), "and it needs a name");
+        assert!(!AutomationPlan { name: "named".into(), steps: Vec::new(), ..Default::default() }.is_runnable(), "no steps, nothing to do");
+        assert!(!AutomationPlan { name: "  ".into(), steps: plan.steps.clone(), ..Default::default() }.is_runnable(), "and it needs a name");
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use crate::state::UserSettings;
+    use crate::test_utils::assert_table;
+
+    fn tool(name: &str, command: &str) -> ExternalTool {
+        ExternalTool { name: name.into(), command: command.into(), ..Default::default() }
+    }
+
+    /// A pipeline whose steps name their programs, as one built in the app does.
+    fn plan(name: &str, runs: &[&str]) -> AutomationPlan {
+        AutomationPlan {
+            name: name.into(),
+            steps: runs
+                .iter()
+                .map(|n| PipelineStep { tool_name: (*n).to_string(), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn registry(tools: &[ExternalTool], plans: &[AutomationPlan]) -> UserSettings {
+        let mut settings = UserSettings { external_tools: tools.to_vec(), automation_plans: plans.to_vec(), ..Default::default() };
+        let known = settings.external_tools.clone();
+        bind_steps(&known, &mut settings.automation_plans);
+        settings
+    }
+
+    /// What each step of each plan in `settings` actually runs, by name.
+    fn runs_of(settings: &UserSettings) -> Vec<(String, Vec<String>)> {
+        settings
+            .automation_plans
+            .iter()
+            .map(|p| {
+                let steps = p
+                    .steps
+                    .iter()
+                    .map(|s| match s.resolve(&settings.external_tools) {
+                        Some(t) => t.name.trim().to_string(),
+                        None => format!("<nothing: {}>", s.display_target()),
+                    })
+                    .collect();
+                (p.name.clone(), steps)
+            })
+            .collect()
+    }
+
+    /// Exporting a pipeline carries every program its steps run, so the file stands on its
+    /// own, and carries them once however many steps share one.
+    #[test]
+    fn exporting_a_pipeline_carries_the_programs_its_steps_run() {
+        let tools = [tool("Collect", "/bin/collect"), tool("Report", "/bin/report"), tool("Unrelated", "/bin/other")];
+        let settings = registry(&tools, &[plan("Nightly", &["Collect", "Report", "Collect"])]);
+        let bundle = AutomationBundle::from_plan(&settings.automation_plans[0], &settings.external_tools, "a colleague");
+
+        assert_eq!(bundle.format_version, BUNDLE_FORMAT_VERSION);
+        assert_eq!(bundle.author, "a colleague");
+        let carried: Vec<&str> = bundle.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(carried, ["Collect", "Report"], "each one once, and nothing the steps do not run");
+        assert_eq!(bundle.plans.len(), 1);
+        // the places in the bundle's own list, and the names that bind wherever it lands
+        let steps = &bundle.plans[0].steps;
+        assert_eq!(steps.iter().map(|s| s.tool_name.as_str()).collect::<Vec<_>>(), ["Collect", "Report", "Collect"]);
+        assert_eq!(steps.iter().map(|s| s.tool_index).collect::<Vec<_>>(), [0, 1, 0]);
+        // and it survives being written and read back
+        let json = bundle.to_json().expect("the bundle as JSON");
+        assert_eq!(AutomationBundle::from_json(&json).expect("read back"), bundle);
+        assert!(json.contains("\n  \"format_version\""), "laid out to be read: {json}");
+    }
+
+    /// A pipeline imported into a registry that already has programs of its own runs the
+    /// programs it came with, not whatever happens to sit at the places its steps once held.
+    #[test]
+    fn a_pipeline_imported_into_a_full_registry_still_runs_its_own_programs() {
+        let theirs = registry(
+            &[tool("Collect", "/bin/collect"), tool("Report", "/bin/report")],
+            &[plan("Nightly", &["Collect", "Report"])],
+        );
+        let bundle = AutomationBundle::from_plan(&theirs.automation_plans[0], &theirs.external_tools, "");
+
+        // a registry of our own, with three programs already in it and none of them theirs
+        let mut mine = registry(
+            &[tool("Mine one", "/bin/one"), tool("Mine two", "/bin/two"), tool("Mine three", "/bin/three")],
+            &[plan("Ours", &["Mine two"])],
+        );
+        let report = bundle.merge_into(&mut mine, ConflictPolicy::KeepBoth);
+
+        assert_eq!(report.taken(), 3, "two programs and the pipeline: {:?}", report.lines());
+        let names: Vec<&str> = mine.external_tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Mine one", "Mine two", "Mine three", "Collect", "Report"]);
+        assert_eq!(
+            runs_of(&mine),
+            vec![
+                ("Ours".to_string(), vec!["Mine two".to_string()]),
+                ("Nightly".to_string(), vec!["Collect".to_string(), "Report".to_string()]),
+            ],
+            "every step runs what it names, ours and theirs alike"
+        );
+        // the places were worked out again for where the programs actually landed
+        let arrived = mine.automation_plans.iter().find(|p| p.name == "Nightly").expect("the pipeline");
+        assert_eq!(arrived.steps.iter().map(|s| s.tool_index).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    /// The three ways a name already registered can be settled.
+    #[test]
+    fn the_conflict_policies_settle_a_name_already_taken_matrix() {
+        struct Case {
+            policy: ConflictPolicy,
+            /// The programs registered afterwards, in order.
+            tools: &'static [&'static str],
+            /// What the program called "Collect" runs afterwards.
+            collect_runs: &'static str,
+            /// What the arriving pipeline's one step runs.
+            step_runs: &'static str,
+            outcome: fn(&MergeOutcome) -> bool,
+        }
+        let cases = [
+            Case {
+                policy: ConflictPolicy::Replace,
+                tools: &["Collect"],
+                collect_runs: "/bin/theirs",
+                step_runs: "Collect",
+                outcome: |o| *o == MergeOutcome::Replaced,
+            },
+            Case {
+                policy: ConflictPolicy::Skip,
+                tools: &["Collect"],
+                collect_runs: "/bin/mine",
+                step_runs: "Collect",
+                outcome: |o| *o == MergeOutcome::Skipped,
+            },
+            Case {
+                policy: ConflictPolicy::KeepBoth,
+                tools: &["Collect", "Collect (2)"],
+                collect_runs: "/bin/mine",
+                step_runs: "Collect (2)",
+                outcome: |o| matches!(o, MergeOutcome::Renamed(to) if to == "Collect (2)"),
+            },
+        ];
+        assert_table!(cases, |idx, case| {
+            let theirs = registry(&[tool("Collect", "/bin/theirs")], &[plan("Nightly", &["Collect"])]);
+            let bundle = AutomationBundle::from_plan(&theirs.automation_plans[0], &theirs.external_tools, "");
+            let mut mine = registry(&[tool("Collect", "/bin/mine")], &[]);
+            let report = bundle.merge_into(&mut mine, case.policy);
+
+            let names: Vec<&str> = mine.external_tools.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, case.tools, "case #{idx} ({}): the registry afterwards", case.policy.label());
+            let collect = mine.external_tools.iter().find(|t| t.name == "Collect").expect("the one named");
+            assert_eq!(collect.command, case.collect_runs, "case #{idx} ({})", case.policy.label());
+            assert_eq!(
+                runs_of(&mine),
+                vec![("Nightly".to_string(), vec![case.step_runs.to_string()])],
+                "case #{idx} ({}): the arriving step runs the program it arrived with",
+                case.policy.label()
+            );
+            assert!(
+                (case.outcome)(&report.tools[0].1),
+                "case #{idx} ({}): {:?}",
+                case.policy.label(),
+                report.lines()
+            );
+            // the policy words a command line uses are the same three, and read back
+            assert_eq!(ConflictPolicy::from_word(case.policy.word()), Some(case.policy));
+        });
+        assert_eq!(ConflictPolicy::from_word("  REPLACE "), Some(ConflictPolicy::Replace), "and ignore capitals");
+        assert_eq!(ConflictPolicy::from_word("something else"), None);
+        // a pipeline whose name is taken is settled the same way
+        let theirs = registry(&[tool("Collect", "/bin/theirs")], &[plan("Nightly", &["Collect"])]);
+        let bundle = AutomationBundle::from_plan(&theirs.automation_plans[0], &theirs.external_tools, "");
+        let mut mine = registry(&[], &[plan("Nightly", &[])]);
+        bundle.merge_into(&mut mine, ConflictPolicy::KeepBoth);
+        let plans: Vec<&str> = mine.automation_plans.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(plans, ["Nightly", "Nightly (2)"]);
+    }
+
+    /// A single program or a single pipeline, pasted out of a settings file, is read as a
+    /// bundle of its own rather than refused on a technicality.
+    #[test]
+    fn a_bare_program_or_pipeline_is_read_as_a_bundle_of_its_own() {
+        let one = tool("Collect", "/bin/collect");
+        let json = serde_json::to_string(&one).expect("a program as JSON");
+        let bundle = AutomationBundle::from_json(&json).expect("a program alone reads");
+        assert_eq!(bundle.tools, [one]);
+        assert!(bundle.plans.is_empty());
+        assert_eq!(bundle.name, "Collect", "named after what it holds");
+
+        let p = plan("Nightly", &["Collect"]);
+        let json = serde_json::to_string(&p).expect("a pipeline as JSON");
+        let bundle = AutomationBundle::from_json(&json).expect("a pipeline alone reads");
+        assert_eq!(bundle.plans, [p]);
+        assert!(bundle.tools.is_empty(), "it carries no programs, so its steps bind to registered ones");
+
+        // and what is not a bundle at all says so
+        let cases: [(&str, &str); 5] = [
+            ("not json at all", "not JSON"),
+            ("[1, 2, 3]", "a JSON object"),
+            ("{}", "no programs and no pipelines"),
+            (r#"{"tools":[],"plans":[]}"#, "no programs and no pipelines"),
+            (r#"{"format_version":99,"tools":[{"name":"a","command":"b"}]}"#, "does not read"),
+        ];
+        assert_table!(cases, |idx, (text, says)| {
+            let e = AutomationBundle::from_json(text).expect_err(&format!("case #{idx}: {text:?} is no bundle"));
+            assert!(e.contains(says), "case #{idx}: {text:?} said {e:?}, wanted {says:?}");
+        });
+    }
+
+    /// A step holds the name of the program it runs, so it survives the registry being
+    /// reordered and follows that program when it is renamed.
+    #[test]
+    fn a_step_follows_the_program_it_names() {
+        let mut settings = registry(
+            &[tool("Collect", "/bin/collect"), tool("Report", "/bin/report")],
+            &[plan("Nightly", &["Report"])],
+        );
+        assert_eq!(settings.automation_plans[0].steps[0].tool_index, 1, "bound to where it sits now");
+
+        // the registry is reordered: the step still runs what it named
+        settings.external_tools.swap(0, 1);
+        let tools = settings.external_tools.clone();
+        bind_steps(&tools, &mut settings.automation_plans);
+        assert_eq!(settings.automation_plans[0].steps[0].tool_index, 0, "pointed at where it moved to");
+        assert_eq!(runs_of(&settings), vec![("Nightly".to_string(), vec!["Report".to_string()])]);
+
+        // the program is renamed: the step is carried with it
+        rename_in_steps(&mut settings.automation_plans, "Report", "Write the report");
+        settings.external_tools[0].name = "Write the report".into();
+        let tools = settings.external_tools.clone();
+        bind_steps(&tools, &mut settings.automation_plans);
+        assert_eq!(runs_of(&settings), vec![("Nightly".to_string(), vec!["Write the report".to_string()])]);
+        // renaming to the same thing, or from nothing, changes nothing
+        let before = settings.automation_plans.clone();
+        rename_in_steps(&mut settings.automation_plans, "Write the report", "Write the report");
+        rename_in_steps(&mut settings.automation_plans, "", "Something");
+        assert_eq!(settings.automation_plans, before);
+
+        // a step that names nothing -- a plan saved before names were kept -- is read by its
+        // place, and gains the name from it
+        let mut old = UserSettings {
+            external_tools: vec![tool("Collect", "/bin/collect"), tool("Report", "/bin/report")],
+            automation_plans: vec![AutomationPlan {
+                name: "Older".into(),
+                steps: vec![PipelineStep { tool_index: 1, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tools = old.external_tools.clone();
+        bind_steps(&tools, &mut old.automation_plans);
+        assert_eq!(old.automation_plans[0].steps[0].tool_name, "Report", "named from where it pointed");
+    }
+
+    /// A value given for a run reaches the template as exactly one argument, whatever is in it.
+    #[test]
+    fn a_value_given_for_a_run_fills_one_argument_matrix() {
+        let ctx = ToolContext {
+            vars: [
+                ("TOKEN".to_string(), "a b & c; d | e > f".to_string()),
+                ("BLANK".to_string(), String::new()),
+                ("LOOKS_LIKE_ONE".to_string(), "{var:TOKEN}".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let cases: [(&str, &[&str]); 8] = [
+            // the value becomes one argument, spaces, semicolons, pipes and all
+            ("--token {var:TOKEN}", &["--token", "a b & c; d | e > f"]),
+            // joined to text around it, still one argument
+            ("prefix-{var:TOKEN}-suffix", &["prefix-a b & c; d | e > f-suffix"]),
+            // twice in one argument
+            ("{var:TOKEN}/{var:TOKEN}", &["a b & c; d | e > f/a b & c; d | e > f"]),
+            // a key given as nothing is nothing, and the argument stays an argument
+            ("--blank={var:BLANK}", &["--blank="]),
+            // a key never given is nothing too, rather than left as a brace
+            ("--missing={var:NEVER_GIVEN}", &["--missing="]),
+            // a value that looks like a placeholder is the text it is, not filled again
+            ("{var:LOOKS_LIKE_ONE}", &["{var:TOKEN}"]),
+            // an opening with no closing brace is text
+            ("{var:TOKEN --next", &["{var:TOKEN", "--next"]),
+            // and the other placeholders still work beside it
+            ("{var:TOKEN} {url}", &["a b & c; d | e > f", ""]),
+        ];
+        assert_table!(cases, |idx, (template, want)| {
+            let argv = fill(&tokenize(template), &ctx, None, None);
+            assert_eq!(argv, want, "case #{idx}: {template:?}");
+        });
+        // the value is never split into arguments of its own, however it is written
+        let argv = fill(&tokenize("{var:TOKEN}"), &ctx, None, None);
+        assert_eq!(argv.len(), 1, "one argument: {argv:?}");
+        // and a template with no variable in it is untouched
+        assert_eq!(fill(&tokenize("--plain value"), &ctx, None, None), ["--plain", "value"]);
     }
 }

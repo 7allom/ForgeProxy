@@ -853,6 +853,7 @@ pub fn tool_context(url: &str, request: &str, response: &str) -> crate::tooling:
         request: request.to_string(),
         response: response.to_string(),
         prev_out_file: String::new(),
+        vars: Default::default(),
     }
 }
 
@@ -2059,7 +2060,7 @@ mod tests {
                 open: |app| {
                     app.automation_target = "http://h.test/".into();
                     app.settings.automation_plans =
-                        vec![crate::tooling::AutomationPlan { name: "empty".into(), steps: Vec::new() }];
+                        vec![crate::tooling::AutomationPlan { name: "empty".into(), steps: Vec::new(), ..Default::default() }];
                     app.automation_sel = AutomationSel::Pipeline(0);
                 },
                 says: "at least one step",
