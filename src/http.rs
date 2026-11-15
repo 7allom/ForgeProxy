@@ -174,8 +174,12 @@ pub struct Recorder {
     /// Logger's capture switch. While it is set nothing is recorded at all, and every tool
     /// goes on sending exactly as it was: pausing stops the record, not the work.
     pub paused: Arc<std::sync::atomic::AtomicBool>,
-    /// How many entries the store keeps before the oldest are dropped.
-    pub limit: usize,
+    /// How many entries the store keeps. Shared, so changing it in Settings reaches the
+    /// senders already running rather than only the next one to start.
+    pub limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// What to do once the store is full: hold the capture rather than drop the oldest. The
+    /// choice between keeping the start of an engagement and keeping the end of it.
+    pub pause_when_full: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Recorder {
@@ -186,8 +190,17 @@ impl Recorder {
             history: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(Mutex::new(0)),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            limit,
+            limit: Arc::new(std::sync::atomic::AtomicUsize::new(limit)),
+            pause_when_full: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The same, but holding the capture once full instead of dropping the oldest.
+    #[cfg(test)]
+    pub fn new_pausing(limit: usize) -> Self {
+        let r = Self::new(limit);
+        r.pause_when_full.store(true, std::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     /// Is recording paused?
@@ -208,11 +221,18 @@ impl Recorder {
             *next += 1;
             *next
         };
+        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed).max(1);
         let mut kept = self.history.lock().unwrap_or_else(|e| e.into_inner());
-        // a ring buffer by index: the oldest entries go first, and only once the store is
-        // full, so an ordinary session never copies the whole of it
-        if kept.len() >= self.limit {
-            let over = kept.len() + 1 - self.limit;
+        if kept.len() >= limit {
+            if self.pause_when_full.load(std::sync::atomic::Ordering::Relaxed) {
+                // the store is full and the oldest entries are the ones worth keeping: stop
+                // recording instead, and say so by setting the capture switch the Logger shows
+                self.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+            // a ring buffer by index: the oldest entries go first, and only once the store is
+            // full, so an ordinary session never copies the whole of it
+            let over = kept.len() + 1 - limit;
             kept.drain(..over);
         }
         kept.push(Arc::new(entry(id)));
@@ -303,11 +323,13 @@ fn unpack_body_capped(encoding: &str, data: &[u8], cap: u64) -> Option<Vec<u8>> 
 pub struct SendOptions {
     pub timeout: Duration,
     pub net: crate::upstream::NetConfig,
+    /// How much of one response body is read, in bytes. Settings > Proxy > Storage and limits.
+    pub max_body: u64,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        SendOptions { timeout: Duration::from_secs(15), net: Default::default() }
+        SendOptions { timeout: Duration::from_secs(15), net: Default::default(), max_body: MAX_BODY }
     }
 }
 
@@ -781,7 +803,7 @@ mod client_tests {
     }
 
     fn opts(verify_tls: bool, upstream: UpstreamProxyConfig) -> SendOptions {
-        SendOptions { timeout: Duration::from_secs(5), net: NetConfig { upstream, verify_tls } }
+        SendOptions { timeout: Duration::from_secs(5), net: NetConfig { upstream, verify_tls }, ..Default::default() }
     }
 
     fn proxy(kind: UpstreamProxyType, port: u16) -> UpstreamProxyConfig {
@@ -962,5 +984,59 @@ mod client_tests {
         let (head, body) = message.split_once("\n\n").expect("head and body are still separated");
         assert_eq!(head, "— (transport error)", "the head is the note alone, with no empty header line under it");
         assert!(body.starts_with("Request failed:"), "and the detail is the body: {body:?}");
+    }
+
+    /// One recorded exchange, distinguishable by its path.
+    fn entry_with(id: usize, path: &str) -> HttpEntry {
+        HttpEntry {
+            id, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: path.into(),
+            status: "200 OK".into(), length: 0, mime: String::new(), request: String::new(), response: String::new(),
+            url: format!("http://shop.test{path}"), truncated: false, time: 0, elapsed_ms: 0,
+        }
+    }
+
+    /// The store keeps what it is told to and no more, dropping the oldest as new ones arrive.
+    #[test]
+    fn the_store_evicts_the_oldest_once_it_is_full() {
+        let rec = Recorder::new(3);
+        for i in 1..=5 {
+            assert!(rec.record(|id| entry_with(id, &format!("/p{i}"))).is_some(), "entry {i} was recorded");
+        }
+        let kept = rec.history.lock().unwrap();
+        assert_eq!(kept.len(), 3, "only the limit is held");
+        let paths: Vec<String> = kept.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(paths, ["/p3", "/p4", "/p5"], "and it is the newest that are held");
+        assert!(!rec.paused(), "evicting does not stop the capture");
+    }
+
+    /// Told to hold instead, it stops recording and says so, so the start of an engagement is
+    /// what survives rather than the end of it.
+    #[test]
+    fn the_store_can_hold_the_capture_instead_of_evicting() {
+        let rec = Recorder::new_pausing(3);
+        for i in 1..=3 {
+            assert!(rec.record(|id| entry_with(id, &format!("/p{i}"))).is_some(), "entry {i}");
+        }
+        assert!(rec.record(|id| entry_with(id, "/over")).is_none(), "the one past the limit is not recorded");
+        assert!(rec.paused(), "and the capture switch is set, which is what the Logger shows");
+        let kept = rec.history.lock().unwrap();
+        assert_eq!(kept.len(), 3);
+        let paths: Vec<String> = kept.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(paths, ["/p1", "/p2", "/p3"], "the oldest are the ones kept");
+    }
+
+    /// The limit is shared, so raising it in Settings reaches a sender that is already running.
+    #[test]
+    fn raising_the_limit_reaches_a_recorder_already_in_use() {
+        let rec = Recorder::new(2);
+        for i in 1..=4 {
+            let _ = rec.record(|id| entry_with(id, &format!("/p{i}")));
+        }
+        assert_eq!(rec.history.lock().unwrap().len(), 2);
+        rec.limit.store(5, std::sync::atomic::Ordering::Relaxed);
+        for i in 5..=7 {
+            let _ = rec.record(|id| entry_with(id, &format!("/p{i}")));
+        }
+        assert_eq!(rec.history.lock().unwrap().len(), 5, "the new limit took effect on the same recorder");
     }
 }

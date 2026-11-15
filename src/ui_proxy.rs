@@ -35,7 +35,15 @@ pub fn open_browser(app: &mut App) {
     let unencrypted_warning = launch_warning(decrypting, pin.is_some());
     // the full message (browser, pin, restart note) goes to the Event log; the toolbar gets
     // a short status
-    app.proxy_msg = match crate::browser::open(app.proxy_host.trim(), port, "about:blank", pin.as_deref()) {
+    // Settings > Proxy > Browser: the binary, the profile, the extra flags and the page
+    let profile = crate::browser::BrowserProfile {
+        binary: app.settings.browser_binary.clone(),
+        profile_dir: app.settings.browser_profile_dir.clone(),
+        extra_args: app.settings.browser_extra_args.clone(),
+        start_url: app.settings.browser_start_url.clone(),
+    };
+    let start = profile.url().to_string();
+    app.proxy_msg = match crate::browser::open_with(app.proxy_host.trim(), port, &start, pin.as_deref(), &profile) {
         Ok(m) => {
             proxy::log(&app.proxy.events, m);
             match unencrypted_warning {

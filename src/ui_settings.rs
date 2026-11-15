@@ -43,6 +43,8 @@ const PAGES: &[PageInfo] = &[
         card("Skipped file extensions", "Requests for files with these extensions pass through Intercept without being held.", Home::Project),
         card("HTTP match and replace rules", "Automatically replace parts of requests and responses passing through the Proxy (and sent from Repeater).", Home::Project),
         card("Default Proxy interception state", "Whether Intercept is on when this project is opened.", Home::Project),
+        card("Storage and limits", "How much traffic is kept in memory, how much of a body is read, and what gives way when the store is full.", Home::User),
+        card("Browser", "Which browser the Open browser button launches, and how.", Home::User),
     ]},
     PageInfo { page: SettingsPage::Intruder, group: Some("Tools"), name: "Intruder", cards: &[
         card("Attack execution", "How many requests an attack sends at once, and the pause between them.", Home::User),
@@ -59,6 +61,9 @@ const PAGES: &[PageInfo] = &[
     PageInfo { page: SettingsPage::Collaborator, group: Some("Tools"), name: "Collaborator", cards: &[
         card("Default relay server", "The relay a new project starts on. A project that names its own relay keeps it.", Home::User),
         card("Polling", "How often the Collaborator tab asks its relay what has come in, while its timer is on.", Home::User),
+    ]},
+    PageInfo { page: SettingsPage::ExternalTools, group: Some("Tools"), name: "External tools", cards: &[
+        card("Registered programs", "Programs offered on the \"Send to\" menus. Each one is run directly with its arguments; no shell is involved.", Home::User),
     ]},
     PageInfo { page: SettingsPage::NetworkConnections, group: Some("Network"), name: "Connections", cards: &[
         card("Upstream proxy", "Send outgoing traffic through another proxy: the Proxy's connections to targets (including HTTPS and pass-through tunnels) and requests from Repeater, Intruder, Scanner and Sequencer.", Home::Override),
@@ -442,6 +447,9 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
                 }
             });
         }
+        (SettingsPage::Proxy, "Storage and limits") => storage_limits(app, ui, p),
+        (SettingsPage::Proxy, "Browser") => browser_profile(app, ui, p),
+        (SettingsPage::ExternalTools, _) => external_tools(app, ui, p),
         (SettingsPage::Collaborator, "Default relay server") => {
             ui.horizontal(|ui| {
                 ui.label("Relay:");
@@ -726,6 +734,248 @@ fn tls_passthrough(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 }
 
+/// Settings > Proxy > Storage and limits: the budget a long engagement runs within.
+fn storage_limits(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let s = &mut app.settings;
+    egui::Grid::new("storage_limits").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Keep at most:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut s.max_entries)
+                    .range(crate::rules::ENTRY_LIMIT_RANGE)
+                    .speed(50.0)
+                    .suffix(" entries"),
+            );
+            if theme::plain_button(ui, p, "Reset", s.max_entries != crate::rules::MAX_RECORDED_REQUESTS).clicked() {
+                s.max_entries = crate::rules::MAX_RECORDED_REQUESTS;
+            }
+        });
+        ui.end_row();
+
+        ui.label("When that is reached:");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut s.pause_when_full, false, "Evict oldest")
+                .on_hover_text("Keep recording; the oldest entries are dropped as new ones arrive.");
+            ui.radio_value(&mut s.pause_when_full, true, "Pause capture")
+                .on_hover_text("Stop recording and keep what is already there. Resume from the Logger.");
+        });
+        ui.end_row();
+
+        ui.label("Read at most, per body:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut s.max_body_kib)
+                    .range(crate::rules::BODY_LIMIT_KIB_RANGE)
+                    .speed(64.0)
+                    .suffix(" KiB"),
+            );
+            ui.label(RichText::new(format!("≈ {} MiB", s.max_body_kib / 1024)).size(11.0).color(p.disabled));
+        });
+        ui.end_row();
+
+        ui.label("Show at most, per message:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut s.display_limit_kib)
+                    .range(crate::rules::DISPLAY_LIMIT_KIB_RANGE)
+                    .speed(32.0)
+                    .suffix(" KiB"),
+            );
+            ui.label(RichText::new("a longer message opens cut short, and read-only").size(11.0).color(p.disabled));
+        });
+        ui.end_row();
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Applies to everything recording from now on, including senders already running.")
+            .size(11.5)
+            .color(p.disabled),
+    );
+}
+
+/// Settings > Proxy > Browser: what the Open browser button launches.
+fn browser_profile(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let s = &mut app.settings;
+    egui::Grid::new("browser_profile").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Browser:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut s.browser_binary)
+                    .desired_width(300.0)
+                    .hint_text("found automatically when empty"),
+            );
+            if theme::plain_button(ui, p, "Choose…", true).clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    s.browser_binary = path.display().to_string();
+                }
+            }
+            if theme::plain_button(ui, p, "Clear", !s.browser_binary.is_empty()).clicked() {
+                s.browser_binary.clear();
+            }
+        });
+        ui.end_row();
+
+        ui.label("Profile folder:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut s.browser_profile_dir)
+                    .desired_width(300.0)
+                    .hint_text("a managed temporary profile when empty"),
+            );
+            if theme::plain_button(ui, p, "Choose…", true).clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    s.browser_profile_dir = dir.display().to_string();
+                }
+            }
+            if theme::plain_button(ui, p, "Clear", !s.browser_profile_dir.is_empty()).clicked() {
+                s.browser_profile_dir.clear();
+            }
+        });
+        ui.end_row();
+
+        ui.label("Extra arguments:");
+        ui.add(
+            egui::TextEdit::singleline(&mut s.browser_extra_args)
+                .desired_width(380.0)
+                .hint_text("--window-size=1280,900"),
+        );
+        ui.end_row();
+
+        ui.label("Open at:");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut s.browser_start_url)
+                    .desired_width(300.0)
+                    .hint_text(crate::browser::DEFAULT_START_URL),
+            );
+            let changed = s.browser_start_url != crate::browser::DEFAULT_START_URL;
+            if theme::plain_button(ui, p, "Reset", changed).clicked() {
+                s.browser_start_url = crate::browser::DEFAULT_START_URL.to_string();
+            }
+        });
+        ui.end_row();
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Name a profile folder to keep cookies and sessions between launches. Arguments are split on spaces, with quoted runs kept together; no shell reads them.")
+            .size(11.5)
+            .color(p.disabled),
+    );
+}
+
+/// Settings > External tools: the programs offered on the "Send to" menus.
+fn external_tools(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let count = app.settings.external_tools.len();
+    let sel = app.ext_tool_sel.filter(|&i| i < count);
+    let mut pick = None;
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            if theme::side_button(ui, p, "Add", true).clicked() {
+                app.settings.external_tools.push(crate::tooling::ExternalTool {
+                    name: "New tool".into(),
+                    ..Default::default()
+                });
+                pick = Some(app.settings.external_tools.len() - 1);
+            }
+            if theme::side_button(ui, p, "Remove", sel.is_some()).clicked() {
+                if let Some(i) = sel {
+                    app.settings.external_tools.remove(i);
+                    app.ext_tool_sel = None;
+                }
+            }
+            if theme::side_button(ui, p, "Up", sel.is_some_and(|i| i > 0)).clicked() {
+                if let Some(i) = sel {
+                    app.settings.external_tools.swap(i, i - 1);
+                    pick = Some(i - 1);
+                }
+            }
+            if theme::side_button(ui, p, "Down", sel.is_some_and(|i| i + 1 < count)).clicked() {
+                if let Some(i) = sel {
+                    app.settings.external_tools.swap(i, i + 1);
+                    pick = Some(i + 1);
+                }
+            }
+        });
+        // (minimum width, share of the spare width) for Name, Program, Input
+        const COLS: [(f32, f32); 3] = [(150.0, 0.35), (200.0, 0.45), (110.0, 0.2)];
+        let height = ((count.max(1) + 1) as f32) * theme::ROW_HEIGHT + 8.0;
+        let tools = app.settings.external_tools.clone();
+        theme::fitted_table(ui, p, "ext_tools_table", height, &COLS, |ui, w| {
+            theme::table_header(ui, p, &[("Name", w[0]), ("Program", w[1]), ("Input", w[2])]);
+            if tools.is_empty() {
+                ui.label(RichText::new("  No programs yet. Add one, and it appears on every \"Send to\" menu.").size(11.5).color(p.disabled));
+                return;
+            }
+            for (i, t) in tools.iter().enumerate() {
+                let open = sel == Some(i);
+                let fg = if t.is_runnable() { p.text } else { p.disabled };
+                let row = theme::table_row(
+                    ui,
+                    p,
+                    &[
+                        (t.name.clone(), w[0], Some(fg)),
+                        (t.command.clone(), w[1], Some(fg)),
+                        (t.stdin_mode.label().to_string(), w[2], Some(p.disabled)),
+                    ],
+                    open,
+                    i % 2 == 1,
+                );
+                row.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, format!("Tool {}", t.name))
+                });
+                if row.clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+    });
+    if let Some(i) = pick {
+        app.ext_tool_sel = Some(i);
+    }
+
+    let Some(i) = app.ext_tool_sel.filter(|&i| i < app.settings.external_tools.len()) else {
+        return;
+    };
+    ui.add_space(8.0);
+    ui.label(bold("Edit selected program", 13.0).color(p.strong));
+    let tool = &mut app.settings.external_tools[i];
+    egui::Grid::new("ext_tool_edit").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Menu label:");
+        ui.add(egui::TextEdit::singleline(&mut tool.name).desired_width(300.0).hint_text("Inspect in script"));
+        ui.end_row();
+        ui.label("Program:");
+        ui.add(egui::TextEdit::singleline(&mut tool.command).desired_width(300.0).hint_text("a name on the path, or a full path"));
+        ui.end_row();
+        ui.label("Arguments:");
+        ui.add(egui::TextEdit::singleline(&mut tool.args).desired_width(380.0).hint_text("-r --url {url} {req_file}"));
+        ui.end_row();
+        ui.label("Give it on input:");
+        egui::ComboBox::from_id_salt("ext_tool_stdin")
+            .selected_text(tool.stdin_mode.label())
+            .show_ui(ui, |ui| {
+                for m in crate::tooling::ToolStdinMode::ALL {
+                    ui.selectable_value(&mut tool.stdin_mode, m, m.label());
+                }
+            });
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+    ui.label(RichText::new("Placeholders").size(11.5).color(p.strong));
+    egui::Grid::new("ext_tool_placeholders").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
+        for (token, meaning) in crate::tooling::PLACEHOLDERS {
+            ui.label(RichText::new(token).size(11.0).monospace().color(p.badge_info));
+            ui.label(RichText::new(meaning).size(11.0).color(p.disabled));
+            ui.end_row();
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("The program is started directly, so an address carrying ; or $( ) is passed to it as text and never run. A temporary file is written for your account only and removed when the program finishes.")
+            .size(11.5)
+            .color(p.disabled),
+    );
+}
+
 /// Settings > Hotkeys: every action, the keys it carries, and the means to change them.
 ///
 /// One row per action from `hotkeys::ACTIONS`, so the table and the dispatch cannot disagree.
@@ -971,6 +1221,7 @@ mod tests {
             SettingsPage::Repeater,
             SettingsPage::Sequencer,
             SettingsPage::Collaborator,
+            SettingsPage::ExternalTools,
             SettingsPage::NetworkConnections,
             SettingsPage::NetworkTls,
             SettingsPage::Display,
@@ -1158,5 +1409,59 @@ mod tests {
         app.settings_page = SettingsPage::Display;
         draw(&ctx, &mut app);
         assert!(app.hotkey_capturing.is_none(), "leaving the page ended it too");
+    }
+
+    /// The External tools page is in the sidebar, findable by what it is for, and its card
+    /// draws for a registry that is empty as well as one with a program in it.
+    #[test]
+    fn the_external_tools_page_is_listed_and_draws() {
+        use crate::state::Tab;
+        use crate::test_utils::MockAppBuilder;
+        use eframe::egui;
+        assert_eq!(PAGES.iter().filter(|i| i.page == SettingsPage::ExternalTools).count(), 1);
+        let page = info(SettingsPage::ExternalTools);
+        assert!(page_visible(page, "external"), "found by name");
+        assert!(page_visible(page, "send to"), "and by what its card is about");
+
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+        ctx.enable_accesskit();
+        app.show_settings = true;
+        app.settings_page = SettingsPage::ExternalTools;
+        let draw = |ctx: &egui::Context, app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 950.0))),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| crate::ui_core::frame(app, ctx)).platform_output.accesskit_update
+        };
+        let labels = |u: &Option<egui::accesskit::TreeUpdate>| -> Vec<String> {
+            u.as_ref()
+                .expect("accesskit output")
+                .nodes
+                .iter()
+                .filter_map(|(_, n)| n.label().or_else(|| n.value()).map(|s| s.to_string()))
+                .collect()
+        };
+        // an empty registry still draws, and says what the page is for
+        draw(&ctx, &mut app);
+        let seen = labels(&draw(&ctx, &mut app));
+        assert!(seen.iter().any(|l| l == "Add"), "the controls are there: {seen:?}");
+
+        // and one with a program in it shows that program, selected for editing
+        app.settings.external_tools = vec![crate::tooling::ExternalTool {
+            name: "Inspect in script".into(),
+            command: "python3".into(),
+            args: "-u check.py {url}".into(),
+            stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+        }];
+        app.ext_tool_sel = Some(0);
+        draw(&ctx, &mut app);
+        let seen = labels(&draw(&ctx, &mut app));
+        assert!(seen.iter().any(|l| l == "Tool Inspect in script"), "the row is drawn: {seen:?}");
+        assert!(seen.iter().any(|l| l == "{url}"), "and the placeholders are listed: {seen:?}");
+        // the editor for the selected program is open, with its fields named
+        for field in ["Menu label:", "Program:", "Arguments:", "Give it on input:"] {
+            assert!(seen.iter().any(|l| l == field), "{field} is in the editor: {seen:?}");
+        }
     }
 }

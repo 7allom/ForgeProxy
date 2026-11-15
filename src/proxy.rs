@@ -46,6 +46,9 @@ pub struct Shared {
     /// Logger's capture switch, shared with the rest of the app: while it is set the proxy
     /// forwards traffic as usual and records none of it.
     pub capture_paused: Arc<AtomicBool>,
+    /// Settings > Proxy > Storage and limits (kept current by the UI each frame).
+    pub entry_limit: Arc<std::sync::atomic::AtomicUsize>,
+    pub pause_when_full: Arc<AtomicBool>,
     pub intercept: Arc<AtomicBool>,
     pub held: Arc<Mutex<Vec<Held>>>,
     pub rules: Arc<Mutex<Vec<Rule>>>,
@@ -193,7 +196,8 @@ impl Shared {
             history: self.history.clone(),
             next_id: self.next_id.clone(),
             paused: self.capture_paused.clone(),
-            limit: crate::rules::MAX_RECORDED_REQUESTS,
+            limit: self.entry_limit.clone(),
+            pause_when_full: self.pause_when_full.clone(),
         }
     }
 }
@@ -899,6 +903,8 @@ mod tests {
             history: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(Mutex::new(0)),
             capture_paused: Arc::new(AtomicBool::new(false)),
+            entry_limit: Arc::new(std::sync::atomic::AtomicUsize::new(crate::rules::MAX_RECORDED_REQUESTS)),
+            pause_when_full: Arc::new(AtomicBool::new(false)),
             intercept: Arc::new(AtomicBool::new(false)),
             held: Arc::new(Mutex::new(Vec::new())),
             rules: Arc::new(Mutex::new(Vec::new())),

@@ -277,6 +277,19 @@ fn seg(p: &Palette, col: Color32, inside: bool) -> TextFormat {
 /// freeze the window.
 pub const DISPLAY_LIMIT: usize = 256 * 1024;
 
+/// Settings > Proxy > Storage and limits: how much of a message is laid out before it is
+/// shown cut short. Kept beside the editor font size and set from the same place once a frame.
+const DISPLAY_LIMIT_KEY: &str = "display_limit_bytes";
+
+pub fn set_display_limit(ctx: &egui::Context, bytes: usize) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(DISPLAY_LIMIT_KEY), bytes));
+}
+
+/// The cut-off in force, which is the default until Settings says otherwise.
+pub fn display_limit(ctx: &egui::Context) -> usize {
+    ctx.data(|d| d.get_temp(egui::Id::new(DISPLAY_LIMIT_KEY))).unwrap_or(DISPLAY_LIMIT)
+}
+
 /// The start of `s`, at most `limit` bytes, ending on a character boundary.
 pub fn capped(s: &str, limit: usize) -> &str {
     if s.len() <= limit {
@@ -472,8 +485,9 @@ pub fn message_view(ui: &mut Ui, p: &Palette, id: &str, text: &str, min_height: 
     match mode {
         MessageViewMode::Raw => MessageView { out: show_message(ui, p, &wid, Buffer::View(text), false, min_height), shown: None },
         MessageViewMode::Pretty => {
-            let full = large_note(ui, p, &wid, text.len(), DISPLAY_LIMIT);
-            let src = if full { text } else { capped(text, DISPLAY_LIMIT) };
+            let cap = display_limit(ui.ctx());
+            let full = large_note(ui, p, &wid, text.len(), cap);
+            let src = if full { text } else { capped(text, cap) };
             let (pretty, kind) = ui.ctx().memory_mut(|m| m.caches.cache::<PrettyCache>().get((src,)));
             let out = show_text(ui, p, &wid, Buffer::View(&pretty), Style::Pretty(kind), min_height);
             MessageView { out, shown: Some(pretty) }
@@ -491,12 +505,13 @@ pub fn message_view(ui: &mut Ui, p: &Palette, id: &str, text: &str, min_height: 
 
 fn show_message(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, positions: bool, min_height: f32) -> egui::text_edit::TextEditOutput {
     let full_len = match &buf { Buffer::Edit(t) => t.len(), Buffer::View(t) => t.len() };
-    let buf = if large_note(ui, p, id, full_len, DISPLAY_LIMIT) {
+    let cap = display_limit(ui.ctx());
+    let buf = if large_note(ui, p, id, full_len, cap) {
         buf
     } else {
         // only the start is laid out, read-only; the text itself is untouched
         let all: &str = match buf { Buffer::Edit(t) => t.as_str(), Buffer::View(t) => t };
-        Buffer::View(capped(all, DISPLAY_LIMIT))
+        Buffer::View(capped(all, cap))
     };
     show_text(ui, p, id, buf, Style::Http { positions }, min_height)
 }

@@ -36,6 +36,17 @@ pub const SEQUENCER_THREADS: usize = 5;
 /// until there is none left.
 pub const MAX_RECORDED_REQUESTS: usize = 50_000;
 
+/// Settings > Proxy > Storage and limits. The ranges a hand-edited settings file is brought
+/// into: small enough to be useful on a short engagement, large enough not to throw away
+/// evidence on a long one.
+pub const ENTRY_LIMIT_RANGE: std::ops::RangeInclusive<usize> = 1_000..=500_000;
+/// How much of one body is read and kept, in KiB.
+pub const BODY_LIMIT_KIB_RANGE: std::ops::RangeInclusive<usize> = 64..=102_400;
+pub const DEFAULT_BODY_LIMIT_KIB: usize = 10 * 1024;
+/// How much of a message an editor lays out before showing it cut short, in KiB.
+pub const DISPLAY_LIMIT_KIB_RANGE: std::ops::RangeInclusive<usize> = 32..=4_096;
+pub const DEFAULT_DISPLAY_LIMIT_KIB: usize = 256;
+
 /// `SKIP_EXTENSIONS` as the editable list a new project starts with.
 pub fn default_skip_extensions() -> Vec<String> {
     SKIP_EXTENSIONS.iter().map(|s| s.to_string()).collect()

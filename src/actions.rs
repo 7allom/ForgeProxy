@@ -447,7 +447,19 @@ pub fn send_text_to_decoder(app: &mut App, text: String) {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum SendTo { Repeater, Intruder, Sequencer, Comparer, ComparerRequest, Decoder, Organizer, Scope }
+pub enum SendTo {
+    Repeater,
+    Intruder,
+    Sequencer,
+    Comparer,
+    ComparerRequest,
+    Decoder,
+    Organizer,
+    Scope,
+    /// A program the user registered, by its place in `UserSettings::external_tools`. Open
+    /// rather than closed, so a tool can be added without the menus knowing what it is.
+    External(usize),
+}
 
 /// Split an authority (`host:port`, `[::1]:8888`, or `host`) into `(hostname, Option<port>)`.
 pub fn split_host_port(auth: &str) -> (&str, Option<&str>) {
@@ -801,7 +813,50 @@ pub fn send_to(app: &mut App, e: &HttpEntry, to: SendTo) {
         }
         SendTo::Organizer => send_to_organizer(app, &entry_url(e), &raw_request(e), &e.response),
         SendTo::Scope => app.target_scope.add(&scope_prefix(e)),
+        SendTo::External(i) => run_external_tool(app, i, &entry_url(e), &raw_request(e), &e.response),
     }
+}
+
+/// Send a message held as text, rather than as a stored entry, to one destination.
+///
+/// The context menus work from the request and response in front of the user, which may be
+/// an edit nobody has sent yet and so has no entry in the store. Only the destinations those
+/// menus offer are handled here.
+pub fn send_message_to(app: &mut App, to: SendTo, url: &str, request: &str, response: &str) {
+    match to {
+        SendTo::External(i) => run_external_tool(app, i, url, request, response),
+        SendTo::Repeater => {
+            let method = request_method(request).unwrap_or_else(|| "GET".to_string());
+            send_to_repeater(app, &method, url, request);
+        }
+        SendTo::Intruder => send_to_intruder(app, url, request),
+        SendTo::Sequencer => send_to_sequencer(app, url, request),
+        SendTo::Organizer => send_to_organizer(app, url, request, response),
+        SendTo::Decoder => send_text_to_decoder(app, request.to_string()),
+        // the rest need an entry of their own, and the menus route them directly
+        SendTo::Comparer | SendTo::ComparerRequest | SendTo::Scope => {}
+    }
+}
+
+/// Hand one message to a registered program, off the drawing thread.
+pub fn run_external_tool(app: &App, index: usize, url: &str, request: &str, response: &str) {
+    let Some(tool) = app.settings.external_tools.get(index).filter(|t| t.is_runnable()) else {
+        return;
+    };
+    let (scheme, host, path) = url_parts(url);
+    // the port the exchange actually used, worked out from the address and the request
+    let port = HttpTarget::parse_or_infer(url, request.as_bytes(), None).port.to_string();
+    let ctx = crate::tooling::ToolContext {
+        url: url.to_string(),
+        scheme,
+        host,
+        port,
+        method: request_method(request).unwrap_or_default(),
+        path,
+        request: request.to_string(),
+        response: response.to_string(),
+    };
+    crate::tooling::run(tool, &ctx, &app.event_log);
 }
 
 /// The scope prefix for an entry: its origin ("https://host:port/").
@@ -1679,5 +1734,37 @@ mod tests {
         assert!(!log.is_empty(), "the requests sent before the stop are still recorded");
         assert!(log.len() < 50, "and the capture did stop early ({} recorded)", log.len());
         assert!(log.iter().all(|e| e.tool == "Sequencer" && e.status == "200 OK"), "{:?}", summary(&log));
+    }
+
+    /// A registered program is reachable through the same dispatch every other destination
+    /// uses, so a menu does not need to know whether a target is built in or added by hand.
+    #[test]
+    fn send_to_routes_a_message_to_a_registered_program() {
+        let (_ctx, mut app) = crate::test_utils::MockAppBuilder::new().build_with_ctx();
+        // a program that exists and succeeds, so the dispatch path runs end to end
+        app.settings.external_tools = vec![crate::tooling::ExternalTool {
+            name: "probe".into(),
+            command: "true".into(),
+            args: "--target {url}".into(),
+            stdin_mode: crate::tooling::ToolStdinMode::RawRequest,
+        }];
+        let e = crate::http::HttpEntry {
+            id: 1, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: "/cart".into(),
+            status: "200 OK".into(), length: 2, mime: "text/html".into(),
+            request: "GET /cart HTTP/1.1\r\nHost: shop.test\r\n\r\n".into(),
+            response: "HTTP/1.1 200 OK\r\n\r\nok".into(),
+            url: "http://shop.test/cart".into(), truncated: false, time: 0, elapsed_ms: 0,
+        };
+        // routed by index; the work happens on a thread, so what is checked here is that the
+        // dispatch accepts it and leaves the app alone (no tab change, nothing recorded)
+        let before = app.tab;
+        send_to(&mut app, &e, SendTo::External(0));
+        assert_eq!(app.tab, before, "running a program does not move the user somewhere else");
+
+        // an index with no tool behind it, and an unfinished tool, are both no-ops
+        send_to(&mut app, &e, SendTo::External(9));
+        app.settings.external_tools[0].command.clear();
+        send_to(&mut app, &e, SendTo::External(0));
+        assert_eq!(app.tab, before);
     }
 }

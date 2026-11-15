@@ -2113,14 +2113,18 @@ pub fn logger(app: &mut App, ui: &mut Ui, p: &Palette) {
             }
             ui.add_space(6.0);
             let mib = |n: u64| n >> 20;
+            // the live budget, not the figures this build was compiled with
+            let kept = app.settings.max_entries;
             let state = if paused {
                 "Capture is paused: requests are still being sent, and none of them are being recorded. ".to_string()
+            } else if app.settings.pause_when_full {
+                format!("Up to {kept} requests are kept; capture holds once that is reached. ")
             } else {
-                format!("The last {} requests are kept in memory. ", crate::rules::MAX_RECORDED_REQUESTS)
+                format!("The last {kept} requests are kept in memory. ")
             };
             ui.label(RichText::new(format!(
-                "{state}Proxy: request bodies up to {} MiB; responses over {} MiB reach the browser but are recorded cut short. Tools read responses up to {} MiB.",
-                mib(crate::proxy::MAX_REQUEST_BODY), mib(crate::proxy::MAX_BUFFERED), mib(crate::http::MAX_BODY))).size(11.5).color(p.text));
+                "{state}Proxy: request bodies up to {} MiB; responses over {} MiB reach the browser but are recorded cut short. Tools read bodies up to {} KiB.",
+                mib(crate::proxy::MAX_REQUEST_BODY), mib(crate::proxy::MAX_BUFFERED), app.settings.max_body_kib)).size(11.5).color(p.text));
         });
     });
     if app.history.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
@@ -2484,6 +2488,29 @@ pub fn show_traffic_context_menu(
         let full_url = actions::repeater_target(request, url);
         ui.ctx().copy_text(crate::export::to_curl(request, &actions::origin_of(&full_url)));
         ui.close_menu();
+    }
+    // the programs the user registered, under a line of their own. Added here rather than in
+    // each table, so every menu this builds -- history, Logger, site map, Organizer,
+    // Collaborator -- offers the same tools without being told about them.
+    let tools: Vec<(usize, String)> = app
+        .settings
+        .external_tools
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_runnable())
+        .map(|(i, t)| (i, t.name.trim().to_string()))
+        .collect();
+    if !tools.is_empty() {
+        ui.separator();
+        let response_text = response.unwrap_or("").to_string();
+        for (i, name) in tools {
+            if ui.button(&name).on_hover_text("Runs the program set up in Settings > External tools").clicked() {
+                // routed as a destination like any other, so a registered program goes
+                // through the same dispatch the built-in tools do
+                actions::send_message_to(app, actions::SendTo::External(i), url, request, &response_text);
+                ui.close_menu();
+            }
+        }
     }
 }
 

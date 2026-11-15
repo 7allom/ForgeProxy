@@ -1097,4 +1097,45 @@ mod tests {
         frame(&ctx, &mut app, vec![]);
         assert!(!find_all(&frame(&ctx, &mut app, vec![]), "GET new.test/x").is_empty(), "with its message open");
     }
+
+    /// Everything in a frame that carries a label or a value.
+    fn labels(update: &Option<egui::accesskit::TreeUpdate>) -> Vec<String> {
+        update
+            .as_ref()
+            .expect("accesskit output")
+            .nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().or_else(|| n.value()).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// A registered program appears on the row menu of a traffic table, and an unfinished one
+    /// does not. The menu is built once and shared, so this is the same menu HTTP history, the
+    /// Logger, the site map, the Organizer and the Collaborator all show.
+    #[test]
+    fn a_registered_program_appears_on_a_row_menu() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Organizer).build_with_ctx();
+        ctx.enable_accesskit();
+        let request = "GET /cart HTTP/1.1\nHost: shop.test\n\n";
+        crate::actions::send_to_organizer(&mut app, "http://shop.test/cart", request, "HTTP/1.1 200 OK\n\nok");
+        app.tab = Tab::Organizer;
+        app.settings.external_tools = vec![
+            crate::tooling::ExternalTool {
+                name: "Inspect in script".into(),
+                command: "python3".into(),
+                args: "-u check.py {url}".into(),
+                stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+            },
+            // unfinished: named, but with nothing to run
+            crate::tooling::ExternalTool { name: "Half done".into(), ..Default::default() },
+        ];
+
+        let at = row_rect(&ctx, &mut app, 1).center();
+        click_at(&ctx, &mut app, at, true);
+        let seen = labels(&frame(&ctx, &mut app, vec![]));
+        assert!(seen.iter().any(|l| l == "Inspect in script"), "the program is offered: {seen:?}");
+        assert!(!seen.iter().any(|l| l == "Half done"), "but not one that cannot run: {seen:?}");
+        // and the built-in destinations are still there alongside it
+        assert!(seen.iter().any(|l| l == "Send to Repeater"), "{seen:?}");
+    }
 }

@@ -33,6 +33,7 @@ mod sequencer;
 mod state;
 mod target;
 mod theme;
+mod tooling;
 mod ui_core;
 mod ui_comparer;
 mod ui_dash;

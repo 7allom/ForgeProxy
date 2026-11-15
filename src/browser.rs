@@ -58,6 +58,42 @@ fn installed() -> Vec<(String, PathBuf, bool)> {
     out
 }
 
+/// Where the browser lands when Settings names no page of its own.
+pub const DEFAULT_START_URL: &str = "about:blank";
+
+/// Settings > Proxy > Browser. Every field is optional: empty means "as before", so a
+/// workstation that has configured none of this behaves exactly as it did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BrowserProfile {
+    /// A browser to run instead of whichever one is found on the path.
+    pub binary: String,
+    /// A profile to keep, instead of the managed one under the app's own data directory.
+    pub profile_dir: String,
+    /// Extra flags, split into separate arguments the same way a tool template is: no shell
+    /// is involved, so a flag carrying a space has to be quoted and nothing else is read.
+    pub extra_args: String,
+    /// The page to open.
+    pub start_url: String,
+}
+
+impl BrowserProfile {
+    /// The page to open: whatever was set, or the blank one.
+    pub fn url(&self) -> &str {
+        match self.start_url.trim() {
+            "" => DEFAULT_START_URL,
+            url => url,
+        }
+    }
+
+    /// The profile directory to use, or `None` to let the managed one be used.
+    pub fn chosen_profile(&self) -> Option<PathBuf> {
+        match self.profile_dir.trim() {
+            "" => None,
+            dir => Some(PathBuf::from(dir)),
+        }
+    }
+}
+
 fn profile_dir(kind: &str) -> PathBuf {
     crate::paths::data_dir().join(format!("browser-{kind}"))
 }
@@ -93,16 +129,54 @@ pub fn chromium_args(profile: &std::path::Path, host: &str, port: u16, spki_pin:
     args
 }
 
+/// The same, with the extra flags from Settings added after the app's own and before the page
+/// to open -- so a flag given here can override one of the defaults, which is the point of
+/// being able to add them, while the address stays last where the browser expects it.
+pub fn chromium_args_with(
+    profile: &std::path::Path,
+    host: &str,
+    port: u16,
+    spki_pin: Option<&str>,
+    url: &str,
+    extra: &str,
+) -> Vec<String> {
+    let mut args = chromium_args(profile, host, port, spki_pin, url);
+    let extra = crate::tooling::tokenize(extra);
+    if extra.is_empty() {
+        return args;
+    }
+    // the address is last: the extra flags go in front of it
+    let url_arg = args.pop().expect("the address is always the last argument");
+    args.extend(extra);
+    args.push(url_arg);
+    args
+}
+
 /// Launch a browser using the proxy at host:port, opening `url`. With `spki_pin` (HTTPS
 /// interception on), a Chromium-family browser trusts the root CA without installing it.
 /// Returns a message for the event log.
-pub fn open(host: &str, port: u16, url: &str, spki_pin: Option<&str>) -> Result<String, String> {
+/// Launch the browser Settings asks for, or whichever one is found when it asks for none.
+///
+/// A browser named in Settings is run as a Chromium-family browser: that is the family whose
+/// flags this app knows how to set, and a custom build is nearly always one of them. When no
+/// binary is named, discovery works as before and a non-Chromium browser is set up through
+/// its own profile file instead.
+pub fn open_with(host: &str, port: u16, url: &str, spki_pin: Option<&str>, settings: &BrowserProfile) -> Result<String, String> {
     let browsers = installed();
-    if let Some((name, bin, _)) = browsers.iter().find(|(_, _, chromium)| *chromium) {
-        let profile = profile_dir("chromium");
+    let chosen = match settings.binary.trim() {
+        "" => None,
+        path => Some(("the browser set in Settings".to_string(), PathBuf::from(path))),
+    };
+    let found = browsers.iter().find(|(_, _, chromium)| *chromium).map(|(n, b, _)| (n.clone(), b.clone()));
+    if let Some((name, bin)) = chosen.or(found) {
+        // a profile named in Settings is kept as it is; otherwise the managed one is used
+        let profile = match settings.chosen_profile() {
+            Some(dir) => dir,
+            None => profile_dir("chromium"),
+        };
         crate::paths::create_private_dir(&profile).map_err(|e| e.to_string())?; // cookies and sessions: owner-only
         Command::new(&bin)
-            .args(chromium_args(&profile, host, port, spki_pin, url))
+            .args(chromium_args_with(&profile, host, port, spki_pin, url, &settings.extra_args))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -150,6 +224,7 @@ pub fn open(host: &str, port: u16, url: &str, spki_pin: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     #[test]
     fn windows_install_locations() {
@@ -206,5 +281,73 @@ mod tests {
         assert_eq!(with.last().unwrap(), "about:blank");
         let without = chromium_args(p, "127.0.0.1", 8080, None, "about:blank");
         assert!(!without.iter().any(|a| a.starts_with("--ignore-certificate-errors")));
+    }
+
+    /// The extra arguments from Settings go in after the app's own and before the address, so
+    /// a flag given there can override one of the defaults and the address stays last.
+    #[test]
+    fn extra_arguments_go_in_before_the_address() {
+        let profile = std::path::Path::new("/tmp/profile");
+        let plain = chromium_args(profile, "127.0.0.1", 8080, None, "http://shop.test/");
+        let with_extra = chromium_args_with(profile, "127.0.0.1", 8080, None, "http://shop.test/", "--window-size=1280,900 --incognito");
+
+        assert_eq!(with_extra.len(), plain.len() + 2, "two flags were added");
+        assert_eq!(with_extra.last().map(String::as_str), Some("http://shop.test/"), "the address is still last");
+        let at = with_extra.iter().position(|a| a == "--window-size=1280,900").expect("the flag is there");
+        assert!(at < with_extra.len() - 1, "and it comes before the address");
+        assert_eq!(with_extra[at + 1], "--incognito", "in the order they were written");
+        // nothing was lost from the app's own flags
+        for arg in &plain {
+            assert!(with_extra.contains(arg), "{arg} survived");
+        }
+
+        // no extra arguments means exactly what it meant before
+        assert_eq!(chromium_args_with(profile, "127.0.0.1", 8080, None, "http://shop.test/", "   "), plain);
+    }
+
+    /// An argument with a space in it is one argument when quoted, and a value that looks like
+    /// shell punctuation stays inside it: the browser is started directly, not through a shell.
+    #[test]
+    fn a_quoted_extra_argument_stays_one_argument() {
+        let profile = std::path::Path::new("/tmp/profile");
+        let args = chromium_args_with(
+            profile,
+            "127.0.0.1",
+            8080,
+            None,
+            "about:blank",
+            r#"--user-agent="Mozilla/5.0 (Test; rv:1)" --host-rules='MAP * 127.0.0.1'"#,
+        );
+        assert!(args.iter().any(|a| a == "--user-agent=Mozilla/5.0 (Test; rv:1)"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--host-rules=MAP * 127.0.0.1"), "{args:?}");
+    }
+
+    /// The pin and the proxy are still set when extra arguments are given, so configuring the
+    /// browser cannot quietly turn interception off.
+    #[test]
+    fn the_proxy_and_the_pin_survive_extra_arguments() {
+        let args = chromium_args_with(std::path::Path::new("/tmp/p"), "10.0.0.2", 9999, Some("abc123"), "about:blank", "--foo");
+        assert!(args.iter().any(|a| a == "--proxy-server=http://10.0.0.2:9999"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--ignore-certificate-errors-spki-list=abc123"), "{args:?}");
+        assert!(args.iter().any(|a| a.starts_with("--user-data-dir=")), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--ignore-certificate-errors"), "never the blanket one");
+    }
+
+    /// What the profile settings resolve to: the page to open, and whether a folder was chosen.
+    #[test]
+    fn the_profile_settings_resolve_matrix() {
+        let cases: [(&str, &str, &str, bool); 5] = [
+            ("nothing set", "", "", false),
+            ("a page set", "http://shop.test/", "", false),
+            ("a page of spaces", "   ", "", false),
+            ("a folder set", "", "/tmp/keep", true),
+            ("both set", "http://shop.test/", "/tmp/keep", true),
+        ];
+        assert_table!(cases, |idx, (what, url, dir, folder)| {
+            let p = BrowserProfile { start_url: url.into(), profile_dir: dir.into(), ..Default::default() };
+            let want_url = if url.trim().is_empty() { DEFAULT_START_URL } else { url };
+            assert_eq!(p.url(), want_url, "case #{idx} ({what}): the page");
+            assert_eq!(p.chosen_profile().is_some(), folder, "case #{idx} ({what}): the folder");
+        });
     }
 }

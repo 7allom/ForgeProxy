@@ -151,6 +151,7 @@ pub enum SettingsPage {
     NetworkConnections,
     NetworkTls,
     Collaborator,
+    ExternalTools,
     Display,
     Hotkeys,
 }
@@ -217,6 +218,23 @@ pub struct UserSettings {
     /// Shortcuts the user has changed, as action id -> phrase ("Ctrl+Shift+R"). Anything in
     /// here that this build does not recognise is passed over, and the default stands.
     pub hotkeys: std::collections::BTreeMap<String, String>,
+    /// Settings > Proxy > Storage and limits: how much traffic is kept, and what gives way
+    /// when that is reached.
+    pub max_entries: usize,
+    /// How much of one body is read and kept, in KiB.
+    pub max_body_kib: usize,
+    /// How much of a message an editor lays out before showing it cut short, in KiB.
+    pub display_limit_kib: usize,
+    /// Hold the capture when the store is full, instead of dropping the oldest entries.
+    pub pause_when_full: bool,
+    /// Settings > External tools: programs offered on the "Send to" menus.
+    pub external_tools: Vec<crate::tooling::ExternalTool>,
+    /// Settings > Proxy > Browser: how the proxy browser is launched. Empty fields mean
+    /// "work it out", which is what the app did before any of this was configurable.
+    pub browser_binary: String,
+    pub browser_profile_dir: String,
+    pub browser_extra_args: String,
+    pub browser_start_url: String,
 }
 
 impl Default for UserSettings {
@@ -243,6 +261,15 @@ impl Default for UserSettings {
             default_message_view: crate::viewer::MessageViewMode::Raw,
             ca_export_dir: String::new(),
             hotkeys: std::collections::BTreeMap::new(),
+            max_entries: crate::rules::MAX_RECORDED_REQUESTS,
+            max_body_kib: crate::rules::DEFAULT_BODY_LIMIT_KIB,
+            display_limit_kib: crate::rules::DEFAULT_DISPLAY_LIMIT_KIB,
+            pause_when_full: false,
+            external_tools: Vec::new(),
+            browser_binary: String::new(),
+            browser_profile_dir: String::new(),
+            browser_extra_args: String::new(),
+            browser_start_url: crate::browser::DEFAULT_START_URL.to_string(),
         }
     }
 }
@@ -267,6 +294,12 @@ impl UserSettings {
         self.sequencer_threads = self.sequencer_threads.clamp(1, 20);
         let c = Self::COLLAB_POLL_RANGE;
         self.collab_poll_secs = self.collab_poll_secs.clamp(*c.start(), *c.end());
+        let e = crate::rules::ENTRY_LIMIT_RANGE;
+        self.max_entries = self.max_entries.clamp(*e.start(), *e.end());
+        let b = crate::rules::BODY_LIMIT_KIB_RANGE;
+        self.max_body_kib = self.max_body_kib.clamp(*b.start(), *b.end());
+        let d = crate::rules::DISPLAY_LIMIT_KIB_RANGE;
+        self.display_limit_kib = self.display_limit_kib.clamp(*d.start(), *d.end());
         self
     }
 
@@ -347,6 +380,10 @@ pub struct App {
     /// Logger's capture switch: while it is set, no tool records what it sends. Shared with
     /// the proxy's threads and with every background sender, so one toggle covers them all.
     pub capture_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// How many entries the store keeps, shared with every sender already running.
+    pub entry_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// Hold the capture once the store is full rather than dropping the oldest.
+    pub pause_when_full: Arc<std::sync::atomic::AtomicBool>,
     pub tx: Sender<Job>,
     pub rx: Receiver<Job>,
 
@@ -508,6 +545,8 @@ pub struct App {
     pub settings_page: SettingsPage,
     /// Card the Settings window scrolls to once (deep links from the command palette).
     pub settings_focus: Option<&'static str>,
+    /// Which registered program the External tools page has open for editing.
+    pub ext_tool_sel: Option<usize>,
     /// The shortcut editor is listening for the keys to give this action. While it is, the
     /// dispatch stands down: otherwise the keys being offered are swallowed by whatever they
     /// are currently bound to, and a shortcut already in use could never be moved.
@@ -611,6 +650,8 @@ impl App {
         let history: crate::http::History = Arc::new(Mutex::new(Vec::new()));
         let next_id = Arc::new(Mutex::new(0usize));
         let capture_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entry_limit = Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_entries));
+        let pause_when_full = Arc::new(std::sync::atomic::AtomicBool::new(settings.pause_when_full));
         let events: crate::proxy::Events = Arc::new(Mutex::new(Default::default()));
         let start_proxy = shot_path.is_none();
         let mut app = Self {
@@ -623,6 +664,8 @@ impl App {
             history: history.clone(),
             next_id: next_id.clone(),
             capture_paused: capture_paused.clone(),
+            entry_limit: entry_limit.clone(),
+            pause_when_full: pause_when_full.clone(),
             tx, rx,
             project_dialog: None,
             project_name: String::new(),
@@ -638,6 +681,8 @@ impl App {
                 history: history.clone(),
                 next_id: next_id.clone(),
                 capture_paused: capture_paused.clone(),
+                entry_limit: entry_limit.clone(),
+                pause_when_full: pause_when_full.clone(),
                 intercept: Arc::new(std::sync::atomic::AtomicBool::new(rules::INTERCEPT_AT_STARTUP)),
                 held: Arc::new(Mutex::new(Vec::new())),
                 rules: Arc::new(Mutex::new(rewrite::defaults())),
@@ -740,6 +785,7 @@ impl App {
             show_settings: false,
             settings_page: SettingsPage::Proxy,
             settings_focus: None,
+            ext_tool_sel: None,
             hotkey_capturing: None,
             rep_unpack: true,
             intercept_default: rules::INTERCEPT_AT_STARTUP,
@@ -909,7 +955,8 @@ impl App {
             history: self.history.clone(),
             next_id: self.next_id.clone(),
             paused: self.capture_paused.clone(),
-            limit: crate::rules::MAX_RECORDED_REQUESTS,
+            limit: self.entry_limit.clone(),
+            pause_when_full: self.pause_when_full.clone(),
         }
     }
 
@@ -922,6 +969,7 @@ impl App {
                 upstream: s.upstream_proxy.clone(),
                 verify_tls: s.protocol.verify_upstream_tls,
             },
+            max_body: (self.settings.max_body_kib as u64).saturating_mul(1024),
         }
     }
 
@@ -1200,6 +1248,9 @@ impl eframe::App for App {
         }
         let eff = self.eff();
         self.proxy.read_timeout_secs.store(eff.proxy_read_timeout_secs, std::sync::atomic::Ordering::SeqCst);
+        // the storage budget reaches the senders already running through the same shared values
+        self.entry_limit.store(self.settings.max_entries.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.pause_when_full.store(self.settings.pause_when_full, std::sync::atomic::Ordering::Relaxed);
         self.proxy.verify_upstream_tls.store(eff.protocol.verify_upstream_tls, std::sync::atomic::Ordering::SeqCst);
         {
             let mut up = self.proxy.upstream_proxy.lock().unwrap_or_else(|e| e.into_inner());
@@ -1558,6 +1609,61 @@ mod settings_tests {
         assert_eq!(older.theme, Look::Light, "what it did say");
         assert_eq!(older.collab_poll_secs, DEFAULT_COLLAB_POLL_SECS, "and defaults for what it did not");
         assert!(older.hotkeys.is_empty() && older.ca_export_dir.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The storage budget, the registry and the browser profile survive a write and a read,
+    /// and a hand-written file with impossible figures in it is brought into range.
+    #[test]
+    fn the_workstation_settings_round_trip_and_are_clamped() {
+        let dir = temp_dir("workstation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = UserSettings::default();
+        s.max_entries = 120_000;
+        s.max_body_kib = 2048;
+        s.display_limit_kib = 512;
+        s.pause_when_full = true;
+        s.browser_binary = "/opt/browser/run".into();
+        s.browser_profile_dir = "/home/a/profile".into();
+        s.browser_extra_args = "--window-size=1280,900".into();
+        s.browser_start_url = "http://shop.test/".into();
+        s.external_tools = vec![crate::tooling::ExternalTool {
+            name: "Inspect in script".into(),
+            command: "python3".into(),
+            args: "-u check.py {url} {req_file}".into(),
+            stdin_mode: crate::tooling::ToolStdinMode::JsonEnvelope,
+        }];
+        s.save(&dir).unwrap();
+        assert_eq!(UserSettings::load(&dir).unwrap(), s, "everything came back as written");
+
+        // figures nobody wants, from a file edited by hand
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"max_entries": 1, "max_body_kib": 99999999, "display_limit_kib": 1}"#,
+        )
+        .unwrap();
+        let fixed = UserSettings::load(&dir).expect("it still loads");
+        assert_eq!(fixed.max_entries, *crate::rules::ENTRY_LIMIT_RANGE.start());
+        assert_eq!(fixed.max_body_kib, *crate::rules::BODY_LIMIT_KIB_RANGE.end());
+        assert_eq!(fixed.display_limit_kib, *crate::rules::DISPLAY_LIMIT_KIB_RANGE.start());
+
+        // a file from before any of this: the defaults, and no tools offered
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"dark"}"#).unwrap();
+        let older = UserSettings::load(&dir).unwrap();
+        assert_eq!(older.max_entries, crate::rules::MAX_RECORDED_REQUESTS);
+        assert_eq!(older.max_body_kib, crate::rules::DEFAULT_BODY_LIMIT_KIB);
+        assert_eq!(older.display_limit_kib, crate::rules::DEFAULT_DISPLAY_LIMIT_KIB);
+        assert!(!older.pause_when_full, "the oldest entries give way, as they always did");
+        assert!(older.external_tools.is_empty(), "no program is offered that was not set up");
+        assert!(older.browser_binary.is_empty() && older.browser_profile_dir.is_empty());
+        assert_eq!(older.browser_start_url, crate::browser::DEFAULT_START_URL);
+
+        // a tool entry missing its fields is read as an unfinished one, not a failure
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"external_tools":[{"name":"half"}]}"#).unwrap();
+        let partial = UserSettings::load(&dir).expect("a partial tool still loads");
+        assert_eq!(partial.external_tools.len(), 1);
+        assert!(!partial.external_tools[0].is_runnable(), "and it is not offered on a menu");
+        assert_eq!(partial.external_tools[0].stdin_mode, crate::tooling::ToolStdinMode::None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

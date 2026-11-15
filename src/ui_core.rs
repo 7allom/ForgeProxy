@@ -14,6 +14,7 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
     let p = app.p();
     crate::editor::set_font_size(ctx, app.settings.editor_font_size);
     crate::editor::set_default_view_mode(ctx, app.settings.default_message_view);
+    crate::editor::set_display_limit(ctx, app.settings.display_limit_kib.saturating_mul(1024));
     // another tab or sub-tab: the Auto-Decoder starts empty there
     crate::editor::decoder_context(ctx, "view", format!("{}/{}/{}", app.tab.label(), app.proxy_sub, app.target_sub));
     top_menu(app, ctx, &p);
