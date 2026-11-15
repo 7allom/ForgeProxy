@@ -663,7 +663,24 @@ pub struct App {
 pub type AppState = App;
 
 impl App {
+    /// The app with nothing asked for on the command line. `main` goes through
+    /// [`App::new_with`], so outside the tests that build an app of their own nothing calls
+    /// this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(cc: &eframe::CreationContext<'_>, shot_path: Option<String>, start_tab: Option<Tab>, light: bool) -> Self {
+        Self::new_with(cc, shot_path, start_tab, light, &crate::cli::Startup::default())
+    }
+
+    /// As [`App::new`], with what the command line asked for at startup applied in time to
+    /// matter: the listener address before the listener goes up, and the project before
+    /// anything is drawn.
+    pub fn new_with(
+        cc: &eframe::CreationContext<'_>,
+        shot_path: Option<String>,
+        start_tab: Option<Tab>,
+        light: bool,
+        startup: &crate::cli::Startup,
+    ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         // settings.json (not for unit tests or screenshot runs: those mustn't depend on, or
         // write to, the real config directory); --light overrides the saved theme
@@ -876,10 +893,37 @@ impl App {
         app.load_ca();
         // the persisted former-session settings become the live values before the listener starts
         app.apply_user_settings();
+        // and the command line has the last word over them, also before it starts
+        app.apply_startup(startup);
         if start_proxy {
             crate::ui_proxy::start_listener(&mut app);
         }
         app
+    }
+
+    /// Apply what the command line asked for, on top of the saved settings: the address to
+    /// listen on, the address a pipeline would run on, and the project to open. A project that
+    /// cannot be read is said so in the Event log and the app opens without it, rather than
+    /// refusing to open at all.
+    fn apply_startup(&mut self, s: &crate::cli::Startup) {
+        if let Some(host) = s.bind.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            self.proxy_host = host.to_string();
+        }
+        if let Some(port) = s.port {
+            self.proxy_port = port.to_string();
+        }
+        if let Some(url) = s.target.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            self.automation_target = url.to_string();
+        }
+        if let Some(path) = &s.project {
+            match crate::project::read(path) {
+                Ok(f) => {
+                    crate::project::apply_all(self, f);
+                    self.project_path = Some(path.clone());
+                }
+                Err(e) => crate::proxy::log_error(&self.proxy.events, e),
+            }
+        }
     }
 
     /// Resolve the effective user settings for this project: the global `settings`, with any
@@ -1547,6 +1591,85 @@ mod close_tests {
         app.comparer_sel_a = Some(99);
         crate::comparer::remove_selected(&mut app);
         assert_eq!(app.comparer_sel_a, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::App;
+    use crate::cli::Startup;
+    use eframe::egui;
+
+    /// An app built as a run started from the command line would build it, with the proxy
+    /// listener kept off (a screenshot path does that) so the test binds nothing.
+    fn launched(startup: &Startup) -> App {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        App::new_with(&cc, Some("/dev/null".into()), None, false, startup)
+    }
+
+    /// `--bind` and `--port` reach the live listener address, and `--target` the Automation
+    /// tab's target bar, before anything is drawn or started.
+    #[test]
+    fn the_command_line_has_the_last_word_over_the_saved_settings() {
+        let plain = launched(&Startup::default());
+        let (saved_host, saved_port) = (plain.proxy_host.clone(), plain.proxy_port.clone());
+        assert!(plain.automation_target.is_empty(), "and nothing is filled in that was not asked for");
+
+        let app = launched(&Startup {
+            bind: Some("0.0.0.0".into()),
+            port: Some(8081),
+            target: Some("  http://shop.test/account  ".into()),
+            project: None,
+        });
+        assert_eq!(app.proxy_host, "0.0.0.0");
+        assert_eq!(app.proxy_port, "8081");
+        assert_eq!(app.automation_target, "http://shop.test/account", "trimmed, as a typed one would be");
+        assert_ne!((saved_host.as_str(), saved_port.as_str()), ("0.0.0.0", "8081"), "which is not what was saved");
+
+        // an address given as nothing but spaces is not an address, and the saved one stands
+        let blank = launched(&Startup { bind: Some("   ".into()), ..Default::default() });
+        assert_eq!(blank.proxy_host, saved_host);
+    }
+
+    /// A project named on the command line is open before the window is, and one that cannot
+    /// be read leaves the app open without it rather than refusing to start.
+    #[test]
+    fn a_project_named_on_the_command_line_is_open_from_the_start() {
+        let dir = std::env::temp_dir().join(format!("forge-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a place to work");
+        let path = dir.join("triage.forge").display().to_string();
+        let mut file = crate::project::ProjectFile::fresh("Saved triage");
+        file.imported_findings = vec![crate::scan::Finding {
+            type_index: crate::tooling::IMPORTED_TYPE_INDEX,
+            name: "Folder contents listed".into(),
+            severity: crate::scan::Severity::Low,
+            confidence: crate::scan::Confidence::Firm,
+            host: "shop.test".into(),
+            path: "/files/".into(),
+            detail: String::new(),
+            remediation: String::new(),
+            request: String::new(),
+            response: String::new(),
+        }];
+        crate::project::write(&file, &path).expect("the project");
+
+        let app = launched(&Startup { project: Some(path.clone()), ..Default::default() });
+        assert_eq!(app.project_name, "Saved triage");
+        assert_eq!(app.project_path.as_deref(), Some(path.as_str()), "and it saves back over itself");
+        let names: Vec<&str> = app.findings.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Folder contents listed"], "with what it was holding");
+
+        // a path that is not a project: the app opens, the Event log says why it is empty
+        let not_a_project = dir.join("notes.txt").display().to_string();
+        std::fs::write(&not_a_project, b"nothing like a project").expect("a file");
+        let app = launched(&Startup { project: Some(not_a_project), ..Default::default() });
+        assert_eq!(app.project_path, None, "nothing was opened");
+        let log = app.proxy.events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(log.iter().any(|e| e.message.contains("Not a project file")), "the Event log says why: {log:?}");
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

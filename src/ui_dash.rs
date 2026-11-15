@@ -266,10 +266,10 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         }
     }
     ui.horizontal(|ui| {
-        for fmt in ["HTML", "XML"] {
-            if theme::plain_button(ui, p, &format!("Export report ({fmt})"), !list.is_empty()).clicked() {
+        for (label, fmt) in [("HTML", crate::export::ReportFormat::Html), ("XML", crate::export::ReportFormat::Xml)] {
+            if theme::plain_button(ui, p, &format!("Export report ({label})"), !list.is_empty()).clicked() {
                 let findings: Vec<Finding> = list.iter().map(|x| x.2.clone()).collect();
-                app.report_msg = export_report(&findings, &fmt.to_ascii_lowercase());
+                app.report_msg = export_report(&findings, fmt);
             }
         }
         if !app.report_msg.is_empty() {
@@ -370,34 +370,13 @@ pub fn windows(app: &mut App, ctx: &egui::Context, p: &Palette) {
     }
 }
 
-fn export_report(findings: &[Finding], fmt: &str) -> String {
-    let path = crate::paths::documents_dir().join(format!("forgeproxy-report.{fmt}")).display().to_string();
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    let body = if fmt == "xml" {
-        let mut s = String::from("<?xml version=\"1.0\"?>\n<issues>\n");
-        for f in findings {
-            s.push_str(&format!(
-                "  <issue>\n    <type>{}</type>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n  </issue>\n",
-                f.type_index, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path)));
-        }
-        s.push_str("</issues>\n");
-        s
-    } else {
-        let mut s = String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>Scan report</title></head><body><h1>Scan report</h1>\n");
-        for f in findings {
-            let (r, g, b) = f.severity.rgb();
-            s.push_str(&format!(
-                "<h2 style=\"color:#{r:02x}{g:02x}{b:02x}\">{} — {}</h2><p><b>Host:</b> {}{}<br><b>Confidence:</b> {}</p><p>{}</p>\n",
-                esc(&f.name), f.severity.label(), esc(&f.host), esc(&f.path), f.confidence.label(), esc(&f.detail)));
-        }
-        s.push_str("</body></html>\n");
-        s
-    };
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(&path, body) {
-        Ok(_) => format!("Saved {} issues to {path}", findings.len()),
+/// The Dashboard's "Export report" buttons: write the issues on screen to the usual place,
+/// and say where they went. The document itself is [`crate::export::report`], which is what
+/// the command line's `--report` writes too.
+fn export_report(findings: &[Finding], fmt: crate::export::ReportFormat) -> String {
+    let path = crate::paths::documents_dir().join(format!("forgeproxy-report.{}", fmt.extension()));
+    match crate::export::write_report(findings, &path) {
+        Ok(_) => format!("Saved {} issues to {}", findings.len(), path.display()),
         Err(e) => format!("Couldn't save the report: {e}"),
     }
 }

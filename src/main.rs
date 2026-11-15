@@ -4,6 +4,7 @@
 
 mod actions;
 mod autodecode;
+mod cli;
 mod codec;
 mod collab;
 mod comparer;
@@ -55,11 +56,31 @@ use eframe::egui;
 use state::{App, Tab};
 
 fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let shot_path = arg("--screenshot");
-    let start_tab = arg("--tab").and_then(|n| Tab::ALL.into_iter().find(|t| t.label().eq_ignore_ascii_case(&n)));
-    let light = args.iter().any(|a| a == "--light");
+    let opts = match cli::parse(std::env::args().skip(1)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("Run with --help for the flags there are.");
+            std::process::exit(cli::EXIT_FAILED);
+        }
+    };
+    // settings.json is found through this, by the app and by an unattended run alike, so it is
+    // set before anything reads it
+    if let Some(dir) = &opts.config {
+        std::env::set_var("FORGEPROXY_CONFIG_DIR", dir);
+    }
+    // whatever needs no window is done here, and the process ends with what it came to
+    if let Some(code) = cli::run(&opts, &mut std::io::stdout(), &mut std::io::stderr()) {
+        std::process::exit(code);
+    }
+
+    let shot_path = opts.screenshot.clone();
+    let start_tab = opts
+        .tab
+        .as_deref()
+        .and_then(|n| Tab::ALL.into_iter().find(|t| t.label().eq_ignore_ascii_case(n)));
+    let light = opts.light;
+    let startup = opts.startup();
     if let Some(p) = &shot_path {
         if let Some(parent) = std::path::Path::new(p).parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -80,6 +101,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ForgeProxy",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, shot_path, start_tab, light)))),
+        Box::new(move |cc| Ok(Box::new(App::new_with(cc, shot_path, start_tab, light, &startup)))),
     )
 }

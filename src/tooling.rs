@@ -1020,6 +1020,92 @@ pub fn run_plan_blocking(
     report(events, &plan.display_name(), outcome_status, last_code);
 }
 
+/// What a pipeline run with no window behind it came to.
+#[derive(Clone, Debug)]
+pub struct HeadlessOutcome {
+    pub status: RunStatus,
+    /// The exit status of the last step that had one.
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u128,
+    /// Findings the steps reported, as parsed, before consolidation.
+    pub findings: Vec<Finding>,
+}
+
+/// How often an unattended run looks for more output to pass on to the terminal. Short enough
+/// that a step's output reads as it arrives, long enough not to spin.
+const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Run `plan` to completion with no drawn app behind it, writing the account of it to `out`
+/// as it arrives.
+///
+/// The engine is the same one the Automation tab uses -- [`run_plan_blocking`], with its
+/// placeholders, timeouts, failure policies and owner-only temporary files -- run on a worker
+/// here so this thread can pass the output on while it is still being produced. The findings
+/// the steps reported come back rather than being filed: there is no issue store out here, and
+/// the caller knows where they are to go.
+///
+/// A run record keeps at most [`MAX_STREAM_KEPT`] of each stream, so that is also as much of
+/// each as reaches the terminal; the whole of a step's output still goes to the findings
+/// parser and on to the next step.
+pub fn run_plan_streaming(
+    plan: &AutomationPlan,
+    tools: &[ExternalTool],
+    ctx: &ToolContext,
+    out: &mut dyn std::io::Write,
+) -> HeadlessOutcome {
+    let runs = RunLog::new(None);
+    let events: crate::proxy::Events = Default::default();
+    let id = runs.begin(&plan.display_name(), RunOrigin::Pipeline(plan.name.trim().to_string()), ctx);
+    let worker = {
+        let (plan, tools, ctx, runs, events) =
+            (plan.clone(), tools.to_vec(), ctx.clone(), runs.clone(), events.clone());
+        std::thread::spawn(move || run_plan_blocking(&plan, &tools, &ctx, &runs, id, &events))
+    };
+
+    // what has already been passed on, so each look only writes what is new
+    let (mut sent_out, mut sent_err) = (0usize, 0usize);
+    let mut pass_on = |run: &ToolRun, out: &mut dyn std::io::Write| {
+        // a stream that was truncated is shorter than what went before it; start again from
+        // the end of what it holds now rather than writing it a second time
+        for (text, sent) in [(&run.stdout, &mut sent_out), (&run.stderr, &mut sent_err)] {
+            if text.len() < *sent {
+                *sent = text.len();
+            }
+            if text.len() > *sent {
+                let _ = out.write_all(text[*sent..].as_bytes());
+                let _ = out.flush();
+                *sent = text.len();
+            }
+        }
+    };
+    loop {
+        let Some(run) = runs.get(id) else { break };
+        pass_on(&run, out);
+        if run.status.finished() {
+            break;
+        }
+        std::thread::sleep(STREAM_POLL);
+    }
+    // the worker finishes the record before it returns, so joining it settles any last write
+    let _ = worker.join();
+    let run = runs.get(id);
+    if let Some(run) = &run {
+        pass_on(run, out);
+    }
+    let findings = runs.take_findings().into_iter().flat_map(|(_, f)| f).collect();
+    match run {
+        Some(run) => HeadlessOutcome {
+            status: run.status,
+            exit_code: run.exit_code,
+            elapsed_ms: run.elapsed_ms,
+            findings,
+        },
+        // the record cannot go missing (nothing clears it here), but a lost run is a failed
+        // one rather than a silent success
+        None => HeadlessOutcome { status: RunStatus::Failed, exit_code: None, elapsed_ms: 0, findings },
+    }
+}
+
 /// Say in the event log how a run went, as the "Send to" menus always did.
 fn report(events: &crate::proxy::Events, label: &str, status: RunStatus, exit_code: Option<i32>) {
     let note = match (status, exit_code) {

@@ -116,12 +116,18 @@ pub fn snapshot(app: &App) -> ProjectFile {
 }
 
 pub fn save(app: &App, path: &str) -> Result<(), String> {
+    write(&snapshot(app), path)
+}
+
+/// Write a project file straight out, without an app behind it: what [`save`] does once the
+/// snapshot is taken, and what an unattended run does to the project it was given.
+pub fn write(file: &ProjectFile, path: &str) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
-    let json = serde_json::to_string_pretty(&snapshot(app)).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     // projects hold captured traffic (cookies, tokens): owner-only
     crate::paths::write_private(std::path::Path::new(path), json.as_bytes()).map_err(|e| e.to_string())
 }
@@ -132,6 +138,21 @@ pub fn read(path: &str) -> Result<ProjectFile, String> {
 }
 
 impl ProjectFile {
+    /// A project with nothing in it yet, as the app writes a new one: the current version, and
+    /// the lists that have a default of their own set to it rather than left empty.
+    ///
+    /// For a `--project` path that is not there when an unattended run starts, so what the run
+    /// reports has somewhere to be kept.
+    pub fn fresh(name: &str) -> Self {
+        ProjectFile {
+            version: 1,
+            name: name.to_string(),
+            org_collections: crate::organizer::default_collections(),
+            skip_extensions: crate::rules::default_skip_extensions(),
+            ..Default::default()
+        }
+    }
+
     /// The file's scope, from `target_scope` or, in files from older versions, the
     /// separate scope fields.
     pub fn scope(&self) -> TargetScope {

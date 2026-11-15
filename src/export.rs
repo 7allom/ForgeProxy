@@ -1,8 +1,11 @@
-//! Traffic export and clipboard interop: a recorded request as a `curl` command, and history
-//! as HAR 1.2 or CSV. These are pure serializers over [`HttpEntry`]; the UI picks files (via
-//! `rfd`) and copies text to the clipboard.
+//! Traffic export and clipboard interop: a recorded request as a `curl` command, history as
+//! HAR 1.2 or CSV, and an issue report as HTML or XML. These are pure serializers over
+//! [`HttpEntry`] and [`crate::scan::Finding`]; the UI picks files (via `rfd`) and copies text
+//! to the clipboard, and the command line writes them straight to a path.
 
 use crate::http::HttpEntry;
+use crate::scan::Finding;
+use std::path::Path;
 
 /// Headers a `curl` command (or HAR url) sets for itself, so repeating them is redundant or
 /// wrong. `host` and `content-length` are already dropped by `parse_raw_request`.
@@ -206,6 +209,159 @@ pub fn to_csv(entries: &[HttpEntry]) -> String {
         out.push_str("\r\n");
     }
     out
+}
+
+// ---- issue reports ------------------------------------------------------
+/// Which report to write. The one formatter serves the Dashboard's "Export report" buttons
+/// and the command line's `--report`, so a report written either way reads the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportFormat {
+    Html,
+    Xml,
+}
+
+impl ReportFormat {
+    /// The format a path asks for: `.xml` writes XML, and anything else -- `.html`, another
+    /// extension, or none at all -- writes HTML.
+    pub fn of_path(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(e) if e.eq_ignore_ascii_case("xml") => ReportFormat::Xml,
+            _ => ReportFormat::Html,
+        }
+    }
+
+    /// The extension a report of this format is written with by default.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ReportFormat::Html => "html",
+            ReportFormat::Xml => "xml",
+        }
+    }
+}
+
+/// Text that cannot be mistaken for markup, for either report.
+fn markup_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// `findings` as one report document.
+pub fn report(findings: &[Finding], fmt: ReportFormat) -> String {
+    let esc = markup_escape;
+    match fmt {
+        ReportFormat::Xml => {
+            let mut s = String::from("<?xml version=\"1.0\"?>\n<issues>\n");
+            for f in findings {
+                s.push_str(&format!(
+                    "  <issue>\n    <type>{}</type>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n  </issue>\n",
+                    f.type_index, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path)));
+            }
+            s.push_str("</issues>\n");
+            s
+        }
+        ReportFormat::Html => {
+            let mut s = String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>Scan report</title></head><body><h1>Scan report</h1>\n");
+            for f in findings {
+                let (r, g, b) = f.severity.rgb();
+                s.push_str(&format!(
+                    "<h2 style=\"color:#{r:02x}{g:02x}{b:02x}\">{} — {}</h2><p><b>Host:</b> {}{}<br><b>Confidence:</b> {}</p><p>{}</p>\n",
+                    esc(&f.name), f.severity.label(), esc(&f.host), esc(&f.path), f.confidence.label(), esc(&f.detail)));
+            }
+            s.push_str("</body></html>\n");
+            s
+        }
+    }
+}
+
+/// Write `findings` to `path` in whichever format its extension asks for, making the folder
+/// above it if it is not there yet. Returns the format written, for the line that says so.
+pub fn write_report(findings: &[Finding], path: &Path) -> std::io::Result<ReportFormat> {
+    let fmt = ReportFormat::of_path(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, report(findings, fmt))?;
+    Ok(fmt)
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use crate::scan::{Confidence, Severity};
+    use crate::test_utils::assert_table;
+
+    fn finding(name: &str, host: &str, path: &str, detail: &str) -> Finding {
+        Finding {
+            type_index: 42,
+            name: name.into(),
+            severity: Severity::Medium,
+            confidence: Confidence::Certain,
+            host: host.into(),
+            path: path.into(),
+            detail: detail.into(),
+            remediation: String::new(),
+            request: String::new(),
+            response: String::new(),
+        }
+    }
+
+    /// The path decides the format: only `.xml` asks for XML, whatever its capitals.
+    #[test]
+    fn the_path_says_which_report_to_write_matrix() {
+        let cases: [(&str, ReportFormat); 7] = [
+            ("/tmp/r.xml", ReportFormat::Xml),
+            ("/tmp/r.XML", ReportFormat::Xml),
+            ("/tmp/r.html", ReportFormat::Html),
+            ("/tmp/r.htm", ReportFormat::Html),
+            ("/tmp/r.txt", ReportFormat::Html),
+            ("/tmp/report", ReportFormat::Html),
+            ("/tmp/a.xml/report", ReportFormat::Html),
+        ];
+        assert_table!(cases, |idx, (path, want)| {
+            assert_eq!(ReportFormat::of_path(Path::new(path)), want, "case #{idx}: {path}");
+        });
+        assert_eq!(ReportFormat::Xml.extension(), "xml");
+        assert_eq!(ReportFormat::Html.extension(), "html");
+    }
+
+    /// Both reports carry every finding, and neither lets text through that would be read as
+    /// markup.
+    #[test]
+    fn a_report_holds_every_finding_with_nothing_read_as_markup() {
+        let findings = [
+            finding("Transport protection not enforced", "shop.test", "/account", "The setting was left off."),
+            finding("Reflected <input> echoed", "shop.test", "/search?q=a&b=1", "A & B <c>"),
+        ];
+        let html = report(&findings, ReportFormat::Html);
+        assert!(html.starts_with("<!doctype html>") && html.ends_with("</html>\n"), "{html}");
+        let xml = report(&findings, ReportFormat::Xml);
+        assert!(xml.starts_with("<?xml version=\"1.0\"?>"), "{xml}");
+        assert_eq!(xml.matches("<issue>").count(), 2, "one entry each: {xml}");
+        for doc in [&html, &xml] {
+            assert!(doc.contains("Transport protection not enforced"), "{doc}");
+            assert!(doc.contains("Reflected &lt;input&gt; echoed"), "the angle brackets are text: {doc}");
+            assert!(!doc.contains("<input>"), "and reach nothing as markup: {doc}");
+            assert!(doc.contains("/search?q=a&amp;b=1"), "the ampersand too: {doc}");
+        }
+        assert!(xml.contains("<severity>Medium</severity>") && xml.contains("<type>42</type>"), "{xml}");
+        // nothing to report is still a well-formed document
+        assert!(report(&[], ReportFormat::Xml).contains("<issues>"), "an empty XML report");
+        assert!(report(&[], ReportFormat::Html).contains("<h1>Scan report</h1>"), "an empty HTML report");
+    }
+
+    /// Writing one makes the folder above it, and writes exactly what the formatter produced.
+    #[test]
+    fn writing_a_report_makes_the_folder_it_goes_in() {
+        let dir = std::env::temp_dir().join(format!("forge-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let findings = [finding("Folder contents listed", "shop.test", "/files/", "")];
+        let path = dir.join("nested").join("deeper").join("report.xml");
+        assert_eq!(write_report(&findings, &path).expect("written"), ReportFormat::Xml);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), report(&findings, ReportFormat::Xml));
+        // and the same path again overwrites rather than failing
+        assert!(write_report(&[], &path).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), report(&[], ReportFormat::Xml));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
