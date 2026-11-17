@@ -56,7 +56,7 @@ pub fn default_commands() -> Vec<PaletteCommand> {
         go("Go to Proxy > Match and replace", None, |a| { a.tab = Tab::Proxy; a.proxy_sub = 2; }),
         go("Go to Intruder", Some("Ctrl+Shift+I"), |a| a.tab = Tab::Intruder),
         go("Go to Repeater", Some("Ctrl+Shift+R"), |a| a.tab = Tab::Repeater),
-        go("Go to Collaborator", None, |a| a.tab = Tab::Collaborator),
+        go("Go to Interactor", None, |a| a.tab = Tab::Interactor),
         go("Go to Sequencer", None, |a| a.tab = Tab::Sequencer),
         go("Go to Decoder", None, |a| { a.tab = Tab::Decoder; a.dec_view = 0; }),
         go("Go to Decoder > JWT Inspector", None, |a| { a.tab = Tab::Decoder; a.dec_view = 1; }),

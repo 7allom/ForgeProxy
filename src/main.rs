@@ -6,7 +6,7 @@ mod actions;
 mod autodecode;
 mod cli;
 mod codec;
-mod collab;
+mod interactor;
 mod comparer;
 mod decoder_ops;
 mod editor;

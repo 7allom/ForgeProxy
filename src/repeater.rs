@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn older_projects_open_their_one_request_as_tab_1() {
         let old: crate::project::ProjectFile = serde_json::from_str(r#"{"version":1,"name":"o","scope_include":[],"scope_exclude":[],"scope_advanced":false,"match_replace":[],"history":[],"tasks":[],"organizer":[],
-            "repeater_url":"https://old.test/","repeater_request":"PUT /old HTTP/1.1\nHost: old.test\n\n","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#).unwrap();
+            "repeater_url":"https://old.test/","repeater_request":"PUT /old HTTP/1.1\nHost: old.test\n\n","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}"#).unwrap();
         let mut app = app();
         app.add_blank_repeater_tab();
         crate::project::apply_all(&mut app, old);

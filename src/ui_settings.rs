@@ -58,9 +58,9 @@ const PAGES: &[PageInfo] = &[
     PageInfo { page: SettingsPage::Sequencer, group: Some("Tools"), name: "Sequencer", cards: &[
         card("Live capture", "How many requests live capture sends at once.", Home::User),
     ]},
-    PageInfo { page: SettingsPage::Collaborator, group: Some("Tools"), name: "Collaborator", cards: &[
+    PageInfo { page: SettingsPage::Interactor, group: Some("Tools"), name: "Interactor", cards: &[
         card("Default relay server", "The relay a new project starts on. A project that names its own relay keeps it.", Home::User),
-        card("Polling", "How often the Collaborator tab asks its relay what has come in, while its timer is on.", Home::User),
+        card("Polling", "How often the Interactor tab asks its relay what has come in, while its timer is on.", Home::User),
     ]},
     PageInfo { page: SettingsPage::ExternalTools, group: Some("Tools"), name: "External tools", cards: &[
         card("Registered programs", "Programs offered on the \"Send to\" menus, and the pipelines built from them. Each one is run directly with its arguments; no shell is involved. The Automation tab is where they are set up and run.", Home::User),
@@ -450,36 +450,36 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
         (SettingsPage::Proxy, "Storage and limits") => storage_limits(app, ui, p),
         (SettingsPage::Proxy, "Browser") => browser_profile(app, ui, p),
         (SettingsPage::ExternalTools, _) => external_tools(app, ui, p),
-        (SettingsPage::Collaborator, "Default relay server") => {
+        (SettingsPage::Interactor, "Default relay server") => {
             ui.horizontal(|ui| {
                 ui.label("Relay:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut app.settings.collab_default_server)
+                    egui::TextEdit::singleline(&mut app.settings.interactor_default_server)
                         .desired_width(240.0)
                         .hint_text("relay.example.com"),
                 );
-                if theme::plain_button(ui, p, "Clear", !app.settings.collab_default_server.is_empty()).clicked() {
-                    app.settings.collab_default_server.clear();
+                if theme::plain_button(ui, p, "Clear", !app.settings.interactor_default_server.is_empty()).clicked() {
+                    app.settings.interactor_default_server.clear();
                 }
             });
             ui.label(
-                RichText::new("Used when a project names no relay of its own. The open project is left as it is; change its relay on the Collaborator tab.")
+                RichText::new("Used when a project names no relay of its own. The open project is left as it is; change its relay on the Interactor tab.")
                     .size(11.5)
                     .color(p.disabled),
             );
         }
-        (SettingsPage::Collaborator, "Polling") => {
+        (SettingsPage::Interactor, "Polling") => {
             ui.horizontal(|ui| {
                 ui.label("Poll every:");
                 ui.add(
-                    egui::DragValue::new(&mut app.settings.collab_poll_secs)
-                        .range(crate::state::UserSettings::COLLAB_POLL_RANGE)
+                    egui::DragValue::new(&mut app.settings.interactor_poll_secs)
+                        .range(crate::state::UserSettings::INTERACTOR_POLL_RANGE)
                         .speed(0.25)
                         .suffix(" s"),
                 );
-                let changed = app.settings.collab_poll_secs != crate::state::DEFAULT_COLLAB_POLL_SECS;
+                let changed = app.settings.interactor_poll_secs != crate::state::DEFAULT_INTERACTOR_POLL_SECS;
                 if theme::plain_button(ui, p, "Reset", changed).clicked() {
-                    app.settings.collab_poll_secs = crate::state::DEFAULT_COLLAB_POLL_SECS;
+                    app.settings.interactor_poll_secs = crate::state::DEFAULT_INTERACTOR_POLL_SECS;
                 }
             });
             ui.label(
@@ -1210,7 +1210,7 @@ mod tests {
             SettingsPage::Intruder,
             SettingsPage::Repeater,
             SettingsPage::Sequencer,
-            SettingsPage::Collaborator,
+            SettingsPage::Interactor,
             SettingsPage::ExternalTools,
             SettingsPage::NetworkConnections,
             SettingsPage::NetworkTls,
@@ -1253,11 +1253,11 @@ mod tests {
         }
     }
 
-    /// The Collaborator page is in the sidebar and findable by what its cards are about.
+    /// The Interactor page is in the sidebar and findable by what its cards are about.
     #[test]
-    fn the_collaborator_page_is_listed_and_searchable() {
-        assert_eq!(PAGES.iter().filter(|i| i.page == SettingsPage::Collaborator).count(), 1);
-        let page = info(SettingsPage::Collaborator);
+    fn the_interactor_page_is_listed_and_searchable() {
+        assert_eq!(PAGES.iter().filter(|i| i.page == SettingsPage::Interactor).count(), 1);
+        let page = info(SettingsPage::Interactor);
         assert!(page_visible(page, "relay"), "found by what its card is about");
         assert!(page_visible(page, "poll"));
         assert!(!page_visible(page, "zoom"));

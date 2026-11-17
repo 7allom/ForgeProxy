@@ -1111,7 +1111,7 @@ mod tests {
 
     /// A registered program appears on the row menu of a traffic table, and an unfinished one
     /// does not. The menu is built once and shared, so this is the same menu HTTP history, the
-    /// Logger, the site map, the Organizer and the Collaborator all show.
+    /// Logger, the site map, the Organizer and the Interactor all show.
     #[test]
     fn a_registered_program_appears_on_a_row_menu() {
         let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Organizer).build_with_ctx();

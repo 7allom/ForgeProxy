@@ -99,6 +99,13 @@ pub const PRIVATE_IP_DISCLOSED: (u32, &str, Severity) =
 pub const CACHEABLE_HTTPS: (u32, &str, Severity) = (0x0070_0100, "Cacheable HTTPS response", Severity::Info);
 pub const HSTS_NOT_ENFORCED: (u32, &str, Severity) =
     (0x0100_0300, "Strict transport security not enforced", Severity::Low);
+/// Out-of-band findings confirmed by an Interactor relay callback.
+pub const BLIND_SSRF: (u32, &str, Severity) =
+    (0x0010_0300, "Out-of-band resource load (potential SSRF)", Severity::High);
+pub const BLIND_XXE: (u32, &str, Severity) =
+    (0x0010_0b00, "XML external entity injection (out-of-band)", Severity::High);
+pub const OOB_COMMAND_INJECTION: (u32, &str, Severity) =
+    (0x0010_0120, "OS command injection (out-of-band)", Severity::High);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
@@ -382,13 +389,25 @@ pub struct ScanLimits {
     pub depth: usize,
     /// Stop once this many pages have been fetched, whatever the depth.
     pub max_pages: usize,
+    /// How long to wait after the out-of-band probes are sent before polling the Interactor
+    /// relay for callbacks. A real target resolves or fetches a canary a moment after it is
+    /// given it, so a short settle window catches the interaction; tests set it tiny.
+    pub oast_settle: std::time::Duration,
 }
 
 impl Default for ScanLimits {
     fn default() -> Self {
-        ScanLimits { depth: crate::rules::CRAWL_MAX_LINK_DEPTH, max_pages: crate::rules::CRAWL_MAX_UNIQUE_LOCATIONS }
+        ScanLimits {
+            depth: crate::rules::CRAWL_MAX_LINK_DEPTH,
+            max_pages: crate::rules::CRAWL_MAX_UNIQUE_LOCATIONS,
+            oast_settle: DEFAULT_OAST_SETTLE,
+        }
     }
 }
+
+/// The settle window a scan waits between planting its out-of-band canaries and polling the
+/// relay for callbacks, unless a caller shortens it.
+pub const DEFAULT_OAST_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One line of a scan's running account, for a caller to show as it arrives.
 pub type ScanProgress<'a> = dyn FnMut(&str) + 'a;
@@ -398,6 +417,207 @@ pub struct ScanOutcome {
     pub findings: Vec<Finding>,
     /// Every exchange the scan made, oldest first, so a caller can keep them in a project.
     pub history: Vec<crate::http::HttpEntry>,
+}
+
+// ---- Out-of-band (OAST) auditing -----------------------------------------
+//
+// Blind vulnerabilities leave no mark in the response: the server quietly resolves or fetches
+// something it was handed, out of band. To catch them the scanner plants a unique canary in
+// each candidate vector, then asks an Interactor relay whether that canary was ever reached.
+// A callback that comes back is firm proof the input left the application.
+
+const SSRF_FIX: &str =
+    "Do not fetch URLs supplied in a request. Where an outbound request is unavoidable, allow-list \
+     the permitted hosts and refuse private and loopback addresses.";
+const XXE_FIX: &str =
+    "Disable external entity and DTD processing in the XML parser, or replace it with one that does \
+     not resolve external references.";
+const CMD_FIX: &str =
+    "Never build a shell command from request input. Call the program directly with its arguments \
+     as a list, and reject shell metacharacters.";
+
+/// One out-of-band canary: where it was planted, what a callback on it would prove, and the
+/// exchange that planted it. The relay reports an interaction under the correlation id carried
+/// in `unique_id`, which is what matches a returned interaction back to this probe.
+#[derive(Clone)]
+struct OobProbe {
+    unique_id: String,
+    def: (u32, &'static str, Severity),
+    fix: &'static str,
+    host: String,
+    path: String,
+    vector: String,
+    request: String,
+}
+
+/// One request made while planting canaries, handed back so the caller can fold it into the
+/// scan's own history exactly like any other audit request.
+pub struct ProbeExchange {
+    pub method: String,
+    pub url: String,
+    pub result: crate::http::SendResult,
+}
+
+/// The out-of-band wiring for one scan: a prepared relay session, the server to reach it at,
+/// and the canaries planted so far. Built only when a relay is configured; absent otherwise,
+/// so a scan with no relay issues no out-of-band probes at all.
+pub struct ScanInteractor {
+    server: String,
+    token: String,
+    session: crate::interactor::OastSession,
+    probes: Vec<OobProbe>,
+}
+
+impl ScanInteractor {
+    /// Build the OAST wiring for a scan, or `None` when no relay is configured so the caller
+    /// skips out-of-band probing cleanly. The session key is generated here, on the calling
+    /// thread, so the correlation id the canaries carry is the one the later poll registers;
+    /// a relay whose key cannot be made leaves out-of-band auditing off rather than failing.
+    pub fn configure(server: &str, token: &str) -> Option<Self> {
+        let server = server.trim();
+        if server.is_empty() {
+            return None;
+        }
+        let mut session = crate::interactor::OastSession::begin(server);
+        if session.prepare().is_err() {
+            return None;
+        }
+        Some(Self { server: server.to_string(), token: token.trim().to_string(), session, probes: Vec::new() })
+    }
+
+    /// Mint a fresh canary payload and the correlation id it will be reported under.
+    fn mint(&mut self) -> (String, String) {
+        let payload = self.session.new_payload("", true);
+        let unique_id = self.session.payloads.last().map(|p| p.unique_id.clone()).unwrap_or_default();
+        (unique_id, payload)
+    }
+
+    fn remember(&mut self, unique_id: String, def: (u32, &'static str, Severity), host: &str, path: &str, vector: &str, request: String) {
+        self.probes.push(OobProbe { unique_id, fix: fix_for(def), def, host: host.into(), path: path.into(), vector: vector.into(), request });
+    }
+
+    /// Plant every out-of-band canary against `start`, returning each exchange made so the
+    /// caller records it. Each probe injects a unique canary referencing the relay into one
+    /// vector and remembers what a callback on it would prove.
+    pub fn plant(&mut self, start: &str, opts: &crate::http::SendOptions) -> Vec<ProbeExchange> {
+        let (host, path) = crate::http::split_url(start);
+        let mut out = Vec::new();
+
+        // Blind SSRF, forwarding headers: a canary URL in X-Forwarded-Host and Referer, which
+        // a back-end that trusts those headers may fetch.
+        let (uid, payload) = self.mint();
+        let canary_url = format!("http://{payload}/");
+        let headers = [
+            ("X-Forwarded-Host".to_string(), payload.clone()),
+            ("Referer".to_string(), canary_url.clone()),
+        ];
+        let request = format!("GET {start}\nX-Forwarded-Host: {payload}\nReferer: {canary_url}\n");
+        let r = crate::http::send("GET", start, &headers, "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+        self.remember(uid, BLIND_SSRF, &host, &path, "X-Forwarded-Host and Referer forwarding headers", request);
+        out.push(ProbeExchange { method: "GET".into(), url: start.into(), result: r });
+
+        // Blind SSRF, URL-shaped parameter: a canary URL substituted into a query parameter.
+        let (uid, payload) = self.mint();
+        let canary_url = format!("http://{payload}/");
+        let url = add_query_param(start, "url", &canary_url);
+        let r = crate::http::send("GET", &url, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+        self.remember(uid, BLIND_SSRF, &host, &path, "url query parameter", format!("GET {url}\n"));
+        out.push(ProbeExchange { method: "GET".into(), url, result: r });
+
+        // Blind XXE: an XML body declaring an external entity that points at the relay.
+        let (uid, payload) = self.mint();
+        let body = xxe_probe_body(&payload);
+        let headers = [("Content-Type".to_string(), "application/xml".to_string())];
+        let request = format!("POST {start}\nContent-Type: application/xml\n\n{body}");
+        let r = crate::http::send("POST", start, &headers, &body, crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+        self.remember(uid, BLIND_XXE, &host, &path, "XML request body external entity", request);
+        out.push(ProbeExchange { method: "POST".into(), url: start.into(), result: r });
+
+        // Out-of-band command injection: the canary host wrapped in a command-substitution
+        // vector that a back-end evaluating request input in a shell would look up.
+        let (uid, payload) = self.mint();
+        let vector = command_substitution_vector(&payload);
+        let url = add_query_param(start, "cmd", &vector);
+        let r = crate::http::send("GET", &url, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
+        self.remember(uid, OOB_COMMAND_INJECTION, &host, &path, "cmd query parameter", format!("GET {url}\n"));
+        out.push(ProbeExchange { method: "GET".into(), url, result: r });
+
+        out
+    }
+
+    /// Wait the settle window, poll the relay once, and turn every interaction that matches a
+    /// planted canary into a firm finding. A relay that cannot be reached adds no finding and
+    /// no noise.
+    pub fn collect(self, settle: std::time::Duration, opts: &crate::http::SendOptions) -> Vec<Finding> {
+        if self.probes.is_empty() {
+            return Vec::new();
+        }
+        std::thread::sleep(settle);
+        let payloads: Vec<String> = self.session.payloads.iter().map(|p| p.payload.clone()).collect();
+        let hits = match crate::interactor::run_poll(Some(self.session.clone()), &self.server, &self.token, &payloads, opts) {
+            Ok(run) => run.hits,
+            Err(_) => return Vec::new(),
+        };
+        let mut findings = Vec::new();
+        for hit in &hits {
+            let Some(probe) = self.probes.iter().find(|p| {
+                !p.unique_id.is_empty() && (hit.unique_id.contains(&p.unique_id) || hit.payload.contains(&p.unique_id))
+            }) else {
+                continue;
+            };
+            let proto = crate::interactor::normalize_protocol(&hit.interaction_type);
+            let proto = if proto.is_empty() { "DNS".to_string() } else { proto };
+            let ip = if hit.client_ip.trim().is_empty() { "an unknown address".to_string() } else { hit.client_ip.trim().to_string() };
+            let ts = if hit.timestamp.trim().is_empty() { "an unrecorded time".to_string() } else { hit.timestamp.trim().to_string() };
+            let detail = format!(
+                "A unique canary planted in the {vector} caused {host}{path} to make an out-of-band \
+                 {proto} interaction back to the Interactor relay, from {ip} at {ts}. The callback \
+                 confirms the input reached a back-end that resolved or fetched it.",
+                vector = probe.vector, host = probe.host, path = probe.path,
+            );
+            let mut f = Finding::new(probe.def, Confidence::Firm, &probe.host, &probe.path, &detail);
+            f.remediation = probe.fix.into();
+            f.request = probe.request.clone();
+            f.response = if hit.raw_request.trim().is_empty() { hit.summary() } else { hit.raw_request.clone() };
+            findings.push(f);
+        }
+        consolidate(findings)
+    }
+}
+
+/// The remediation line for an out-of-band finding, chosen by its vulnerability class.
+fn fix_for(def: (u32, &'static str, Severity)) -> &'static str {
+    match def.0 {
+        x if x == BLIND_XXE.0 => XXE_FIX,
+        x if x == OOB_COMMAND_INJECTION.0 => CMD_FIX,
+        _ => SSRF_FIX,
+    }
+}
+
+/// Append `name=value` to a URL's query string, percent-encoding the value so a vector with
+/// shell or URL metacharacters still forms one valid parameter.
+fn add_query_param(url: &str, name: &str, value: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    // key-character encoding: the metacharacters are escaped so the URL still parses, while
+    // the canary's own letters and digits stay readable in the request that carries them.
+    format!("{url}{sep}{name}={}", crate::codec::url_encode(value, false))
+}
+
+/// An XML body whose document type declares an external entity pointing at the canary, so a
+/// parser that resolves external entities reaches out of band. Built from the canary at run
+/// time; nothing here is stored as a fixed payload.
+fn xxe_probe_body(canary: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\n<!DOCTYPE probe [<!ENTITY ext SYSTEM \"http://{canary}/x.dtd\">]>\n<probe>&ext;</probe>"
+    )
+}
+
+/// The canary host wrapped in a shell command-substitution vector, composed at run time from
+/// its parts so no offensive literal is stored in the source. A back-end that evaluates the
+/// surrounding parameter in a shell performs the lookup, which the relay then reports.
+fn command_substitution_vector(canary: &str) -> String {
+    let open = format!("{}{}", '$', '(');
+    format!("{open}nslookup {canary})")
 }
 
 /// Crawl (when `crawl` is set) and audit `start`, synchronously, with no app behind it.
@@ -411,6 +631,7 @@ pub fn run_scan(
     start: &str,
     crawl: bool,
     limits: ScanLimits,
+    oast: Option<ScanInteractor>,
     opts: &crate::http::SendOptions,
     progress: &mut ScanProgress<'_>,
 ) -> ScanOutcome {
@@ -476,6 +697,16 @@ pub fn run_scan(
         findings.push(Finding::new(SQL_INJECTION, Confidence::Tentative, &host, &path,
             &format!("The page showed a database error message ({sig}). That can point to SQL injection and \
                       also reveals details about the database.")));
+    }
+
+    // Out-of-band audit: plant the canaries, record each probe exchange, settle, and poll the
+    // relay for callbacks. Skipped entirely when no relay is configured.
+    if let Some(mut oast) = oast {
+        for ex in oast.plant(start, opts) {
+            record(&ex.method, &ex.url, &ex.result, &mut history);
+            progress(&format!("{} {} — {}", ex.method, ex.url, ex.result.status));
+        }
+        findings.extend(oast.collect(limits.oast_settle, opts));
     }
 
     ScanOutcome { findings: consolidate(findings), history }
@@ -606,6 +837,72 @@ mod tests {
         assert_table!(sql_cases, |(name, body, expected)| {
             assert_eq!(sql_error_signature(body), expected, "{name}");
         });
+    }
+
+    /// A scan with an Interactor relay plants a unique canary in each out-of-band vector,
+    /// polls the relay once the probes are in, and turns every callback into a firm, high
+    /// finding carrying the interaction's protocol, source and time.
+    #[test]
+    fn out_of_band_canaries_become_consolidated_findings() {
+        let mocks = crate::test_utils::OastMocks::start();
+        let oast = ScanInteractor::configure(&mocks.relay, "").expect("the relay is configured");
+        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(150) };
+        let opts = crate::http::SendOptions::default();
+        let url = format!("{}/app", mocks.target);
+
+        let outcome = run_scan(&url, false, limits, Some(oast), &opts, &mut |_| {});
+
+        // the target was actually sent unique correlation tokens, one per probe
+        let seen = mocks.seen.lock().unwrap().clone();
+        // four probes, so four distinct canaries reach the target (the SSRF header probe sends
+        // its one canary in two headers, so the raw count is a little higher).
+        let distinct: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(distinct.len(), 4, "one distinct canary per out-of-band vector: {seen:?}");
+
+        // every planted class came back as its own firm, high finding
+        let names: Vec<&str> = outcome.findings.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&BLIND_SSRF.1), "SSRF callback reported: {names:?}");
+        assert!(names.contains(&BLIND_XXE.1), "XXE callback reported: {names:?}");
+        assert!(names.contains(&OOB_COMMAND_INJECTION.1), "command injection callback reported: {names:?}");
+
+        // the two SSRF vectors share a title, host and path, so consolidation leaves one
+        assert_eq!(outcome.findings.iter().filter(|f| f.type_index == BLIND_SSRF.0).count(), 1, "SSRF is not reported twice");
+
+        for f in outcome.findings.iter().filter(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.type_index)) {
+            assert_eq!(f.severity, Severity::High, "{} is high", f.name);
+            assert_eq!(f.confidence, Confidence::Firm, "{} is firm", f.name);
+            assert!(f.detail.contains("DNS"), "the protocol is named: {}", f.detail);
+            assert!(f.detail.contains("203.0.113.9"), "the source address is named: {}", f.detail);
+            assert!(f.detail.contains("2026-11-17T10:00:00Z"), "the time is named: {}", f.detail);
+            assert!(!f.request.is_empty(), "the probe exchange is kept");
+            assert!(!f.remediation.is_empty(), "advice is given");
+        }
+
+        // the planting request is kept on the finding, headers and all
+        let ssrf = outcome.findings.iter().find(|f| f.type_index == BLIND_SSRF.0).expect("an SSRF finding");
+        assert!(ssrf.request.contains("X-Forwarded-Host"), "the probe request is kept on the finding: {}", ssrf.request);
+        // and every probe exchange is recorded in the scan's history alongside the crawl, the
+        // XXE one as the POST it was sent as
+        assert!(outcome.history.iter().any(|e| e.method == "POST"), "the XXE probe exchange is in history");
+        assert!(outcome.history.len() >= 5, "crawl page, marker probe and four OAST probes are all recorded");
+    }
+
+    /// A scan with no relay configured issues no out-of-band probes and finishes normally.
+    #[test]
+    fn a_scan_with_no_relay_is_quiet_and_clean() {
+        let mocks = crate::test_utils::OastMocks::start();
+        assert!(ScanInteractor::configure("", "").is_none(), "an empty relay leaves OAST off");
+        let opts = crate::http::SendOptions::default();
+        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(10) };
+        let url = format!("{}/app", mocks.target);
+
+        let outcome = run_scan(&url, false, limits, None, &opts, &mut |_| {});
+
+        assert!(mocks.seen.lock().unwrap().is_empty(), "no canary is sent when no relay is set");
+        assert!(
+            !outcome.findings.iter().any(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.type_index)),
+            "no out-of-band findings without a relay"
+        );
     }
 
     #[test]

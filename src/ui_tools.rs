@@ -1020,17 +1020,17 @@ fn sync_repeater_target(tab: &mut crate::repeater::RepeaterTab, url_before: &str
     }
 }
 
-// ---- Collaborator (picture-18) ------------------------------------------
+// ---- Interactor (picture-18) ------------------------------------------
 /// What the interactions table shows about each interaction, and how wide each column is.
 /// Payload and Comment take the room left over; the rest hold what they hold.
-const COLLAB_COLS: [(f32, f32); 7] =
+const INTERACTOR_COLS: [(f32, f32); 7] =
     [(46.0, 0.0), (162.0, 0.0), (78.0, 0.0), (240.0, 1.0), (120.0, 0.0), (128.0, 0.0), (190.0, 1.0)];
 
 /// What a right-click on a row asked for, named by the interaction's stable id and carried
 /// out once the table has finished drawing -- a row cannot be removed from inside the loop
 /// that is still walking the rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CollabRowAction {
+enum InteractorRowAction {
     Remove(usize),
     Repeater(usize),
     Organizer(usize),
@@ -1045,7 +1045,7 @@ enum CollabRowAction {
 ///
 /// Anything that is not shaped like an ISO-8601 timestamp is passed through exactly as it
 /// arrived, rather than mangled into something that only looks like one.
-fn collab_time_text(raw: &str) -> String {
+fn interactor_time_text(raw: &str) -> String {
     let s = raw.trim();
     let b = s.as_bytes();
     // `YYYY-MM-DD?HH:MM:SS` is the shortest thing worth reformatting, where the separator is
@@ -1082,40 +1082,40 @@ fn collab_time_text(raw: &str) -> String {
 }
 
 /// How a row announces itself, which is also how a test finds it.
-fn collab_row_label(hit: &crate::collab::CollabInteraction) -> String {
+fn interactor_row_label(hit: &crate::interactor::InteractorInteraction) -> String {
     format!("Interaction #{} ({} {})", hit.id, hit.interaction_type, hit.payload)
 }
 
-pub fn collaborator(app: &mut App, ui: &mut Ui, p: &Palette) {
+pub fn interactor(app: &mut App, ui: &mut Ui, p: &Palette) {
     // the poll timer belongs to this tab: it runs while the tab is drawing and no longer
-    actions::collab_auto_poll_tick(app, ui.ctx());
+    actions::interactor_auto_poll_tick(app, ui.ctx());
     // a protocol filter whose protocol is no longer here would leave the table showing
     // nothing at all, so it is dropped before any of it is measured or drawn
-    app.collab_view.reconcile(&app.collab_interactions);
+    app.interactor_view.reconcile(&app.interactor_interactions);
 
     let mut action = None;
-    theme::section_title(ui, p, "Collaborator",
+    theme::section_title(ui, p, "Interactor",
         "Test whether an application can be made to contact an external service via DNS, HTTP, or SMTP. \
          Put a payload in a request; if the target looks it up, the interaction shows below.");
     ui.add_space(8.0);
-    collab_toolbar(app, ui, p);
+    interactor_toolbar(app, ui, p);
     ui.add_space(5.0);
-    collab_filter_bar(app, ui, p);
+    interactor_filter_bar(app, ui, p);
     ui.add_space(6.0);
 
-    let rows = crate::collab::rows(&app.collab_interactions, app.collab_session.as_ref(), &app.collab_view);
+    let rows = crate::interactor::rows(&app.interactor_interactions, app.interactor_session.as_ref(), &app.interactor_view);
     // how much of the table the filters are hiding, which is worth saying plainly:
     // an empty-looking table is otherwise hard to tell from one that collected nothing
-    if app.collab_view.is_filtering() && !app.collab_interactions.is_empty() {
+    if app.interactor_view.is_filtering() && !app.interactor_interactions.is_empty() {
         ui.add_space(2.0);
         ui.label(
-            RichText::new(format!("Showing {} of {}", rows.len(), app.collab_interactions.len()))
+            RichText::new(format!("Showing {} of {}", rows.len(), app.interactor_interactions.len()))
                 .size(11.0)
                 .color(p.disabled),
         );
         ui.add_space(2.0);
     }
-    if app.collab_interactions.is_empty() {
+    if app.interactor_interactions.is_empty() {
         let _ = theme::empty_state(ui, p, EmptyIcon::Radar, "No interactions",
             "Generate a payload with \"Copy to clipboard\", use it in a request, then poll for DNS, HTTP, or SMTP interactions.", None);
         return;
@@ -1125,117 +1125,117 @@ pub fn collaborator(app: &mut App, ui: &mut Ui, p: &Palette) {
     // the whole tab -- otherwise the clamp meant to keep a table's worth of space
     // above it reserves room the bars have already taken, and dragging up far enough
     // leaves no table at all. The traffic tables place theirs the same way.
-    collab_detail_pane(app, ui, p);
-    collab_table(app, ui, p, &rows, &mut action);
-    collab_keyboard_navigation(app, ui, &rows);
+    interactor_detail_pane(app, ui, p);
+    interactor_table(app, ui, p, &rows, &mut action);
+    interactor_keyboard_navigation(app, ui, &rows);
     if let Some(action) = action {
-        collab_apply(app, action);
+        interactor_apply(app, action);
     }
 }
 
 /// Row one: the payload being handed out, the polling, and the relay it all goes to.
-fn collab_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
+fn interactor_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.horizontal_wrapped(|ui| {
         if theme::primary_button(ui, p, "Copy to clipboard").clicked() {
-            if app.collab_server.trim().is_empty() {
+            if app.interactor_server.trim().is_empty() {
                 // nothing to collect against without a relay, and nothing is sent until one is named
-                app.collab_msg = "Enter a Collaborator server address first.".into();
+                app.interactor_msg = "Enter a Interactor server address first.".into();
             } else {
-                let with_server = app.collab_with_server;
-                let custom = app.collab_custom.clone();
-                let payload = actions::collab_session(app).new_payload(&custom, with_server);
+                let with_server = app.interactor_with_server;
+                let custom = app.interactor_custom.clone();
+                let payload = actions::interactor_session(app).new_payload(&custom, with_server);
                 ui.ctx().copy_text(payload.clone());
-                app.collab_msg = format!("Copied {payload}");
-                app.collab_payloads.push(payload);
+                app.interactor_msg = format!("Copied {payload}");
+                app.interactor_payloads.push(payload);
                 // the relay has to know the session before it can collect anything for it,
                 // and the key that makes that possible takes a moment to generate
-                actions::register_collaborator(app);
+                actions::register_interactor(app);
             }
         }
         ui.label(RichText::new("Custom data:").size(12.0).color(p.text));
         ui.add(
-            egui::TextEdit::singleline(&mut app.collab_custom)
+            egui::TextEdit::singleline(&mut app.interactor_custom)
                 .desired_width(118.0)
-                .char_limit(crate::collab::CUSTOM_DATA_MAX)
+                .char_limit(crate::interactor::CUSTOM_DATA_MAX)
                 .hint_text("Tag"),
         )
         .on_hover_text("Goes into the payload's hostname, so it comes back on the interaction it caused.");
-        ui.checkbox(&mut app.collab_with_server, "Include server location");
+        ui.checkbox(&mut app.interactor_with_server, "Include server location");
 
         ui.separator();
 
-        if theme::plain_button(ui, p, "Poll now", !app.collab_polling).clicked() {
-            actions::poll_collaborator(app);
+        if theme::plain_button(ui, p, "Poll now", !app.interactor_polling).clicked() {
+            actions::poll_interactor(app);
         }
-        if theme::pill(ui, p, "Auto-poll", app.collab_auto_poll)
+        if theme::pill(ui, p, "Auto-poll", app.interactor_auto_poll)
             .on_hover_text("Poll every ten seconds while this tab is open. Stops on its own if a poll or registration fails.")
             .clicked()
         {
-            if app.collab_auto_poll {
-                app.collab_auto_poll = false;
-                app.collab_last_poll = None;
-            } else if app.collab_server.trim().is_empty() {
-                app.collab_msg = "Enter a Collaborator server address first.".into();
+            if app.interactor_auto_poll {
+                app.interactor_auto_poll = false;
+                app.interactor_last_poll = None;
+            } else if app.interactor_server.trim().is_empty() {
+                app.interactor_msg = "Enter a Interactor server address first.".into();
             } else {
-                app.collab_auto_poll = true;
+                app.interactor_auto_poll = true;
                 // due at once, so turning it on polls rather than waiting ten seconds first
-                app.collab_last_poll = None;
+                app.interactor_last_poll = None;
             }
         }
-        if theme::plain_button(ui, p, "Clear", !app.collab_interactions.is_empty())
+        if theme::plain_button(ui, p, "Clear", !app.interactor_interactions.is_empty())
             .on_hover_text("Forget the interactions collected so far. The session and its payloads stay.")
             .clicked()
         {
-            app.collab_interactions.clear();
-            app.collab_sel = None;
+            app.interactor_interactions.clear();
+            app.interactor_sel = None;
             // the pill that was on may have been the only one of its kind
-            app.collab_view.reconcile(&app.collab_interactions);
-            app.collab_msg = "Interactions cleared.".into();
+            app.interactor_view.reconcile(&app.interactor_interactions);
+            app.interactor_msg = "Interactions cleared.".into();
         }
 
         ui.separator();
 
         ui.label(RichText::new("Server:").size(12.0).color(p.text));
         let server = ui.add(
-            egui::TextEdit::singleline(&mut app.collab_server)
+            egui::TextEdit::singleline(&mut app.interactor_server)
                 .desired_width(168.0)
                 .hint_text("relay.example.com"),
         );
         if server.changed() {
             // a session belongs to the relay it was registered with; the next payload or
             // poll starts one on whichever server is named now
-            app.collab_session = None;
-            app.collab_registering = false;
+            app.interactor_session = None;
+            app.interactor_registering = false;
         }
         ui.label(RichText::new("Token:").size(12.0).color(p.text));
         ui.add(
-            egui::TextEdit::singleline(&mut app.collab_token)
+            egui::TextEdit::singleline(&mut app.interactor_token)
                 .desired_width(104.0)
                 .password(true)
                 .hint_text("Optional token"),
         )
         .on_hover_text("Sent as the Authorization header. A public relay needs none.");
-        collab_session_badge(app, ui, p);
+        interactor_session_badge(app, ui, p);
     });
-    if !app.collab_msg.is_empty() {
-        let is_err = app.collab_msg.starts_with("Poll failed:")
-            || app.collab_msg.starts_with("Registration failed:")
-            || app.collab_msg.starts_with("Enter a")
-            || app.collab_msg.starts_with("Custom data");
+    if !app.interactor_msg.is_empty() {
+        let is_err = app.interactor_msg.starts_with("Poll failed:")
+            || app.interactor_msg.starts_with("Registration failed:")
+            || app.interactor_msg.starts_with("Enter a")
+            || app.interactor_msg.starts_with("Custom data");
         let col = if is_err { p.high } else { p.disabled };
         ui.add_space(3.0);
-        ui.label(RichText::new(&app.collab_msg).size(11.5).color(col));
+        ui.label(RichText::new(&app.interactor_msg).size(11.5).color(col));
     }
 }
 
 /// Where the session stands, in the few words there is room for at the end of the row.
-fn collab_session_badge(app: &App, ui: &mut Ui, p: &Palette) {
-    let (text, colour) = match (&app.collab_session, app.collab_registering) {
+fn interactor_session_badge(app: &App, ui: &mut Ui, p: &Palette) {
+    let (text, colour) = match (&app.interactor_session, app.interactor_registering) {
         (_, true) => ("Registering…".to_string(), p.disabled),
         (Some(s), _) if s.registered => {
             // the whole correlation id is twenty characters, which is more than a badge wants
             let short: String = s.correlation_id.chars().take(8).collect();
-            (format!("Session {short} on {}", crate::collab::server_host(&s.server)), p.low)
+            (format!("Session {short} on {}", crate::interactor::server_host(&s.server)), p.low)
         }
         _ => ("Not registered".to_string(), p.disabled),
     };
@@ -1246,16 +1246,16 @@ fn collab_session_badge(app: &App, ui: &mut Ui, p: &Palette) {
 ///
 /// The pills are built from the interactions rather than from a fixed list, so a relay that
 /// reports something no one has seen before gets a pill of its own with no code to change.
-fn collab_filter_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
-    let total = app.collab_interactions.len();
-    let counts: Vec<(String, usize)> = crate::collab::protocols(&app.collab_interactions)
+fn interactor_filter_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let total = app.interactor_interactions.len();
+    let counts: Vec<(String, usize)> = crate::interactor::protocols(&app.interactor_interactions)
         .into_iter()
         .map(|name| {
-            let n = crate::collab::protocol_count(&app.collab_interactions, &name);
+            let n = crate::interactor::protocol_count(&app.interactor_interactions, &name);
             (name, n)
         })
         .collect();
-    let active = app.collab_view.protocol.clone();
+    let active = app.interactor_view.protocol.clone();
     let mut pick: Option<Option<String>> = None;
     let mut clear_search = false;
     ui.horizontal_wrapped(|ui| {
@@ -1271,33 +1271,33 @@ fn collab_filter_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
         }
         ui.add_space(10.0);
         ui.add(
-            egui::TextEdit::singleline(&mut app.collab_view.search)
+            egui::TextEdit::singleline(&mut app.interactor_view.search)
                 .desired_width(228.0)
                 .hint_text("Filter payload, label, IP, or comment..."),
         );
-        if !app.collab_view.search.is_empty() && theme::plain_button(ui, p, "\u{00d7}", true).on_hover_text("Clear the search").clicked() {
+        if !app.interactor_view.search.is_empty() && theme::plain_button(ui, p, "\u{00d7}", true).on_hover_text("Clear the search").clicked() {
             clear_search = true;
         }
     });
     if let Some(protocol) = pick {
-        app.collab_view.protocol = protocol;
+        app.interactor_view.protocol = protocol;
     }
     if clear_search {
-        app.collab_view.search.clear();
+        app.interactor_view.search.clear();
     }
 }
 
 /// The interactions, sorted and filtered as the bars above ask for.
-fn collab_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut Option<CollabRowAction>) {
-    use crate::collab::CollabSortColumn as C;
+fn interactor_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut Option<InteractorRowAction>) {
+    use crate::interactor::InteractorSortColumn as C;
     let height = ui.available_height().max(120.0);
-    let sel = app.collab_sel;
-    let hits = app.collab_interactions.clone();
-    let session = app.collab_session.clone();
-    let (sort_col, ascending) = (app.collab_view.sort_column, app.collab_view.sort_ascending);
+    let sel = app.interactor_sel;
+    let hits = app.interactor_interactions.clone();
+    let session = app.interactor_session.clone();
+    let (sort_col, ascending) = (app.interactor_view.sort_column, app.interactor_view.sort_ascending);
     let mut sort_click = None;
     let mut clicked = None;
-    theme::fitted_table(ui, p, "collab_table", height, &COLLAB_COLS, |ui, w| {
+    theme::fitted_table(ui, p, "interactor_table", height, &INTERACTOR_COLS, |ui, w| {
         let cols: &[(&str, f32, C)] = &[
             ("#", w[0], C::Index),
             ("Time", w[1], C::Time),
@@ -1315,24 +1315,24 @@ fn collab_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action:
                 "No interaction matches the protocol or the text being searched for.", None);
             return;
         }
-        egui::ScrollArea::vertical().id_salt("collab_rows").show_rows(ui, theme::ROW_HEIGHT, rows.len(), |ui, range| {
+        egui::ScrollArea::vertical().id_salt("interactor_rows").show_rows(ui, theme::ROW_HEIGHT, rows.len(), |ui, range| {
             for (nth, &i) in rows.iter().enumerate().skip(range.start).take(range.len()) {
                 let hit = &hits[i];
                 let selected = sel == Some(hit.id);
                 let (row, cells) =
-                    theme::table_row_cells(ui, p, ("collab_row", hit.id), w, theme::ROW_HEIGHT, selected, nth % 2 == 1, None);
+                    theme::table_row_cells(ui, p, ("interactor_row", hit.id), w, theme::ROW_HEIGHT, selected, nth % 2 == 1, None);
                 let fg = if selected { p.strong } else { p.text };
                 let comment = if hit.comment.trim().is_empty() { hit.summary() } else { hit.comment.clone() };
                 theme::cell_text(ui, cells[0], &hit.id.to_string(), fg);
-                theme::cell_text(ui, cells[1], &collab_time_text(&hit.timestamp), fg);
+                theme::cell_text(ui, cells[1], &interactor_time_text(&hit.timestamp), fg);
                 theme::cell_text(ui, cells[2], &hit.interaction_type,
                     if selected { p.strong } else { crate::ui_core::protocol_color(p, &hit.interaction_type) });
                 theme::cell_text(ui, cells[3], &hit.payload, fg);
-                theme::cell_text(ui, cells[4], &crate::collab::label_of(session.as_ref(), hit), fg);
+                theme::cell_text(ui, cells[4], &crate::interactor::label_of(session.as_ref(), hit), fg);
                 theme::cell_text(ui, cells[5], &hit.client_ip, fg);
                 theme::cell_text(ui, cells[6], &comment, fg);
                 row.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, collab_row_label(hit))
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, interactor_row_label(hit))
                 });
                 if row.clicked() {
                     clicked = Some(hit.id);
@@ -1350,25 +1350,25 @@ fn collab_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action:
                     ui.separator();
                     // the tools that work on a request need one: a lookup carries none
                     if ui.add_enabled(has_req, egui::Button::new("Send to Repeater")).clicked() {
-                        *action = Some(CollabRowAction::Repeater(hit.id));
+                        *action = Some(InteractorRowAction::Repeater(hit.id));
                         ui.close_menu();
                     }
                     if ui.add_enabled(has_req, egui::Button::new("Send to Organizer")).clicked() {
-                        *action = Some(CollabRowAction::Organizer(hit.id));
+                        *action = Some(InteractorRowAction::Organizer(hit.id));
                         ui.close_menu();
                     }
                     // the Decoder takes the transcript when there is one and the payload
                     // otherwise, so it is worth offering either way
                     if ui.button("Send to Decoder").clicked() {
-                        *action = Some(CollabRowAction::Decoder(hit.id));
+                        *action = Some(InteractorRowAction::Decoder(hit.id));
                         ui.close_menu();
                     }
                     // and the programs the user registered, on the address the interaction
                     // stands for with whatever transcript came with it
-                    append_external_tools_menu(ui, app, &actions::collab_interaction_url(hit), &hit.raw_request, &hit.raw_response);
+                    append_external_tools_menu(ui, app, &actions::interactor_interaction_url(hit), &hit.raw_request, &hit.raw_response);
                     ui.separator();
                     if ui.button("Remove").clicked() {
-                        *action = Some(CollabRowAction::Remove(hit.id));
+                        *action = Some(InteractorRowAction::Remove(hit.id));
                         ui.close_menu();
                     }
                 });
@@ -1376,41 +1376,41 @@ fn collab_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action:
         });
     });
     if let Some(col) = sort_click {
-        app.collab_view.click_column(col);
+        app.interactor_view.click_column(col);
     }
     if let Some(id) = clicked {
         // clicking the row that is open closes it again
-        app.collab_sel = (app.collab_sel != Some(id)).then_some(id);
+        app.interactor_sel = (app.interactor_sel != Some(id)).then_some(id);
     }
 }
 
 /// Carry out what a row's context menu asked for.
-fn collab_apply(app: &mut App, action: CollabRowAction) {
+fn interactor_apply(app: &mut App, action: InteractorRowAction) {
     let id = match action {
-        CollabRowAction::Remove(id) | CollabRowAction::Repeater(id) | CollabRowAction::Organizer(id) | CollabRowAction::Decoder(id) => id,
+        InteractorRowAction::Remove(id) | InteractorRowAction::Repeater(id) | InteractorRowAction::Organizer(id) | InteractorRowAction::Decoder(id) => id,
     };
-    let Some(hit) = app.collab_interactions.iter().find(|h| h.id == id).cloned() else {
+    let Some(hit) = app.interactor_interactions.iter().find(|h| h.id == id).cloned() else {
         return;
     };
     match action {
-        CollabRowAction::Remove(_) => {
-            app.collab_interactions.retain(|h| h.id != id);
-            if app.collab_sel == Some(id) {
-                app.collab_sel = None;
+        InteractorRowAction::Remove(_) => {
+            app.interactor_interactions.retain(|h| h.id != id);
+            if app.interactor_sel == Some(id) {
+                app.interactor_sel = None;
             }
             // that may have been the last interaction of its protocol
-            app.collab_view.reconcile(&app.collab_interactions);
+            app.interactor_view.reconcile(&app.interactor_interactions);
         }
-        CollabRowAction::Repeater(_) => actions::send_collab_to_repeater(app, &hit),
-        CollabRowAction::Organizer(_) => actions::send_collab_to_organizer(app, &hit),
-        CollabRowAction::Decoder(_) => actions::send_collab_to_decoder(app, &hit),
+        InteractorRowAction::Repeater(_) => actions::send_interactor_to_repeater(app, &hit),
+        InteractorRowAction::Organizer(_) => actions::send_interactor_to_organizer(app, &hit),
+        InteractorRowAction::Decoder(_) => actions::send_interactor_to_decoder(app, &hit),
     }
 }
 
 /// Up and Down move the selection through the rows as they are shown -- sorted and filtered
 /// as they are, which is the order the eye is following. Held back while something has the
 /// keyboard, so an arrow key in the search box moves the cursor and not the row.
-fn collab_keyboard_navigation(app: &mut App, ui: &mut Ui, rows: &[usize]) {
+fn interactor_keyboard_navigation(app: &mut App, ui: &mut Ui, rows: &[usize]) {
     if rows.is_empty() || ui.memory(|m| m.focused()).is_some() {
         return;
     }
@@ -1418,8 +1418,8 @@ fn collab_keyboard_navigation(app: &mut App, ui: &mut Ui, rows: &[usize]) {
     if !down && !up {
         return;
     }
-    let ids: Vec<usize> = rows.iter().map(|&i| app.collab_interactions[i].id).collect();
-    let at = app.collab_sel.and_then(|id| ids.iter().position(|&x| x == id));
+    let ids: Vec<usize> = rows.iter().map(|&i| app.interactor_interactions[i].id).collect();
+    let at = app.interactor_sel.and_then(|id| ids.iter().position(|&x| x == id));
     let next = match (at, down) {
         // nothing selected yet: Down takes the first row, Up the last
         (None, true) => 0,
@@ -1427,18 +1427,18 @@ fn collab_keyboard_navigation(app: &mut App, ui: &mut Ui, rows: &[usize]) {
         (Some(i), true) => (i + 1).min(ids.len() - 1),
         (Some(i), false) => i.saturating_sub(1),
     };
-    app.collab_sel = Some(ids[next]);
+    app.interactor_sel = Some(ids[next]);
 }
 
 /// What the selected interaction carried, in a pane that can be dragged taller or shorter.
 /// Nothing is registered at all when no row is open, so the table has the whole tab to itself.
-fn collab_detail_pane(app: &mut App, ui: &mut Ui, p: &Palette) {
-    let Some(hit) = app.collab_sel.and_then(|id| app.collab_interactions.iter().find(|h| h.id == id)).cloned() else {
+fn interactor_detail_pane(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let Some(hit) = app.interactor_sel.and_then(|id| app.interactor_interactions.iter().find(|h| h.id == id)).cloned() else {
         return;
     };
-    let label = crate::collab::label_of(app.collab_session.as_ref(), &hit);
+    let label = crate::interactor::label_of(app.interactor_session.as_ref(), &hit);
     let avail = ui.available_height();
-    egui::TopBottomPanel::bottom("collab_detail")
+    egui::TopBottomPanel::bottom("interactor_detail")
         .resizable(true)
         .default_height(280.0)
         .min_height(120.0)
@@ -1447,15 +1447,15 @@ fn collab_detail_pane(app: &mut App, ui: &mut Ui, p: &Palette) {
         .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { top: 6, ..Default::default() }))
         .show_inside(ui, |ui| {
             if hit.has_message() {
-                collab_transcript(app, ui, p, &hit, &label);
+                interactor_transcript(app, ui, p, &hit, &label);
             } else {
-                collab_callback_details(ui, p, &hit, &label);
+                interactor_callback_details(ui, p, &hit, &label);
             }
         });
 }
 
 /// One name and its value, selectable so it can be copied out.
-fn collab_field(ui: &mut Ui, p: &Palette, name: &str, value: &str) {
+fn interactor_field(ui: &mut Ui, p: &Palette, name: &str, value: &str) {
     if value.trim().is_empty() {
         return;
     }
@@ -1467,10 +1467,10 @@ fn collab_field(ui: &mut Ui, p: &Palette, name: &str, value: &str) {
 
 /// An interaction that carried a message: what came in, what was answered, and the rest of
 /// what the relay said about it.
-fn collab_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::collab::CollabInteraction, label: &str) {
+fn interactor_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::interactor::InteractorInteraction, label: &str) {
     let has_response = !hit.raw_response.trim().is_empty();
     // a lookup's transcript is not a request and a response, so the pane says "Transcript"
-    let request_title = if crate::collab::normalize_protocol(&hit.interaction_type).starts_with("HTTP") { "Request" } else { "Transcript" };
+    let request_title = if crate::interactor::normalize_protocol(&hit.interaction_type).starts_with("HTTP") { "Request" } else { "Transcript" };
     let columns = if has_response { 3 } else { 2 };
     // The editors go inside a scroll area, which bounds the height they are offered to the
     // pane's actual (dragged) size. A panel stores the rect of its *contents*, so editors
@@ -1479,25 +1479,25 @@ fn collab_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::colla
     // keeps at least a table's worth of room above it is bypassed, letting the table collapse.
     // Anything that does not fit scrolls instead. The traffic tables do the same, for the same
     // reason.
-    egui::ScrollArea::vertical().id_salt("collab_detail_scroll").auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("interactor_detail_scroll").auto_shrink([false, false]).show(ui, |ui| {
         let h = (ui.available_height() - 24.0).max(90.0);
         let (out_req, out_resp) = theme::columns(ui, columns, |cols| {
             cols[0].label(bold(request_title, 12.5).color(p.strong));
-            let req = editor::message_view(&mut cols[0], p, "collab_req", &hit.raw_request, h);
+            let req = editor::message_view(&mut cols[0], p, "interactor_req", &hit.raw_request, h);
             let resp = has_response.then(|| {
                 cols[1].label(bold("Response", 12.5).color(p.strong));
-                editor::message_view(&mut cols[1], p, "collab_resp", &hit.raw_response, h)
+                editor::message_view(&mut cols[1], p, "interactor_resp", &hit.raw_response, h)
             });
             let last = columns - 1;
             cols[last].label(bold("Details", 12.5).color(p.strong));
-            egui::ScrollArea::vertical().id_salt("collab_details").max_height(h).show(&mut cols[last], |ui| {
-                collab_field(ui, p, "Type", &hit.interaction_type);
-                collab_field(ui, p, "Query type", &hit.query_type);
-                collab_field(ui, p, "Full payload", &hit.payload);
-                collab_field(ui, p, "Label", label);
-                collab_field(ui, p, "Session ID", &hit.unique_id);
-                collab_field(ui, p, "Client IP", &hit.client_ip);
-                collab_field(ui, p, "Timestamp", &hit.timestamp);
+            egui::ScrollArea::vertical().id_salt("interactor_details").max_height(h).show(&mut cols[last], |ui| {
+                interactor_field(ui, p, "Type", &hit.interaction_type);
+                interactor_field(ui, p, "Query type", &hit.query_type);
+                interactor_field(ui, p, "Full payload", &hit.payload);
+                interactor_field(ui, p, "Label", label);
+                interactor_field(ui, p, "Session ID", &hit.unique_id);
+                interactor_field(ui, p, "Client IP", &hit.client_ip);
+                interactor_field(ui, p, "Timestamp", &hit.timestamp);
                 if !hit.comment.trim().is_empty() {
                     ui.add_space(4.0);
                     ui.add(egui::Label::new(RichText::new(&hit.comment).size(12.0).color(p.text)).selectable(true).wrap());
@@ -1506,9 +1506,9 @@ fn collab_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::colla
             (req, resp)
         });
         let name = format!("Interaction {}", hit.payload);
-        attach_view_context_menu(&out_req, &hit.raw_request, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} request"));
+        attach_view_context_menu(&out_req, &hit.raw_request, app, Tab::Interactor, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} request"));
         if let Some(out_resp) = out_resp {
-            attach_view_context_menu(&out_resp, &hit.raw_response, app, Tab::Collaborator, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} response"));
+            attach_view_context_menu(&out_resp, &hit.raw_response, app, Tab::Interactor, "", &hit.raw_request, Some(&hit.raw_response), &format!("{name} response"));
         }
     });
 }
@@ -1516,19 +1516,19 @@ fn collab_transcript(app: &mut App, ui: &mut Ui, p: &Palette, hit: &crate::colla
 /// An interaction that carried no message of its own -- a name lookup, a connection that was
 /// made and nothing more. There is no request to show, so the pane shows what there is in two
 /// columns rather than leaving two empty editors taking up the room.
-fn collab_callback_details(ui: &mut Ui, p: &Palette, hit: &crate::collab::CollabInteraction, label: &str) {
+fn interactor_callback_details(ui: &mut Ui, p: &Palette, hit: &crate::interactor::InteractorInteraction, label: &str) {
     ui.label(bold("Callback details", 12.5).color(p.strong));
     ui.add_space(4.0);
-    egui::ScrollArea::vertical().id_salt("collab_callback").auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("interactor_callback").auto_shrink([false, false]).show(ui, |ui| {
         theme::columns(ui, 2, |cols| {
-            collab_field(&mut cols[0], p, "Full payload", &hit.payload);
-            collab_field(&mut cols[0], p, "Type", &hit.interaction_type);
-            collab_field(&mut cols[0], p, "Query type", &hit.query_type);
-            collab_field(&mut cols[0], p, "Event", &hit.summary());
-            collab_field(&mut cols[1], p, "Label", label);
-            collab_field(&mut cols[1], p, "Client IP", &hit.client_ip);
-            collab_field(&mut cols[1], p, "Timestamp", &hit.timestamp);
-            collab_field(&mut cols[1], p, "Session ID", &hit.unique_id);
+            interactor_field(&mut cols[0], p, "Full payload", &hit.payload);
+            interactor_field(&mut cols[0], p, "Type", &hit.interaction_type);
+            interactor_field(&mut cols[0], p, "Query type", &hit.query_type);
+            interactor_field(&mut cols[0], p, "Event", &hit.summary());
+            interactor_field(&mut cols[1], p, "Label", label);
+            interactor_field(&mut cols[1], p, "Client IP", &hit.client_ip);
+            interactor_field(&mut cols[1], p, "Timestamp", &hit.timestamp);
+            interactor_field(&mut cols[1], p, "Session ID", &hit.unique_id);
         });
         if !hit.comment.trim().is_empty() {
             ui.add_space(6.0);
@@ -2580,7 +2580,7 @@ pub fn external_tools_menu_pick(ui: &mut Ui, tools: &[(usize, String)]) -> Optio
 ///
 /// Called from every traffic menu -- the editors and viewers through
 /// [`show_traffic_context_menu`], and each table's rows: HTTP history, Logger, site map,
-/// Organizer, the Dashboard's live items and the Collaborator. A program set up once is then
+/// Organizer, the Dashboard's live items and the Interactor. A program set up once is then
 /// offered wherever a message is, without each table having to know what is registered.
 pub fn append_external_tools_menu(ui: &mut Ui, app: &mut App, url: &str, request: &str, response: &str) {
     let tools = menu_external_tools(&app.settings);
@@ -3102,21 +3102,21 @@ mod logger_tests {
 }
 
 #[cfg(test)]
-mod collab_tests {
-    use super::collab_time_text;
-    use crate::collab::{CollabInteraction, OastSession};
+mod interactor_tests {
+    use super::interactor_time_text;
+    use crate::interactor::{InteractorInteraction, OastSession};
     use crate::state::{App, Tab};
     use crate::test_utils::{assert_table, MockAppBuilder};
     use eframe::egui;
 
-    /// The Collaborator tab with a session that handed out six labelled payloads and seven
+    /// The Interactor tab with a session that handed out six labelled payloads and seven
     /// interactions collected against them: one of every protocol the filter bar knows a
     /// colour for, one protocol it has never heard of, and two lookups for the same payload.
     ///
     /// The payload hostnames deliberately carry none of the labels, so a search that matches a
     /// label can only have matched through the session.
-    fn collab_app() -> (egui::Context, App) {
-        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Collaborator).build_with_ctx();
+    fn interactor_app() -> (egui::Context, App) {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Interactor).build_with_ctx();
         ctx.enable_accesskit();
         let mut session = OastSession::begin("relay.test");
         session.registered = true;
@@ -3124,7 +3124,7 @@ mod collab_tests {
             session.new_payload(custom, false);
         }
         let ids: Vec<String> = session.payloads.iter().map(|p| p.unique_id.clone()).collect();
-        let hit = |id: usize, kind: &str, host: &str, ip: &str, unique: &str| CollabInteraction {
+        let hit = |id: usize, kind: &str, host: &str, ip: &str, unique: &str| InteractorInteraction {
             id,
             interaction_type: kind.into(),
             timestamp: format!("2026-11-14T09:0{id}:00Z"),
@@ -3133,26 +3133,26 @@ mod collab_tests {
             unique_id: unique.into(),
             ..Default::default()
         };
-        app.collab_interactions = vec![
-            CollabInteraction { query_type: "A".into(), ..hit(1, "DNS", "r1.relay.test", "203.0.113.11", &ids[0]) },
-            CollabInteraction {
+        app.interactor_interactions = vec![
+            InteractorInteraction { query_type: "A".into(), ..hit(1, "DNS", "r1.relay.test", "203.0.113.11", &ids[0]) },
+            InteractorInteraction {
                 raw_request: "GET /hook?x=1 HTTP/1.1\nHost: r2.relay.test\n\n".into(),
                 raw_response: "HTTP/1.1 200 OK\ncontent-length: 2\n\nok".into(),
                 ..hit(2, "HTTP", "r2.relay.test", "203.0.113.22", &ids[1])
             },
             hit(3, "LDAP", "r3.relay.test", "203.0.113.33", &ids[2]),
-            CollabInteraction {
+            InteractorInteraction {
                 raw_request: "RCPT TO:<root@r4.relay.test>".into(),
                 ..hit(4, "SMTP", "r4.relay.test", "203.0.113.44", &ids[3])
             },
             hit(5, "SMB", "r5.relay.test", "203.0.113.55", &ids[4]),
             hit(6, "QUIC-ODDITY", "r6.relay.test", "203.0.113.66", &ids[5]),
-            CollabInteraction { query_type: "AAAA".into(), ..hit(7, "DNS", "r1.relay.test", "203.0.113.77", &ids[0]) },
+            InteractorInteraction { query_type: "AAAA".into(), ..hit(7, "DNS", "r1.relay.test", "203.0.113.77", &ids[0]) },
         ];
-        app.collab_session = Some(session);
-        app.collab_server = "relay.test".into();
-        app.collab_sel = None;
-        app.tab = Tab::Collaborator;
+        app.interactor_session = Some(session);
+        app.interactor_server = "relay.test".into();
+        app.interactor_sel = None;
+        app.tab = Tab::Interactor;
         (ctx, app)
     }
 
@@ -3213,7 +3213,7 @@ mod collab_tests {
 
     /// How the row for this interaction announces itself.
     fn row_label(app: &App, id: usize) -> String {
-        let hit = app.collab_interactions.iter().find(|h| h.id == id).expect("the interaction");
+        let hit = app.interactor_interactions.iter().find(|h| h.id == id).expect("the interaction");
         format!("Interaction #{} ({} {})", hit.id, hit.interaction_type, hit.payload)
     }
 
@@ -3226,9 +3226,9 @@ mod collab_tests {
 
     /// The ids the table is showing, in the order it shows them.
     fn shown(app: &App) -> Vec<usize> {
-        crate::collab::rows(&app.collab_interactions, app.collab_session.as_ref(), &app.collab_view)
+        crate::interactor::rows(&app.interactor_interactions, app.interactor_session.as_ref(), &app.interactor_view)
             .iter()
-            .map(|&i| app.collab_interactions[i].id)
+            .map(|&i| app.interactor_interactions[i].id)
             .collect()
     }
 
@@ -3236,7 +3236,7 @@ mod collab_tests {
     /// by whichever one is clicked -- including a protocol the app has never heard of.
     #[test]
     fn the_protocol_pills_are_built_from_what_came_in_and_filter_by_it() {
-        let (ctx, mut app) = collab_app();
+        let (ctx, mut app) = interactor_app();
         let update = frame(&ctx, &mut app, vec![]);
         // the known protocols in the bar's own order, then the one the relay invented
         for want in ["All (7)", "DNS (2)", "HTTP (1)", "SMTP (1)", "LDAP (1)", "SMB (1)", "QUIC-ODDITY (1)"] {
@@ -3247,18 +3247,18 @@ mod collab_tests {
         }
 
         click(&ctx, &mut app, "LDAP (1)");
-        assert_eq!(app.collab_view.protocol.as_deref(), Some("LDAP"));
+        assert_eq!(app.interactor_view.protocol.as_deref(), Some("LDAP"));
         assert_eq!(shown(&app), [3], "only the one interaction of that protocol");
 
         click(&ctx, &mut app, "LDAP (1)");
-        assert_eq!(app.collab_view.protocol, None, "the pill that is on puts the filter back");
+        assert_eq!(app.interactor_view.protocol, None, "the pill that is on puts the filter back");
         assert_eq!(shown(&app), [1, 2, 3, 4, 5, 6, 7]);
 
         // a protocol no one has heard of filters exactly like the ones that are known
         click(&ctx, &mut app, "QUIC-ODDITY (1)");
         assert_eq!(shown(&app), [6]);
         click(&ctx, &mut app, "All (7)");
-        assert_eq!(app.collab_view.protocol, None, "and All takes any filter off");
+        assert_eq!(app.interactor_view.protocol, None, "and All takes any filter off");
         assert_eq!(shown(&app), [1, 2, 3, 4, 5, 6, 7]);
     }
 
@@ -3275,8 +3275,8 @@ mod collab_tests {
             ("something no row has", "nothing-here", vec![]),
         ];
         assert_table!(cases, |idx, (what, search, want)| {
-            let (ctx, mut app) = collab_app();
-            app.collab_view.search = search.to_string();
+            let (ctx, mut app) = interactor_app();
+            app.interactor_view.search = search.to_string();
             frame(&ctx, &mut app, vec![]);
             assert_eq!(shown(&app), want, "case #{idx} ({what})");
             // every row the table says it is showing is really drawn
@@ -3290,64 +3290,64 @@ mod collab_tests {
     /// only the rows that survive both -- in the order they are shown.
     #[test]
     fn the_arrow_keys_walk_the_rows_that_are_shown() {
-        let (ctx, mut app) = collab_app();
-        app.collab_view.search = "alpha".into();
+        let (ctx, mut app) = interactor_app();
+        app.interactor_view.search = "alpha".into();
         frame(&ctx, &mut app, vec![]);
         assert_eq!(shown(&app), [1, 7]);
 
         frame(&ctx, &mut app, key(egui::Key::ArrowDown));
-        assert_eq!(app.collab_sel, Some(1), "Down with nothing selected takes the first row");
+        assert_eq!(app.interactor_sel, Some(1), "Down with nothing selected takes the first row");
         frame(&ctx, &mut app, key(egui::Key::ArrowDown));
-        assert_eq!(app.collab_sel, Some(7), "straight past the rows the search is hiding");
+        assert_eq!(app.interactor_sel, Some(7), "straight past the rows the search is hiding");
         frame(&ctx, &mut app, key(egui::Key::ArrowDown));
-        assert_eq!(app.collab_sel, Some(7), "and stops at the bottom rather than wrapping");
+        assert_eq!(app.interactor_sel, Some(7), "and stops at the bottom rather than wrapping");
         frame(&ctx, &mut app, key(egui::Key::ArrowUp));
-        assert_eq!(app.collab_sel, Some(1));
+        assert_eq!(app.interactor_sel, Some(1));
         frame(&ctx, &mut app, key(egui::Key::ArrowUp));
-        assert_eq!(app.collab_sel, Some(1), "and at the top");
+        assert_eq!(app.interactor_sel, Some(1), "and at the top");
 
         // sorted the other way, Down goes to what is now the next row down
-        app.collab_view.sort_ascending = false;
+        app.interactor_view.sort_ascending = false;
         frame(&ctx, &mut app, vec![]);
         assert_eq!(shown(&app), [7, 1]);
-        app.collab_sel = Some(7);
+        app.interactor_sel = Some(7);
         frame(&ctx, &mut app, key(egui::Key::ArrowDown));
-        assert_eq!(app.collab_sel, Some(1), "the row under it on screen, not the next one stored");
+        assert_eq!(app.interactor_sel, Some(1), "the row under it on screen, not the next one stored");
 
         // and with a protocol pill on as well, only what passes both is walked
-        app.collab_view.search.clear();
-        app.collab_view.protocol = Some("DNS".into());
-        app.collab_view.sort_ascending = true;
-        app.collab_sel = None;
+        app.interactor_view.search.clear();
+        app.interactor_view.protocol = Some("DNS".into());
+        app.interactor_view.sort_ascending = true;
+        app.interactor_sel = None;
         frame(&ctx, &mut app, vec![]);
         assert_eq!(shown(&app), [1, 7]);
         frame(&ctx, &mut app, key(egui::Key::ArrowDown));
-        assert!(shown(&app).contains(&app.collab_sel.expect("a row")), "the selection is one of the rows shown");
+        assert!(shown(&app).contains(&app.interactor_sel.expect("a row")), "the selection is one of the rows shown");
     }
 
     /// Clicking a row opens that interaction below the table, and clicking it again closes it.
     /// What the pane shows follows the selection by id, so re-sorting cannot move it.
     #[test]
     fn clicking_a_row_opens_that_interaction_and_the_selection_survives_a_re_sort() {
-        let (ctx, mut app) = collab_app();
+        let (ctx, mut app) = interactor_app();
         let at = row_rect(&ctx, &mut app, 4).center();
         click_at(&ctx, &mut app, at, false);
-        assert_eq!(app.collab_sel, Some(4), "the row that was clicked");
+        assert_eq!(app.interactor_sel, Some(4), "the row that was clicked");
 
         // the same row again lets it go
         let at = row_rect(&ctx, &mut app, 4).center();
         click_at(&ctx, &mut app, at, false);
-        assert_eq!(app.collab_sel, None);
+        assert_eq!(app.interactor_sel, None);
 
         // a selection follows its interaction through a re-sort rather than staying on a row
-        app.collab_sel = Some(4);
-        app.collab_view.sort_column = Some(crate::collab::CollabSortColumn::Payload);
-        app.collab_view.sort_ascending = false;
+        app.interactor_sel = Some(4);
+        app.interactor_view.sort_column = Some(crate::interactor::InteractorSortColumn::Payload);
+        app.interactor_view.sort_ascending = false;
         frame(&ctx, &mut app, vec![]);
         // r6 down to r2, then the two lookups that share r1: equal values keep the order they
         // arrived in whichever way the column is sorted, so #1 still comes before #7
         assert_eq!(shown(&app), [6, 5, 4, 3, 2, 1, 7], "sorted by payload, descending");
-        assert_eq!(app.collab_sel, Some(4), "and the open interaction is still #4");
+        assert_eq!(app.interactor_sel, Some(4), "and the open interaction is still #4");
     }
 
     /// An interaction that carried a message shows it, with the Raw / Pretty / Hex switch over
@@ -3388,11 +3388,11 @@ mod collab_tests {
             },
         ];
         assert_table!(cases, |idx, case| {
-            let (ctx, mut app) = collab_app();
+            let (ctx, mut app) = interactor_app();
             let at = row_rect(&ctx, &mut app, case.id).center();
             click_at(&ctx, &mut app, at, false);
             let update = frame(&ctx, &mut app, vec![]);
-            assert_eq!(app.collab_sel, Some(case.id), "case #{idx} ({})", case.name);
+            assert_eq!(app.interactor_sel, Some(case.id), "case #{idx} ({})", case.name);
             for want in case.present {
                 assert!(!find_all(&update, want).is_empty(), "case #{idx} ({}): {want:?} is shown", case.name);
             }
@@ -3432,7 +3432,7 @@ mod collab_tests {
             },
         ];
         assert_table!(cases, |idx, case| {
-            let (ctx, mut app) = collab_app();
+            let (ctx, mut app) = interactor_app();
             // interaction #2 is the one with a request on it
             let at = row_rect(&ctx, &mut app, 2).center();
             click_at(&ctx, &mut app, at, true);
@@ -3449,9 +3449,9 @@ mod collab_tests {
     /// protocol filter left pointing at a protocol that has gone with it comes off.
     #[test]
     fn the_row_menu_removes_the_row_it_was_opened_on() {
-        let (ctx, mut app) = collab_app();
-        app.collab_view.protocol = Some("LDAP".into());
-        app.collab_sel = Some(3);
+        let (ctx, mut app) = interactor_app();
+        app.interactor_view.protocol = Some("LDAP".into());
+        app.interactor_sel = Some(3);
         frame(&ctx, &mut app, vec![]);
         assert_eq!(shown(&app), [3]);
 
@@ -3463,12 +3463,12 @@ mod collab_tests {
         click_at(&ctx, &mut app, remove, false);
 
         assert_eq!(
-            app.collab_interactions.iter().map(|h| h.id).collect::<Vec<_>>(),
+            app.interactor_interactions.iter().map(|h| h.id).collect::<Vec<_>>(),
             [1, 2, 4, 5, 6, 7],
             "that interaction and no other was removed"
         );
-        assert_eq!(app.collab_sel, None, "and nothing is left selected");
-        assert_eq!(app.collab_view.protocol, None, "the pill it was the last of took the filter with it");
+        assert_eq!(app.interactor_sel, None, "and nothing is left selected");
+        assert_eq!(app.interactor_view.protocol, None, "the pill it was the last of took the filter with it");
         assert_eq!(shown(&app), [1, 2, 4, 5, 6, 7], "so the table is not left showing nothing");
     }
 
@@ -3476,16 +3476,16 @@ mod collab_tests {
     /// payloads already out in the world go on being collected for.
     #[test]
     fn clear_forgets_the_interactions_and_keeps_the_session() {
-        let (ctx, mut app) = collab_app();
-        app.collab_sel = Some(2);
-        app.collab_view.protocol = Some("DNS".into());
-        let payloads = app.collab_session.as_ref().expect("a session").payloads.clone();
+        let (ctx, mut app) = interactor_app();
+        app.interactor_sel = Some(2);
+        app.interactor_view.protocol = Some("DNS".into());
+        let payloads = app.interactor_session.as_ref().expect("a session").payloads.clone();
 
         click(&ctx, &mut app, "Clear");
-        assert!(app.collab_interactions.is_empty(), "the interactions are gone");
-        assert_eq!(app.collab_sel, None, "nothing is selected any more");
-        assert_eq!(app.collab_view.protocol, None, "and no filter is left pointing at a protocol that is gone");
-        let session = app.collab_session.as_ref().expect("the session stays");
+        assert!(app.interactor_interactions.is_empty(), "the interactions are gone");
+        assert_eq!(app.interactor_sel, None, "nothing is selected any more");
+        assert_eq!(app.interactor_view.protocol, None, "and no filter is left pointing at a protocol that is gone");
+        let session = app.interactor_session.as_ref().expect("the session stays");
         assert_eq!(session.payloads, payloads, "with every payload it handed out");
     }
 
@@ -3493,21 +3493,21 @@ mod collab_tests {
     /// has not been named.
     #[test]
     fn the_auto_poll_toggle_needs_a_relay_to_poll() {
-        let (ctx, mut app) = collab_app();
-        app.collab_server.clear();
+        let (ctx, mut app) = interactor_app();
+        app.interactor_server.clear();
         click(&ctx, &mut app, "Auto-poll");
-        assert!(!app.collab_auto_poll, "nothing to poll, so the timer does not start");
-        assert_eq!(app.collab_msg, "Enter a Collaborator server address first.");
-        assert!(!app.collab_polling, "and no request went out");
+        assert!(!app.interactor_auto_poll, "nothing to poll, so the timer does not start");
+        assert_eq!(app.interactor_msg, "Enter a Interactor server address first.");
+        assert!(!app.interactor_polling, "and no request went out");
 
         // with a relay named it turns on, and turning it off again stops it
-        app.collab_server = "relay.example.com".into();
+        app.interactor_server = "relay.example.com".into();
         click(&ctx, &mut app, "Auto-poll");
-        assert!(app.collab_auto_poll, "the timer is on");
-        app.collab_polling = false;
+        assert!(app.interactor_auto_poll, "the timer is on");
+        app.interactor_polling = false;
         click(&ctx, &mut app, "Auto-poll");
-        assert!(!app.collab_auto_poll, "and off again");
-        assert_eq!(app.collab_last_poll, None);
+        assert!(!app.interactor_auto_poll, "and off again");
+        assert_eq!(app.interactor_last_poll, None);
     }
 
     /// The Time column shows the date, the time and milliseconds, whatever precision the relay
@@ -3530,33 +3530,33 @@ mod collab_tests {
             ("nothing at all", "", ""),
         ];
         assert_table!(cases, |idx, (what, raw, want)| {
-            assert_eq!(collab_time_text(raw), want, "case #{idx} ({what})");
+            assert_eq!(interactor_time_text(raw), want, "case #{idx} ({what})");
         });
 
         // a trailing dot with no digits after it, and text that is not even ASCII: neither is
         // allowed to panic on a byte index
-        assert_eq!(collab_time_text("2026-11-14T09:30:00."), "2026-11-14 09:30:00.000");
-        assert_eq!(collab_time_text("2026-11-14T09:30:00.\u{00e9}Z"), "2026-11-14 09:30:00.000");
-        assert_eq!(collab_time_text("\u{00e9}\u{00e9}\u{00e9}"), "\u{00e9}\u{00e9}\u{00e9}");
-        assert_eq!(collab_time_text("  2026-11-14T09:30:00Z  "), "2026-11-14 09:30:00.000", "surrounding space is trimmed");
+        assert_eq!(interactor_time_text("2026-11-14T09:30:00."), "2026-11-14 09:30:00.000");
+        assert_eq!(interactor_time_text("2026-11-14T09:30:00.\u{00e9}Z"), "2026-11-14 09:30:00.000");
+        assert_eq!(interactor_time_text("\u{00e9}\u{00e9}\u{00e9}"), "\u{00e9}\u{00e9}\u{00e9}");
+        assert_eq!(interactor_time_text("  2026-11-14T09:30:00Z  "), "2026-11-14 09:30:00.000", "surrounding space is trimmed");
     }
 
     /// Shortening the cell is a matter of drawing only: the interaction keeps the timestamp the
     /// relay sent, which is what the table sorts by and what the Details pane shows.
     #[test]
     fn the_full_timestamp_is_kept_for_sorting_and_for_the_details_pane() {
-        let (ctx, mut app) = collab_app();
+        let (ctx, mut app) = interactor_app();
         // two interactions a third of a second apart: the same cell text, a different order
-        app.collab_interactions[0].timestamp = "2026-11-14T11:06:18.237456789Z".into();
-        app.collab_interactions[1].timestamp = "2026-11-14T11:06:18.237111111Z".into();
+        app.interactor_interactions[0].timestamp = "2026-11-14T11:06:18.237456789Z".into();
+        app.interactor_interactions[1].timestamp = "2026-11-14T11:06:18.237111111Z".into();
         assert_eq!(
-            collab_time_text(&app.collab_interactions[0].timestamp),
-            collab_time_text(&app.collab_interactions[1].timestamp),
+            interactor_time_text(&app.interactor_interactions[0].timestamp),
+            interactor_time_text(&app.interactor_interactions[1].timestamp),
             "the cells read the same to a millisecond"
         );
 
-        app.collab_view.sort_column = Some(crate::collab::CollabSortColumn::Time);
-        app.collab_view.sort_ascending = true;
+        app.interactor_view.sort_column = Some(crate::interactor::InteractorSortColumn::Time);
+        app.interactor_view.sort_ascending = true;
         frame(&ctx, &mut app, vec![]);
         let order = shown(&app);
         let (first, second) = (order.iter().position(|&id| id == 2), order.iter().position(|&id| id == 1));
@@ -3566,13 +3566,13 @@ mod collab_tests {
         let at = row_rect(&ctx, &mut app, 1).center();
         click_at(&ctx, &mut app, at, false);
         let update = frame(&ctx, &mut app, vec![]);
-        assert_eq!(app.collab_sel, Some(1));
+        assert_eq!(app.interactor_sel, Some(1));
         assert!(!find_all(&update, "2026-11-14T11:06:18.237456789Z").is_empty(), "the full timestamp is there to read");
     }
 
     /// The detail pane's rect as egui last laid it out.
     fn detail_rect(ctx: &egui::Context) -> egui::Rect {
-        egui::containers::panel::PanelState::load(ctx, egui::Id::new("collab_detail"))
+        egui::containers::panel::PanelState::load(ctx, egui::Id::new("interactor_detail"))
             .map(|s| s.rect)
             .expect("the detail pane is on screen")
     }
@@ -3605,9 +3605,9 @@ mod collab_tests {
     /// contents allowed to insist on their own height would stop it shrinking.
     #[test]
     fn dragging_the_splitter_trades_height_between_the_table_and_the_detail_pane() {
-        let (ctx, mut app) = collab_app();
+        let (ctx, mut app) = interactor_app();
         // interaction #2 carries a request and a response, so the pane is at its fullest
-        app.collab_sel = Some(2);
+        app.interactor_sel = Some(2);
         frame(&ctx, &mut app, vec![]);
 
         let (h0, t0) = (detail_rect(&ctx).height(), table_height(&ctx, &mut app));
@@ -3635,8 +3635,8 @@ mod collab_tests {
             ("callback details, which have no editors in them", 1, -120.0),
         ];
         assert_table!(cases, |idx, (what, id, dy)| {
-            let (ctx, mut app) = collab_app();
-            app.collab_sel = Some(id);
+            let (ctx, mut app) = interactor_app();
+            app.interactor_sel = Some(id);
             let settled = drag_splitter(&ctx, &mut app, dy);
             for n in 0..5 {
                 let now = detail_rect(&ctx).height();
@@ -3657,8 +3657,8 @@ mod collab_tests {
     /// left with nothing.
     #[test]
     fn dragging_the_splitter_to_the_top_still_leaves_a_table() {
-        let (ctx, mut app) = collab_app();
-        app.collab_sel = Some(2);
+        let (ctx, mut app) = interactor_app();
+        app.interactor_sel = Some(2);
         frame(&ctx, &mut app, vec![]);
         drag_splitter(&ctx, &mut app, -2000.0);
         let table = table_height(&ctx, &mut app);
@@ -3674,8 +3674,8 @@ mod collab_tests {
     /// table with only a few rows in it is not left sitting above an empty strip.
     #[test]
     fn nothing_selected_leaves_no_pane_and_no_gap_under_the_table() {
-        let (ctx, mut app) = collab_app();
-        app.collab_sel = None;
+        let (ctx, mut app) = interactor_app();
+        app.interactor_sel = None;
         let update = frame(&ctx, &mut app, vec![]);
         for pane in ["Request", "Response", "Transcript", "Details", "Callback details"] {
             assert!(find_all(&update, pane).is_empty(), "nothing is open, so {pane:?} is not drawn");
@@ -3684,12 +3684,12 @@ mod collab_tests {
         let whole = table_height_to(&ctx, &mut app, header_top);
 
         // opening a row takes that room for the pane, and closing it gives it all back
-        app.collab_sel = Some(2);
+        app.interactor_sel = Some(2);
         frame(&ctx, &mut app, vec![]);
         let shared = table_height(&ctx, &mut app);
         assert!(shared < whole - 100.0, "the open pane takes its room from the table: {whole} -> {shared}");
 
-        app.collab_sel = None;
+        app.interactor_sel = None;
         let update = frame(&ctx, &mut app, vec![]);
         assert!(find_all(&update, "Request").is_empty(), "closing it puts the pane away again");
         let back = table_height_to(&ctx, &mut app, find(&update, "#").top());

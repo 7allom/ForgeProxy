@@ -185,8 +185,12 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
     app.task_sub = 0;
     let (tx, rec) = (app.tx.clone(), app.recorder());
     let opts = app.send_options();
+    let (relay, token) = (app.interactor_server.clone(), app.interactor_token.clone());
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        // Out-of-band wiring: built here on the worker so the relay key pair is made off the
+        // drawing thread. `None` when no Interactor relay is set, which leaves OAST off.
+        let oast = scan::ScanInteractor::configure(&relay, &token);
         let limit = std::time::Duration::from_secs(rules::CRAWL_MAX_TIME_MIN * 60);
         let mut findings = Vec::new();
         let mut queue = std::collections::VecDeque::from([(url.clone(), 0usize)]);
@@ -228,6 +232,15 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
             findings.push(scan::Finding::new(scan::SQL_INJECTION, scan::Confidence::Tentative, &host, &path,
                 &format!("The page showed a database error message ({sig}). That can point to SQL injection and \
                           also reveals details about the database.")));
+        }
+        // Out-of-band audit: plant the canaries, record each probe, settle, poll for callbacks.
+        if let Some(mut oast) = oast {
+            for ex in oast.plant(&url, &opts) {
+                let _ = record_bg(&rec, "Scanner", &ex.method, &ex.url, std::time::Duration::ZERO, &ex.result);
+                requests += 1;
+                let _ = tx.send(Job::ScanProgress { task, requests, line: format!("{} {} — {}", ex.method, ex.url, ex.result.status) });
+            }
+            findings.extend(oast.collect(scan::DEFAULT_OAST_SETTLE, &opts));
         }
         let _ = tx.send(Job::ScanDone { task, findings: scan::consolidate(findings) });
     });
@@ -1052,103 +1065,103 @@ pub fn start_sequencer(app: &mut App) {
 
 /// The session payloads are being handed out under, started if there is none yet or if the
 /// relay has been changed since. Only the identifiers are made here, which is quick; the key
-/// pair that goes with them is generated in the background by [`register_collaborator`],
+/// pair that goes with them is generated in the background by [`register_interactor`],
 /// because that is not.
-pub fn collab_session(app: &mut App) -> &mut crate::collab::OastSession {
-    let server = app.collab_server.trim().to_string();
+pub fn interactor_session(app: &mut App) -> &mut crate::interactor::OastSession {
+    let server = app.interactor_server.trim().to_string();
     let matches = app
-        .collab_session
+        .interactor_session
         .as_ref()
-        .is_some_and(|s| crate::collab::server_host(&s.server) == crate::collab::server_host(&server));
+        .is_some_and(|s| crate::interactor::server_host(&s.server) == crate::interactor::server_host(&server));
     if !matches {
-        app.collab_session = Some(crate::collab::OastSession::begin(&server));
-        app.collab_registering = false;
+        app.interactor_session = Some(crate::interactor::OastSession::begin(&server));
+        app.interactor_registering = false;
     }
-    app.collab_session.as_mut().expect("a session was just put there")
+    app.interactor_session.as_mut().expect("a session was just put there")
 }
 
 /// Register the current session with its relay, off the drawing thread: the key pair takes a
 /// moment to make, and the relay takes another to answer. Does nothing for a session that is
 /// already registered, or while one is being registered.
-pub fn register_collaborator(app: &mut App) {
-    if app.collab_registering || app.collab_server.trim().is_empty() {
+pub fn register_interactor(app: &mut App) {
+    if app.interactor_registering || app.interactor_server.trim().is_empty() {
         return;
     }
-    let session = collab_session(app).clone();
+    let session = interactor_session(app).clone();
     if session.registered {
         return;
     }
-    app.collab_registering = true;
-    let (tx, token, opts) = (app.tx.clone(), app.collab_token.clone(), app.send_options());
+    app.interactor_registering = true;
+    let (tx, token, opts) = (app.tx.clone(), app.interactor_token.clone(), app.send_options());
     std::thread::spawn(move || {
         let mut session = session;
-        let res = session.prepare().and_then(|()| match crate::collab::register(&session, &token, &opts) {
+        let res = session.prepare().and_then(|()| match crate::interactor::register(&session, &token, &opts) {
             Ok(()) => {
                 session.registered = true;
                 Ok(session)
             }
             // a relay with no registration to offer is polled the plain way, and that is not
             // a failure worth reporting: the session stands, unregistered
-            Err(crate::collab::RegisterError::NotSupported(_)) => Ok(session),
-            Err(crate::collab::RegisterError::Failed(m)) => Err(m),
+            Err(crate::interactor::RegisterError::NotSupported(_)) => Ok(session),
+            Err(crate::interactor::RegisterError::Failed(m)) => Err(m),
         });
-        let _ = tx.send(Job::CollabSession(res));
+        let _ = tx.send(Job::InteractorSession(res));
     });
 }
 
-/// Dispatch a background Collaborator poll via `Job::CollabPoll`: it registers a session if
+/// Dispatch a background Interactor poll via `Job::InteractorPoll`: it registers a session if
 /// there is none, collects what has come in, and registers again if the relay has forgotten
 /// the one it had. None of it is recorded in the traffic store -- polling is this app talking
 /// to its own relay, not traffic to a target.
-pub fn poll_collaborator(app: &mut App) {
-    let server = app.collab_server.trim().to_string();
+pub fn poll_interactor(app: &mut App) {
+    let server = app.interactor_server.trim().to_string();
     if server.is_empty() {
-        app.collab_msg = "Enter a Collaborator server address first.".into();
+        app.interactor_msg = "Enter a Interactor server address first.".into();
         return;
     }
-    if app.collab_polling {
+    if app.interactor_polling {
         return;
     }
-    app.collab_polling = true;
-    app.collab_msg = format!("Polling {server}…");
-    let payloads = app.collab_payloads.clone();
-    let session = app.collab_session.clone();
-    let token = app.collab_token.clone();
+    app.interactor_polling = true;
+    app.interactor_msg = format!("Polling {server}…");
+    let payloads = app.interactor_payloads.clone();
+    let session = app.interactor_session.clone();
+    let token = app.interactor_token.clone();
     let opts = app.send_options();
     let tx = app.tx.clone();
     std::thread::spawn(move || {
-        let res = crate::collab::run_poll(session, &server, &token, &payloads, &opts);
-        let _ = tx.send(Job::CollabPoll(res));
+        let res = crate::interactor::run_poll(session, &server, &token, &payloads, &opts);
+        let _ = tx.send(Job::InteractorPoll(res));
     });
 }
 
 
-/// Drive the Collaborator poll timer. Called once a frame from the Collaborator tab, so the
+/// Drive the Interactor poll timer. Called once a frame from the Interactor tab, so the
 /// timer only runs while that tab is on screen: it starts a poll off the drawing thread once
 /// the interval has passed, and asks for the frame that will start the next one, so polling
 /// goes on without the user touching anything.
 ///
-/// A failed poll or registration switches `collab_auto_poll` off where the failure is
+/// A failed poll or registration switches `interactor_auto_poll` off where the failure is
 /// reported, so a relay that has gone away is asked once and not every ten seconds.
-pub fn collab_auto_poll_tick(app: &mut App, ctx: &eframe::egui::Context) {
-    if !app.collab_auto_poll {
-        app.collab_last_poll = None;
+pub fn interactor_auto_poll_tick(app: &mut App, ctx: &eframe::egui::Context) {
+    if !app.interactor_auto_poll {
+        app.interactor_last_poll = None;
         return;
     }
-    if app.collab_server.trim().is_empty() {
+    if app.interactor_server.trim().is_empty() {
         // there is nothing to poll, and asking every ten seconds would say so every ten
         // seconds: say it once and stop the timer
-        app.collab_auto_poll = false;
-        app.collab_last_poll = None;
-        app.collab_msg = "Enter a Collaborator server address first.".into();
+        app.interactor_auto_poll = false;
+        app.interactor_last_poll = None;
+        app.interactor_msg = "Enter a Interactor server address first.".into();
         return;
     }
-    // Settings > Collaborator: how long to wait between polls
-    let every = Duration::from_secs(app.settings.collab_poll_secs.max(1));
-    let due = app.collab_last_poll.is_none_or(|t| t.elapsed() >= every);
-    if due && !app.collab_polling {
-        app.collab_last_poll = Some(std::time::Instant::now());
-        poll_collaborator(app);
+    // Settings > Interactor: how long to wait between polls
+    let every = Duration::from_secs(app.settings.interactor_poll_secs.max(1));
+    let due = app.interactor_last_poll.is_none_or(|t| t.elapsed() >= every);
+    if due && !app.interactor_polling {
+        app.interactor_last_poll = Some(std::time::Instant::now());
+        poll_interactor(app);
     }
     // a poll in flight already keeps the frames coming; this is for the wait between them
     ctx.request_repaint_after(every);
@@ -1157,7 +1170,7 @@ pub fn collab_auto_poll_tick(app: &mut App, ctx: &eframe::egui::Context) {
 /// The address an out-of-band interaction stands for, as the rest of the app reads one: the
 /// payload's hostname, over the scheme the interaction came in on. Empty when the relay named
 /// neither a payload nor an identifier.
-pub fn collab_interaction_url(hit: &crate::collab::CollabInteraction) -> String {
+pub fn interactor_interaction_url(hit: &crate::interactor::InteractorInteraction) -> String {
     let host = match hit.payload.trim() {
         "" => hit.unique_id.trim(),
         payload => payload,
@@ -1165,7 +1178,7 @@ pub fn collab_interaction_url(hit: &crate::collab::CollabInteraction) -> String 
     if host.is_empty() {
         return String::new();
     }
-    let scheme = match crate::collab::normalize_protocol(&hit.interaction_type).as_str() {
+    let scheme = match crate::interactor::normalize_protocol(&hit.interaction_type).as_str() {
         "HTTPS" | "FTPS" | "SMTPS" => "https",
         _ => "http",
     };
@@ -1173,22 +1186,22 @@ pub fn collab_interaction_url(hit: &crate::collab::CollabInteraction) -> String 
 }
 
 /// Open the transcript a relay captured in the Repeater, to be sent again by hand.
-pub fn send_collab_to_repeater(app: &mut App, hit: &crate::collab::CollabInteraction) {
-    let url = collab_interaction_url(hit);
+pub fn send_interactor_to_repeater(app: &mut App, hit: &crate::interactor::InteractorInteraction) {
+    let url = interactor_interaction_url(hit);
     let method = request_method(&hit.raw_request).unwrap_or_else(|| "GET".to_string());
     send_to_repeater(app, &method, &url, &hit.raw_request);
 }
 
 /// Keep the transcript a relay captured in the Organizer, with whatever was answered.
-pub fn send_collab_to_organizer(app: &mut App, hit: &crate::collab::CollabInteraction) {
-    let url = collab_interaction_url(hit);
+pub fn send_interactor_to_organizer(app: &mut App, hit: &crate::interactor::InteractorInteraction) {
+    let url = interactor_interaction_url(hit);
     send_to_organizer(app, &url, &hit.raw_request, &hit.raw_response);
 }
 
 /// Open what the interaction carried in the Decoder: the transcript when there is one, and the
 /// payload that fired otherwise -- a lookup carries no message, but its hostname is the thing
 /// worth taking apart.
-pub fn send_collab_to_decoder(app: &mut App, hit: &crate::collab::CollabInteraction) {
+pub fn send_interactor_to_decoder(app: &mut App, hit: &crate::interactor::InteractorInteraction) {
     let text = match hit.raw_request.trim().is_empty() {
         false => hit.raw_request.clone(),
         true => hit.payload.clone(),

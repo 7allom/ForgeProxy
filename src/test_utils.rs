@@ -276,3 +276,123 @@ impl HttpFixture {
         }
     }
 }
+
+// ---- Out-of-band (OAST) mock relay + target ------------------------------
+
+/// A mock target application and a mock Interactor relay, wired together, for exercising the
+/// scanner's out-of-band auditing end to end.
+///
+/// The target records every correlation token it is sent (the long label a canary carries).
+/// The relay reports an interaction for any token the target has seen -- which is exactly what
+/// a real back-end resolving a canary would cause -- and otherwise reports nothing. The relay
+/// answers `/register` with 404 so the scanner polls it in the plain, unencrypted way.
+pub struct OastMocks {
+    /// `http://host:port` of the mock target to point a scan at.
+    pub target: String,
+    /// `host:port` of the mock relay, as an `--interactor` value.
+    pub relay: String,
+    /// The correlation tokens the target has been sent, newest last.
+    pub seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Every maximal run of lowercase letters and digits at least 20 long: the shape a canary's
+/// correlation label has, and nothing shorter in a request looks like one.
+fn correlation_tokens(raw: &str) -> Vec<String> {
+    let decoded = crate::codec::url_decode(raw);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in decoded.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            cur.push(c);
+        } else {
+            if cur.len() >= 20 {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    out
+}
+
+/// Read one HTTP request off a stream: the head, and the body named by Content-Length.
+fn read_http_request(stream: &std::net::TcpStream) -> (String, String) {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    let clen = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; clen];
+    let _ = reader.read_exact(&mut body);
+    (head, String::from_utf8_lossy(&body).into_owned())
+}
+
+impl OastMocks {
+    pub fn start() -> Self {
+        use std::io::Write;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // The target: record any correlation token it is sent, then answer plainly.
+        let target_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}", target_listener.local_addr().unwrap());
+        let seen_t = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in target_listener.incoming().flatten() {
+                let (head, body) = read_http_request(&stream);
+                for tok in correlation_tokens(&format!("{head}{body}")) {
+                    seen_t.lock().unwrap().push(tok);
+                }
+                let mut stream = stream;
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+
+        // The relay: 404 to /register (so it is polled the plain way), and an interaction for
+        // any polled id the target has already seen.
+        let relay_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = relay_listener.local_addr().unwrap().to_string();
+        let seen_r = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in relay_listener.incoming().flatten() {
+                let (head, _) = read_http_request(&stream);
+                let line = head.lines().next().unwrap_or("");
+                let path = line.split_whitespace().nth(1).unwrap_or("");
+                let (code, payload) = if line.starts_with("POST") {
+                    (404, String::new())
+                } else {
+                    let id = path.split("id=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
+                    let fired = !id.is_empty() && seen_r.lock().unwrap().iter().any(|t| t == id);
+                    if fired {
+                        (200, format!(
+                            "[{{\"protocol\":\"DNS\",\"q-type\":\"A\",\"remote-address\":\"203.0.113.9\",\
+                             \"time\":\"2026-11-17T10:00:00Z\",\"unique-id\":\"{id}\",\"full-id\":\"{id}\"}}]"
+                        ))
+                    } else {
+                        (200, "[]".to_string())
+                    }
+                };
+                let reason = if code == 200 { "OK" } else { "Not Found" };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let mut stream = stream;
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        OastMocks { target, relay, seen }
+    }
+}

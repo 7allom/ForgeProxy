@@ -39,18 +39,18 @@ pub struct ProjectFile {
     /// takes the default from Settings; `Some("")` in one where the relay was cleared on
     /// purpose, which is left cleared.
     #[serde(default)]
-    pub collab_server: Option<String>,
+    pub interactor_server: Option<String>,
     /// The token a protected relay asks for, the session registered with it, the payloads
     /// handed out and what has come back. Absent from files saved before any of this, which
     /// open with no session and nothing collected.
     #[serde(default)]
-    pub collab_token: String,
+    pub interactor_token: String,
     #[serde(default)]
-    pub collab_session: Option<crate::collab::OastSession>,
+    pub interactor_session: Option<crate::interactor::OastSession>,
     #[serde(default)]
-    pub collab_payloads: Vec<String>,
+    pub interactor_payloads: Vec<String>,
     #[serde(default)]
-    pub collab_interactions: Vec<crate::collab::CollabInteraction>,
+    pub interactor_interactions: Vec<crate::interactor::InteractorInteraction>,
     /// "Default Proxy interception state": applied when the project is opened.
     #[serde(default)]
     pub intercept_at_startup: bool,
@@ -101,11 +101,11 @@ pub fn snapshot(app: &App) -> ProjectFile {
         intruder_template: app.int_template.clone(),
         intruder_payloads: app.int_payloads.clone(),
         intruder_payloads_b: app.int_payloads_b.clone(),
-        collab_server: Some(app.collab_server.clone()),
-        collab_token: app.collab_token.clone(),
-        collab_session: app.collab_session.clone(),
-        collab_payloads: app.collab_payloads.clone(),
-        collab_interactions: app.collab_interactions.clone(),
+        interactor_server: Some(app.interactor_server.clone()),
+        interactor_token: app.interactor_token.clone(),
+        interactor_session: app.interactor_session.clone(),
+        interactor_payloads: app.interactor_payloads.clone(),
+        interactor_interactions: app.interactor_interactions.clone(),
         intercept_at_startup: app.intercept_default,
         intercept_only_in_scope: app.intercept_only_in_scope,
         tls_passthrough: app.tls_passthrough.clone(),
@@ -181,8 +181,8 @@ pub fn apply_settings(app: &mut App, f: &ProjectFile) {
 /// to how a fresh start has it (app preferences, the proxy listener and the CA stay).
 /// The relay a project starts on when it names none: the one set in Settings, or nothing.
 fn default_relay(app: &App) -> String {
-    let configured = app.settings.collab_default_server.trim();
-    if configured.is_empty() { crate::collab::DEFAULT_SERVER.to_string() } else { configured.to_string() }
+    let configured = app.settings.interactor_default_server.trim();
+    if configured.is_empty() { crate::interactor::DEFAULT_SERVER.to_string() } else { configured.to_string() }
 }
 
 pub fn reset(app: &mut App) {
@@ -220,18 +220,18 @@ pub fn reset(app: &mut App) {
     app.int_payloads.clear();
     app.int_payloads_b.clear();
     app.int_results.clear();
-    app.collab_server = default_relay(app);
-    app.collab_token.clear();
-    app.collab_session = None;
-    app.collab_registering = false;
-    app.collab_sel = None;
-    app.collab_payloads.clear();
-    app.collab_interactions.clear();
-    app.collab_polling = false;
-    app.collab_auto_poll = false;
-    app.collab_last_poll = None;
-    app.collab_view = crate::collab::CollabView::default();
-    app.collab_msg.clear();
+    app.interactor_server = default_relay(app);
+    app.interactor_token.clear();
+    app.interactor_session = None;
+    app.interactor_registering = false;
+    app.interactor_sel = None;
+    app.interactor_payloads.clear();
+    app.interactor_interactions.clear();
+    app.interactor_polling = false;
+    app.interactor_auto_poll = false;
+    app.interactor_last_poll = None;
+    app.interactor_view = crate::interactor::InteractorView::default();
+    app.interactor_msg.clear();
     app.decoder_pending_delete = None;
     app.project_name.clear();
     app.project_path = None;
@@ -283,22 +283,22 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     // world answer to that correlation id and no other
     // a relay the file names is the project's own, cleared or not; only a file that never
     // carried the field falls back to the workstation default
-    app.collab_server = match f.collab_server {
+    app.interactor_server = match f.interactor_server {
         Some(named) => named,
         None => default_relay(app),
     };
-    app.collab_token = f.collab_token;
-    app.collab_session = f.collab_session;
-    app.collab_registering = false;
-    app.collab_sel = None;
-    app.collab_payloads = f.collab_payloads;
-    app.collab_interactions = f.collab_interactions;
+    app.interactor_token = f.interactor_token;
+    app.interactor_session = f.interactor_session;
+    app.interactor_registering = false;
+    app.interactor_sel = None;
+    app.interactor_payloads = f.interactor_payloads;
+    app.interactor_interactions = f.interactor_interactions;
     // a project saved before interactions had ids reads them all back as 0; the table
     // addresses rows by id, so give them one before anything draws
-    crate::collab::renumber(&mut app.collab_interactions);
-    app.collab_auto_poll = false;
-    app.collab_last_poll = None;
-    app.collab_view = crate::collab::CollabView::default();
+    crate::interactor::renumber(&mut app.interactor_interactions);
+    app.interactor_auto_poll = false;
+    app.interactor_last_poll = None;
+    app.interactor_view = crate::interactor::InteractorView::default();
     // the project's default interception state takes effect as it opens
     app.intercept_default = f.intercept_at_startup;
     if app.proxy.intercept.load(std::sync::atomic::Ordering::SeqCst) != app.intercept_default {
@@ -441,7 +441,7 @@ mod tests {
                 {"method":"GET","host":"shop.test","path":"/cart","note":"had a look","highlight":2,"status":"Postponed"},
                 {"method":"POST","host":"api.test","path":"/login","note":"","highlight":null,"status":"New"}
             ],
-            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#;
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}"#;
         let f: ProjectFile = serde_json::from_str(old).expect("an older project file still reads");
         assert_eq!(f.org_collections, crate::organizer::default_collections(), "the inbox stands in for the collections it has none of");
 
@@ -482,19 +482,19 @@ mod tests {
     /// into does: a project reopened next week has to be able to go on collecting for them,
     /// which it can only do with the same correlation id and the same key.
     #[test]
-    fn a_project_keeps_the_collaborator_session_and_what_it_caught() {
+    fn a_project_keeps_the_interactor_session_and_what_it_caught() {
         let ctx = eframe::egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx);
         let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
-        app.collab_server = "relay.test".into();
-        app.collab_token = "s3cret".into();
-        let mut session = crate::collab::OastSession::begin("relay.test");
+        app.interactor_server = "relay.test".into();
+        app.interactor_token = "s3cret".into();
+        let mut session = crate::interactor::OastSession::begin("relay.test");
         session.prepare().expect("a session key");
         session.registered = true;
         let payload = session.new_payload("Login Flow", true);
-        app.collab_payloads.push(payload.clone());
-        app.collab_session = Some(session.clone());
-        app.collab_interactions.push(crate::collab::CollabInteraction {
+        app.interactor_payloads.push(payload.clone());
+        app.interactor_session = Some(session.clone());
+        app.interactor_interactions.push(crate::interactor::InteractorInteraction {
             id: 1,
             interaction_type: "DNS".into(),
             client_ip: "203.0.113.7".into(),
@@ -517,16 +517,16 @@ mod tests {
         };
         apply_all(&mut loaded, back);
 
-        assert_eq!(loaded.collab_server, "relay.test");
-        assert_eq!(loaded.collab_token, "s3cret");
-        assert_eq!(loaded.collab_payloads, [payload.clone()]);
-        let kept = loaded.collab_session.as_ref().expect("the session came back");
+        assert_eq!(loaded.interactor_server, "relay.test");
+        assert_eq!(loaded.interactor_token, "s3cret");
+        assert_eq!(loaded.interactor_payloads, [payload.clone()]);
+        let kept = loaded.interactor_session.as_ref().expect("the session came back");
         assert_eq!(kept, &session, "the whole session: its ids, its key and the payloads it handed out");
         assert!(kept.private_key_pem.contains("PRIVATE KEY"), "with the key that can still read what the relay sends");
         assert_eq!(kept.payloads[0].custom_data, "login-flow");
 
 
-        let hits = &loaded.collab_interactions;
+        let hits = &loaded.interactor_interactions;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].raw_request, ";; QUESTION\nlogin-flow.relay.test. IN A", "the message it carried");
         assert_eq!(hits[0].raw_response, ";; ANSWER\nlogin-flow.relay.test. 60 IN A 203.0.113.1");
@@ -538,20 +538,20 @@ mod tests {
     /// A project saved before any of this opens with no session and nothing collected, on
     /// the relay a new project starts on.
     #[test]
-    fn a_project_from_before_the_collaborator_session_opens_clean() {
+    fn a_project_from_before_the_interactor_session_opens_clean() {
         let old = r#"{"version":1,"name":"o","match_replace":[],"history":[],"tasks":[],"organizer":[],
-            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#;
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}"#;
         let f: ProjectFile = serde_json::from_str(old).expect("an older project file still reads");
-        assert!(f.collab_session.is_none());
-        assert!(f.collab_interactions.is_empty());
+        assert!(f.interactor_session.is_none());
+        assert!(f.interactor_interactions.is_empty());
 
         let ctx = eframe::egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx);
         let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
         apply_all(&mut app, f);
-        assert_eq!(app.collab_server, crate::collab::DEFAULT_SERVER, "a file with no server named opens on the one a new project uses");
-        assert!(app.collab_session.is_none());
-        assert!(app.collab_token.is_empty());
+        assert_eq!(app.interactor_server, crate::interactor::DEFAULT_SERVER, "a file with no server named opens on the one a new project uses");
+        assert!(app.interactor_session.is_none());
+        assert!(app.interactor_token.is_empty());
     }
 
     #[cfg(unix)]
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(back.tls_passthrough, ["*.pinned.test"]);
         // projects saved before the setting existed load with it off
         let old: ProjectFile = serde_json::from_str(r#"{"version":1,"name":"o","scope_include":[],"scope_exclude":[],"scope_advanced":false,"match_replace":[],"history":[],"tasks":[],"organizer":[],
-            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","collab_server":""}"#).unwrap();
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}"#).unwrap();
         assert!(!old.intercept_only_in_scope);
         assert!(old.tls_passthrough.is_empty());
         assert_eq!(old.skip_extensions, crate::rules::default_skip_extensions(), "older files get the default list");
@@ -595,7 +595,7 @@ mod tests {
         let json = r#"{"version":1,"name":"old","scope_include":[{"enabled":true,"prefix":"https://a.test/","subdomains":true}],
             "scope_exclude":[],"scope_advanced":false,"match_replace":[],"history":[],"tasks":[],"organizer":[],
             "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"","intruder_payloads":"",
-            "intruder_payloads_b":"","collab_server":""}"#;
+            "intruder_payloads_b":"","interactor_server":""}"#;
         let f: ProjectFile = serde_json::from_str(json).unwrap();
         let s = f.scope();
         assert_eq!(s.include.len(), 1);
@@ -737,11 +737,11 @@ mod tests {
                         "status":"200 OK","length":2,"mime":"text/html",
                         "request":"GET /pay HTTP/1.1\nHost: shop.test\n\n","response":"HTTP/1.1 200 OK\n\nok"}],
             "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
-            "intruder_payloads":"","intruder_payloads_b":"","collab_server":"relay.test"}"#;
+            "intruder_payloads":"","intruder_payloads_b":"","interactor_server":"relay.test"}"#;
         let f: ProjectFile = serde_json::from_str(old).expect("a file naming the old view still reads");
         assert_eq!(f.name, "older", "the project's own fields came through");
         assert_eq!(f.history.len(), 1, "and so did its traffic");
-        assert_eq!(f.collab_server.as_deref(), Some("relay.test"));
+        assert_eq!(f.interactor_server.as_deref(), Some("relay.test"));
 
         // and it applies to a running app, with the traffic where the Logger will find it
         let ctx = egui::Context::default();
@@ -760,7 +760,7 @@ mod tests {
     fn the_project_file_passes_over_fields_it_does_not_know() {
         let with_junk = r#"{"version":1,"name":"n","match_replace":[],"history":[],"tasks":[],"organizer":[],
             "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
-            "intruder_payloads":"","intruder_payloads_b":"","collab_server":"",
+            "intruder_payloads":"","intruder_payloads_b":"","interactor_server":"",
             "a_setting_from_a_later_build":{"nested":[1,2,3]},"another":"x"}"#;
         let f: ProjectFile = serde_json::from_str(with_junk).expect("unknown fields are passed over");
         assert_eq!(f.name, "n");
@@ -789,10 +789,10 @@ mod tests {
             let ctx = egui::Context::default();
             let cc = eframe::CreationContext::_new_kittest(ctx);
             let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
-            app.settings.collab_default_server = case.configured.to_string();
+            app.settings.interactor_default_server = case.configured.to_string();
 
             let relay = match case.in_file {
-                Some(named) => format!(r#","collab_server":"{named}""#),
+                Some(named) => format!(r#","interactor_server":"{named}""#),
                 None => String::new(),
             };
             let text = format!(
@@ -802,7 +802,7 @@ mod tests {
             );
             let f: ProjectFile = serde_json::from_str(&text).expect("the project file reads");
             apply_all(&mut app, f);
-            assert_eq!(app.collab_server, case.want, "case #{idx} ({})", case.name);
+            assert_eq!(app.interactor_server, case.want, "case #{idx} ({})", case.name);
         });
     }
 
@@ -812,14 +812,14 @@ mod tests {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx);
         let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
-        app.settings.collab_default_server = "default.example.com".into();
-        app.collab_server = "something.else".into();
+        app.settings.interactor_default_server = "default.example.com".into();
+        app.interactor_server = "something.else".into();
         reset(&mut app);
-        assert_eq!(app.collab_server, "default.example.com", "a new project opens on the default");
+        assert_eq!(app.interactor_server, "default.example.com", "a new project opens on the default");
 
-        app.settings.collab_default_server.clear();
-        app.collab_server = "something.else".into();
+        app.settings.interactor_default_server.clear();
+        app.interactor_server = "something.else".into();
         reset(&mut app);
-        assert_eq!(app.collab_server, "", "and on nothing when none is set");
+        assert_eq!(app.interactor_server, "", "and on nothing when none is set");
     }
 }

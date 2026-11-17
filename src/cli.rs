@@ -1016,13 +1016,18 @@ Options:
   --report <path>        Write the issues to this file (.xml for XML, else HTML).
   --fail-on-findings     Exit 2 when the scan reports one issue or more.
   --json                 Print the findings as JSON instead of a table.
+  --interactor <server>  Interactor relay for out-of-band (blind) checks. Defaults to the one
+                         set in settings.json.
+  --interactor-token <t> Authorization token for a relay that requires one.
+  --oast-settle-ms <n>   Wait this long after the out-of-band probes before polling the relay
+                         (default 2000).
   --config <dir>         Read settings.json from here.
 ";
 
 fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let parsed = match SubArgs::parse(
         argv,
-        &["--depth", "--max-pages", "--project", "--report", "--config"],
+        &["--depth", "--max-pages", "--project", "--report", "--config", "--interactor", "--interactor-token", "--oast-settle-ms"],
         &["--crawl", "--fail-on-findings", "--json"],
         &[],
     ) {
@@ -1046,12 +1051,24 @@ fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Ok(n) => n.max(1),
             Err(e) => return refuse(err, &e),
         },
+        oast_settle: match parsed.number("--oast-settle-ms", crate::scan::ScanLimits::default().oast_settle.as_millis() as usize) {
+            Ok(n) => std::time::Duration::from_millis(n as u64),
+            Err(e) => return refuse(err, &e),
+        },
     };
     let settings = settings_of_config(&parsed, err);
     let opts = settings.send_options();
     let crawl = parsed.has("--crawl");
+    // An Interactor relay from the flag, else the one settings name; absent means no out-of-band
+    // probing at all.
+    let relay = parsed.value("--interactor").map(str::to_string).unwrap_or_else(|| settings.interactor_default_server.clone());
+    let token = parsed.value("--interactor-token").unwrap_or("");
+    let oast = crate::scan::ScanInteractor::configure(&relay, token);
+    if oast.is_some() {
+        let _ = writeln!(err, "Out-of-band checks via {}...", crate::interactor::server_host(&relay));
+    }
     let _ = writeln!(err, "{} {url}...", if crawl { "Crawling and auditing" } else { "Auditing" });
-    let outcome = crate::scan::run_scan(url, crawl, limits, &opts, &mut |line| {
+    let outcome = crate::scan::run_scan(url, crawl, limits, oast, &opts, &mut |line| {
         let _ = writeln!(err, "  {line}");
     });
 
@@ -3138,6 +3155,24 @@ mod subcommand_tests {
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("needs a URL"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// scan given an Interactor relay plants out-of-band canaries, polls the relay, and turns a
+    /// callback into a reported finding that drives the --fail-on-findings exit code to 2.
+    #[test]
+    fn scan_reports_out_of_band_callbacks_and_fails_on_them() {
+        let mocks = crate::test_utils::OastMocks::start();
+        let url = format!("{}/app", mocks.target);
+
+        let (code, out, _) = run(
+            sub_scan,
+            &[&url, "--json", "--fail-on-findings", "--interactor", &mocks.relay, "--oast-settle-ms", "150"],
+        );
+        assert_eq!(code, EXIT_FINDINGS, "an out-of-band callback is a finding, so --fail-on-findings exits 2: {out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let names: Vec<&str> = v["findings"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str()).collect();
+        assert!(names.iter().any(|n| n.contains("SSRF")), "the SSRF callback is reported: {names:?}");
+        assert!(!mocks.seen.lock().unwrap().is_empty(), "canaries reached the target");
     }
 
     // ---- proxy ----------------------------------------------------------

@@ -171,7 +171,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     info(Action::GoTo(Tab::Proxy), "go_proxy", "Switch to Proxy", Binding::ctrl_shift(Key::P)),
     info(Action::GoTo(Tab::Intruder), "go_intruder", "Switch to Intruder", Binding::ctrl_shift(Key::I)),
     info(Action::GoTo(Tab::Repeater), "go_repeater", "Switch to Repeater", Binding::ctrl_shift(Key::R)),
-    info(Action::GoTo(Tab::Collaborator), "go_collaborator", "Switch to Collaborator", Binding::ctrl_shift(Key::C)),
+    info(Action::GoTo(Tab::Interactor), "go_interactor", "Switch to Interactor", Binding::ctrl_shift(Key::C)),
     info(Action::GoTo(Tab::Sequencer), "go_sequencer", "Switch to Sequencer", Binding::ctrl_shift(Key::S)),
     info(Action::GoTo(Tab::Decoder), "go_decoder", "Switch to Decoder", Binding::ctrl_shift(Key::E)),
     info(Action::GoTo(Tab::Comparer), "go_comparer", "Switch to Comparer", Binding::ctrl_shift(Key::M)),

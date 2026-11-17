@@ -39,7 +39,7 @@ pub fn decode(payload: &str) -> Option<(u64, String)> {
     Some((n.parse().ok()?, custom.to_string()))
 }
 
-/// Extract the bare payload identifier from a Collaborator payload (stripping server domain/IP).
+/// Extract the bare payload identifier from a Interactor payload (stripping server domain/IP).
 pub fn payload_id(payload: &str) -> &str {
     let trimmed = payload.trim();
     trimmed
@@ -62,7 +62,7 @@ where
 
 /// One out-of-band interaction returned by a relay polling endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CollabInteraction {
+pub struct InteractorInteraction {
     /// The number this interaction is addressed by for as long as it is kept: row selection,
     /// sorting, filtering and the arrow keys all name an interaction by this, so none of them
     /// can come to mean a different one when the table is re-sorted or narrowed. Assigned when
@@ -119,7 +119,7 @@ pub struct CollabInteraction {
     pub unique_id: String,
 }
 
-impl CollabInteraction {
+impl InteractorInteraction {
     /// The one line the table shows about what happened: what a lookup asked for, or the
     /// first line of the request that came in.
     pub fn summary(&self) -> String {
@@ -162,14 +162,14 @@ pub fn normalize_protocol(raw: &str) -> String {
 
 /// The id to give the next interaction, one past the highest in use. Ids are never reused, so
 /// a selection cannot come to mean a different interaction after a removal.
-pub fn next_interaction_id(hits: &[CollabInteraction]) -> usize {
+pub fn next_interaction_id(hits: &[InteractorInteraction]) -> usize {
     hits.iter().map(|h| h.id).max().unwrap_or(0) + 1
 }
 
 /// Give every interaction an id of its own, for interactions read from a project saved before
 /// they had one (they all read back as 0). Interactions that already have distinct ids are
 /// left as they are.
-pub fn renumber(hits: &mut [CollabInteraction]) {
+pub fn renumber(hits: &mut [InteractorInteraction]) {
     let mut seen = std::collections::HashSet::new();
     if hits.iter().all(|h| h.id != 0 && seen.insert(h.id)) {
         return;
@@ -183,7 +183,7 @@ pub fn renumber(hits: &mut [CollabInteraction]) {
 /// [`KNOWN_PROTOCOLS`] gives and anything else after them in alphabetical order. This is what
 /// the filter bar is built from, so a relay reporting something new gets a pill of its own
 /// without a line of code changing.
-pub fn protocols(hits: &[CollabInteraction]) -> Vec<String> {
+pub fn protocols(hits: &[InteractorInteraction]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for hit in hits {
         let name = normalize_protocol(&hit.interaction_type);
@@ -197,14 +197,14 @@ pub fn protocols(hits: &[CollabInteraction]) -> Vec<String> {
 }
 
 /// How many of these interactions are of this protocol.
-pub fn protocol_count(hits: &[CollabInteraction], protocol: &str) -> usize {
+pub fn protocol_count(hits: &[InteractorInteraction], protocol: &str) -> usize {
     hits.iter().filter(|h| normalize_protocol(&h.interaction_type) == protocol).count()
 }
 
 /// The label the payload behind this interaction was handed out under, or empty when the
 /// session never handed out a payload matching it -- an interaction collected by an earlier
 /// session, or one for a payload generated without a label.
-pub fn label_of(session: Option<&OastSession>, hit: &CollabInteraction) -> String {
+pub fn label_of(session: Option<&OastSession>, hit: &InteractorInteraction) -> String {
     session
         .and_then(|s| s.label_for(&hit.unique_id))
         .map(|p| p.custom_data.clone())
@@ -213,7 +213,7 @@ pub fn label_of(session: Option<&OastSession>, hit: &CollabInteraction) -> Strin
 
 /// Which column the interactions table is sorted by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CollabSortColumn {
+pub enum InteractorSortColumn {
     Index,
     Time,
     Type,
@@ -226,31 +226,31 @@ pub enum CollabSortColumn {
 /// What the interactions table shows: the protocol pill that is on, the search box, and the
 /// column it is sorted by.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CollabView {
+pub struct InteractorView {
     /// Matched against an interaction's payload, label, address and comment, ignoring case.
     pub search: String,
     /// The one protocol being shown, or `None` for all of them.
     pub protocol: Option<String>,
-    pub sort_column: Option<CollabSortColumn>,
+    pub sort_column: Option<InteractorSortColumn>,
     pub sort_ascending: bool,
 }
 
-impl Default for CollabView {
+impl Default for InteractorView {
     fn default() -> Self {
         Self {
             search: String::new(),
             protocol: None,
             // the order interactions arrived in, which is what an untouched table shows
-            sort_column: Some(CollabSortColumn::Index),
+            sort_column: Some(InteractorSortColumn::Index),
             sort_ascending: true,
         }
     }
 }
 
-impl CollabView {
+impl InteractorView {
     /// Click on a column header: the same column flips the order, another one sorts by it
     /// ascending. The same rule the traffic tables follow.
-    pub fn click_column(&mut self, col: CollabSortColumn) {
+    pub fn click_column(&mut self, col: InteractorSortColumn) {
         if self.sort_column == Some(col) {
             self.sort_ascending = !self.sort_ascending;
         } else {
@@ -265,7 +265,7 @@ impl CollabView {
     }
 
     /// Does this interaction pass the filters?
-    pub fn matches(&self, session: Option<&OastSession>, hit: &CollabInteraction) -> bool {
+    pub fn matches(&self, session: Option<&OastSession>, hit: &InteractorInteraction) -> bool {
         if let Some(want) = &self.protocol {
             if normalize_protocol(&hit.interaction_type) != *want {
                 return false;
@@ -282,7 +282,7 @@ impl CollabView {
     /// Drop a protocol filter whose protocol is no longer among the interactions, so that
     /// clearing the table (or removing the last interaction of a kind) cannot leave the table
     /// filtered to a pill that is not on screen any more and so showing nothing at all.
-    pub fn reconcile(&mut self, hits: &[CollabInteraction]) {
+    pub fn reconcile(&mut self, hits: &[InteractorInteraction]) {
         if let Some(want) = &self.protocol {
             if !hits.iter().any(|h| normalize_protocol(&h.interaction_type) == *want) {
                 self.protocol = None;
@@ -297,7 +297,7 @@ impl CollabView {
 /// Every row the table draws comes from here, and a row stands for `hits[index]` however the
 /// table is sorted or filtered -- which is what keeps a click on a row, the arrow keys and the
 /// detail pane under it all pointing at the same interaction.
-pub fn rows(hits: &[CollabInteraction], session: Option<&OastSession>, view: &CollabView) -> Vec<usize> {
+pub fn rows(hits: &[InteractorInteraction], session: Option<&OastSession>, view: &InteractorView) -> Vec<usize> {
     let mut rows: Vec<usize> = hits.iter().enumerate().filter(|(_, h)| view.matches(session, h)).map(|(i, _)| i).collect();
     if let Some(col) = view.sort_column {
         sort_rows(hits, session, &mut rows, col, view.sort_ascending);
@@ -307,18 +307,18 @@ pub fn rows(hits: &[CollabInteraction], session: Option<&OastSession>, view: &Co
 
 /// Sort row indices by `col`, falling back to the order the interactions arrived in so that
 /// equal values keep a fixed order whichever way the column is sorted.
-fn sort_rows(hits: &[CollabInteraction], session: Option<&OastSession>, rows: &mut [usize], col: CollabSortColumn, ascending: bool) {
+fn sort_rows(hits: &[InteractorInteraction], session: Option<&OastSession>, rows: &mut [usize], col: InteractorSortColumn, ascending: bool) {
     let text = |a: &str, b: &str| a.to_lowercase().cmp(&b.to_lowercase());
     rows.sort_by(|&x, &y| {
         let (a, b) = (&hits[x], &hits[y]);
         let primary = match col {
-            CollabSortColumn::Index => a.id.cmp(&b.id),
-            CollabSortColumn::Time => text(&a.timestamp, &b.timestamp),
-            CollabSortColumn::Type => text(&a.interaction_type, &b.interaction_type),
-            CollabSortColumn::Payload => text(&a.payload, &b.payload),
-            CollabSortColumn::Label => text(&label_of(session, a), &label_of(session, b)),
-            CollabSortColumn::SourceIp => text(&a.client_ip, &b.client_ip),
-            CollabSortColumn::Comment => text(&a.comment, &b.comment),
+            InteractorSortColumn::Index => a.id.cmp(&b.id),
+            InteractorSortColumn::Time => text(&a.timestamp, &b.timestamp),
+            InteractorSortColumn::Type => text(&a.interaction_type, &b.interaction_type),
+            InteractorSortColumn::Payload => text(&a.payload, &b.payload),
+            InteractorSortColumn::Label => text(&label_of(session, a), &label_of(session, b)),
+            InteractorSortColumn::SourceIp => text(&a.client_ip, &b.client_ip),
+            InteractorSortColumn::Comment => text(&a.comment, &b.comment),
         };
         let primary = if ascending { primary } else { primary.reverse() };
         primary.then(x.cmp(&y))
@@ -327,17 +327,17 @@ fn sort_rows(hits: &[CollabInteraction], session: Option<&OastSession>, rows: &m
 
 /// Envelope returned by a relay JSON polling endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CollabPollResponse {
+pub struct InteractorPollResponse {
     #[serde(default, deserialize_with = "null_to_default", alias = "responses", alias = "data", alias = "events")]
-    pub interactions: Vec<CollabInteraction>,
+    pub interactions: Vec<InteractorInteraction>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum PollWireFormat {
-    Envelope(CollabPollResponse),
-    List(Vec<CollabInteraction>),
-    Single(CollabInteraction),
+    Envelope(InteractorPollResponse),
+    List(Vec<InteractorInteraction>),
+    Single(InteractorInteraction),
 }
 
 /// Build the generic OAST polling URL `http://{server}/poll?id={id}` (or `https://` / custom path when specified).
@@ -357,14 +357,14 @@ pub fn poll_url(server: &str, id: &str) -> String {
     }
 }
 
-/// Parse a JSON poll response body into normalized [`CollabInteraction`] records.
-pub fn parse_poll_response(body: &str, default_payload: &str) -> Result<Vec<CollabInteraction>, String> {
+/// Parse a JSON poll response body into normalized [`InteractorInteraction`] records.
+pub fn parse_poll_response(body: &str, default_payload: &str) -> Result<Vec<InteractorInteraction>, String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
     let wire: PollWireFormat =
-        serde_json::from_str(trimmed).map_err(|e| format!("Invalid Collaborator poll JSON: {e}"))?;
+        serde_json::from_str(trimmed).map_err(|e| format!("Invalid Interactor poll JSON: {e}"))?;
     let raw_list = match wire {
         PollWireFormat::Envelope(env) => env.interactions,
         PollWireFormat::List(list) => list,
@@ -412,12 +412,12 @@ pub fn parse_poll_response(body: &str, default_payload: &str) -> Result<Vec<Coll
         .collect())
 }
 
-/// Poll the Collaborator server for a single payload using `ureq`.
+/// Poll the Interactor server for a single payload using `ureq`.
 pub fn poll_payload(
     agent: &ureq::Agent,
     server: &str,
     payload: &str,
-) -> Result<Vec<CollabInteraction>, String> {
+) -> Result<Vec<InteractorInteraction>, String> {
     let id = payload_id(payload);
     let url = poll_url(server, id);
     let resp = agent.get(&url).set("Accept", "application/json").call();
@@ -432,24 +432,24 @@ pub fn poll_payload(
             parse_poll_response(&text, payload)
         }
         Err(ureq::Error::Status(code, r)) => Err(format!(
-            "Collaborator server {server} returned HTTP {code} {}",
+            "Interactor server {server} returned HTTP {code} {}",
             r.status_text()
         )),
         Err(ureq::Error::Transport(e)) => {
-            Err(format!("Collaborator server {server} is unreachable: {e}"))
+            Err(format!("Interactor server {server} is unreachable: {e}"))
         }
     }
 }
 
-/// Poll the Collaborator server for all generated payloads (or a server probe if no payloads exist yet).
+/// Poll the Interactor server for all generated payloads (or a server probe if no payloads exist yet).
 pub fn poll_all(
     server: &str,
     payloads: &[String],
     opts: &crate::http::SendOptions,
-) -> Result<Vec<CollabInteraction>, String> {
+) -> Result<Vec<InteractorInteraction>, String> {
     let srv = server.trim();
     if srv.is_empty() {
-        return Err("No Collaborator server set.".into());
+        return Err("No Interactor server set.".into());
     }
     let agent = crate::http::agent(true, opts)?;
     if payloads.is_empty() {
@@ -814,7 +814,7 @@ struct SealedInteraction {
 }
 
 /// Read the interactions out of what a relay sent, in the order it sent them.
-fn read_sealed(session: &OastSession, body: &str) -> Result<Vec<CollabInteraction>, String> {
+fn read_sealed(session: &OastSession, body: &str) -> Result<Vec<InteractorInteraction>, String> {
     let sealed: SealedPoll = serde_json::from_str(body.trim()).map_err(|e| format!("The server's answer could not be read: {e}"))?;
     if sealed.data.is_empty() {
         return Ok(Vec::new());
@@ -826,8 +826,8 @@ fn read_sealed(session: &OastSession, body: &str) -> Result<Vec<CollabInteractio
         .filter_map(|text| serde_json::from_str::<SealedInteraction>(text).ok())
         .map(|hit| {
             let unique = if hit.unique_id.is_empty() { hit.full_id.clone() } else { hit.unique_id.clone() };
-            let mut out = CollabInteraction {
-                // given one when it is taken in, by `App::apply_collab_poll`
+            let mut out = InteractorInteraction {
+                // given one when it is taken in, by `App::apply_interactor_poll`
                 id: 0,
                 interaction_type: if hit.protocol.trim().is_empty() { "DNS".into() } else { hit.protocol.trim().to_ascii_uppercase() },
                 client_ip: hit.remote_address,
@@ -852,7 +852,7 @@ fn read_sealed(session: &OastSession, body: &str) -> Result<Vec<CollabInteractio
 }
 
 /// Ask a relay what has come in for this session.
-pub fn poll_session(session: &OastSession, token: &str, opts: &crate::http::SendOptions) -> Result<Vec<CollabInteraction>, PollError> {
+pub fn poll_session(session: &OastSession, token: &str, opts: &crate::http::SendOptions) -> Result<Vec<InteractorInteraction>, PollError> {
     let agent = crate::http::agent(true, opts).map_err(PollError::Failed)?;
     let url = format!(
         "{}?id={}&secret={}",
@@ -889,7 +889,7 @@ pub struct PollRun {
     /// The session it used, when that is not the one it was given: a session registered
     /// because there was none, or because the one there was had expired.
     pub session: Option<OastSession>,
-    pub hits: Vec<CollabInteraction>,
+    pub hits: Vec<InteractorInteraction>,
     /// Something worth saying about the run that is not a failure -- a relay that turned out
     /// not to speak the encrypted protocol, say.
     pub note: String,
@@ -906,7 +906,7 @@ pub fn run_poll(
     opts: &crate::http::SendOptions,
 ) -> Result<PollRun, String> {
     if server.trim().is_empty() {
-        return Err("No Collaborator server set.".into());
+        return Err("No Interactor server set.".into());
     }
     // a session belongs to the relay it was registered with
     let current = session.filter(|s| server_host(&s.server) == server_host(server));
@@ -964,9 +964,9 @@ mod tests {
     #[test]
     fn a_payload_from_an_earlier_version_still_reads_matrix() {
         // one with a label and a server, one bare: both made by the generator of the time
-        assert_eq!(decode("j73yo1chyy2pe7878x.collab.example.com"), Some((7, "order42".to_string())));
+        assert_eq!(decode("j73yo1chyy2pe7878x.interactor.example.com"), Some((7, "order42".to_string())));
         assert_eq!(decode("dz5jyw3ik0m"), Some((3, String::new())));
-        assert_eq!(payload_id("j73yo1chyy2pe7878x.collab.example.com"), "j73yo1chyy2pe7878x");
+        assert_eq!(payload_id("j73yo1chyy2pe7878x.interactor.example.com"), "j73yo1chyy2pe7878x");
 
         let cases: [(&str, &str); 6] = [
             ("nothing at all", ""),
@@ -992,9 +992,9 @@ mod tests {
             ),
             (
                 "explicit https:// scheme preserved",
-                "https://custom-collab.net",
+                "https://custom-interactor.net",
                 "xyz987",
-                "https://custom-collab.net/poll?id=xyz987",
+                "https://custom-interactor.net/poll?id=xyz987",
             ),
             (
                 "trailing slash and custom port normalized",
@@ -1010,15 +1010,15 @@ mod tests {
             ),
             (
                 "custom endpoint path appends ?id= without duplicating /poll",
-                "https://collab.example.com/api/v1/events",
+                "https://interactor.example.com/api/v1/events",
                 "tok99",
-                "https://collab.example.com/api/v1/events?id=tok99",
+                "https://interactor.example.com/api/v1/events?id=tok99",
             ),
             (
                 "custom endpoint path with existing query parameter appends &id=",
-                "https://collab.example.com/poll?secret=1",
+                "https://interactor.example.com/poll?secret=1",
                 "tok99",
-                "https://collab.example.com/poll?secret=1&id=tok99",
+                "https://interactor.example.com/poll?secret=1&id=tok99",
             ),
         ];
 
@@ -1028,20 +1028,20 @@ mod tests {
     }
 
     #[test]
-    fn collab_interaction_parsing_matrix() {
+    fn interactor_interaction_parsing_matrix() {
         // a payload from an earlier version, whose label is read back out of it
-        let tracked_payload = "j73yo1chyy2pe7878x.collab.example.com".to_string();
+        let tracked_payload = "j73yo1chyy2pe7878x.interactor.example.com".to_string();
 
         struct ParseSuccessCase {
             name: &'static str,
             body: &'static str,
             default_payload: String,
-            expected: Vec<CollabInteraction>,
+            expected: Vec<InteractorInteraction>,
         }
 
         let success_cases = [
             ParseSuccessCase {
-                name: "OAST Collaborator standard responses envelope (DNS, HTTP POST, SMTP)",
+                name: "OAST Interactor standard responses envelope (DNS, HTTP POST, SMTP)",
                 body: r#"{
                     "responses": [
                         {
@@ -1056,7 +1056,7 @@ mod tests {
                             "clientIp": "203.0.113.10",
                             "timeStamp": "2026-11-06T18:50:05Z",
                             "protocolDetails": "POST /webhook HTTP/1.1",
-                            "interactionId": "explicit.collab.example.net"
+                            "interactionId": "explicit.interactor.example.net"
                         },
                         {
                             "type": "smtp",
@@ -1068,7 +1068,7 @@ mod tests {
                 }"#,
                 default_payload: tracked_payload.clone(),
                 expected: vec![
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "DNS".into(),
                         client_ip: "203.0.113.9".into(),
                         timestamp: "2026-11-06T18:50:00Z".into(),
@@ -1077,16 +1077,16 @@ mod tests {
                         payload: tracked_payload.clone(),
                         ..Default::default()
                     },
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "HTTP".into(),
                         client_ip: "203.0.113.10".into(),
                         timestamp: "2026-11-06T18:50:05Z".into(),
                         protocol_details: "POST /webhook HTTP/1.1".into(),
                         comment: "POST /webhook HTTP/1.1 (Custom data: order42)".into(),
-                        payload: "explicit.collab.example.net".into(),
+                        payload: "explicit.interactor.example.net".into(),
                         ..Default::default()
                     },
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "SMTP".into(),
                         client_ip: "203.0.113.11".into(),
                         timestamp: "2026-11-06T18:50:10Z".into(),
@@ -1113,7 +1113,7 @@ mod tests {
                             "remote-address": "198.51.100.42",
                             "timestamp": "18:51:12",
                             "raw-request": "R0VUIC9jYWxsYmFjayBIVFRQLzEuMQ==",
-                            "full-id": "customid.collab.example.net"
+                            "full-id": "customid.interactor.example.net"
                         },
                         {
                             "protocol": "smtp",
@@ -1124,12 +1124,12 @@ mod tests {
                         }
                     ]
                 }"#,
-                default_payload: "fallback.collab.example.net".into(),
+                default_payload: "fallback.interactor.example.net".into(),
                 // the query type, the request and the identifier now each land in a field
                 // of their own, which is what the inspector under the table reads; the one
                 // line the table shows is worked out from them
                 expected: vec![
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "DNS".into(),
                         client_ip: "198.51.100.1".into(),
                         timestamp: "18:51:00".into(),
@@ -1139,17 +1139,17 @@ mod tests {
                         query_type: "AAAA".into(),
                         ..Default::default()
                     },
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "HTTP".into(),
                         client_ip: "198.51.100.42".into(),
                         timestamp: "18:51:12".into(),
                         protocol_details: "R0VUIC9jYWxsYmFjayBIVFRQLzEuMQ==".into(),
                         comment: "R0VUIC9jYWxsYmFjayBIVFRQLzEuMQ==".into(),
-                        payload: "customid.collab.example.net".into(),
+                        payload: "customid.interactor.example.net".into(),
                         raw_request: "R0VUIC9jYWxsYmFjayBIVFRQLzEuMQ==".into(),
                         ..Default::default()
                     },
-                    CollabInteraction {
+                    InteractorInteraction {
                         interaction_type: "SMTP".into(),
                         client_ip: "198.51.100.99".into(),
                         timestamp: "18:52:00".into(),
@@ -1166,7 +1166,7 @@ mod tests {
                 name: "top-level JSON array with missing protocol defaults to DNS and decodes custom data",
                 body: r#"[{"ip": "192.0.2.55", "time": "10:00:00"}]"#,
                 default_payload: tracked_payload.clone(),
-                expected: vec![CollabInteraction {
+                expected: vec![InteractorInteraction {
                     interaction_type: "DNS".into(),
                     client_ip: "192.0.2.55".into(),
                     timestamp: "10:00:00".into(),
@@ -1240,7 +1240,7 @@ mod tests {
             req
         });
         let srv = format!("127.0.0.1:{}", addr.port());
-        let payload = "k2m9qp4rt7wz0a8bc3xy.collab.test".to_string();
+        let payload = "k2m9qp4rt7wz0a8bc3xy.interactor.test".to_string();
         let expected_id = payload_id(&payload).to_string();
         let hits = poll_all(&srv, std::slice::from_ref(&payload), &crate::http::SendOptions::default()).unwrap();
         let req_line = handle.join().unwrap();
@@ -1677,7 +1677,7 @@ mod tests {
 
     /// Three interactions with a different order in every column, and the session that handed
     /// out the payloads they fired on, so the label each one resolves to is a real one.
-    fn table_fixture() -> (OastSession, Vec<CollabInteraction>) {
+    fn table_fixture() -> (OastSession, Vec<InteractorInteraction>) {
         let mut session = OastSession::begin("relay.test");
         // the label is what the payload was handed out under; the table resolves it back
         // through the session rather than storing it on the interaction
@@ -1686,7 +1686,7 @@ mod tests {
         }
         let ids: Vec<String> = session.payloads.iter().map(|p| p.unique_id.clone()).collect();
         let hits = vec![
-            CollabInteraction {
+            InteractorInteraction {
                 id: 1,
                 interaction_type: "DNS".into(),
                 timestamp: "2026-11-14T09:30:00Z".into(),
@@ -1696,7 +1696,7 @@ mod tests {
                 unique_id: ids[0].clone(),
                 ..Default::default()
             },
-            CollabInteraction {
+            InteractorInteraction {
                 id: 2,
                 interaction_type: "LDAP".into(),
                 timestamp: "2026-11-14T08:00:00Z".into(),
@@ -1706,7 +1706,7 @@ mod tests {
                 unique_id: ids[1].clone(),
                 ..Default::default()
             },
-            CollabInteraction {
+            InteractorInteraction {
                 id: 3,
                 interaction_type: "HTTP".into(),
                 timestamp: "2026-11-14T10:15:00Z".into(),
@@ -1721,7 +1721,7 @@ mod tests {
     }
 
     /// The ids the table shows, in the order it shows them.
-    fn shown(hits: &[CollabInteraction], session: &OastSession, view: &CollabView) -> Vec<usize> {
+    fn shown(hits: &[InteractorInteraction], session: &OastSession, view: &InteractorView) -> Vec<usize> {
         rows(hits, Some(session), view).iter().map(|&i| hits[i].id).collect()
     }
 
@@ -1729,17 +1729,17 @@ mod tests {
     #[test]
     fn every_column_sorts_by_what_it_shows_matrix() {
         let (session, hits) = table_fixture();
-        let cases: [(&str, CollabSortColumn, Vec<usize>); 7] = [
-            ("the order they arrived in", CollabSortColumn::Index, vec![1, 2, 3]),
-            ("when each came in", CollabSortColumn::Time, vec![2, 1, 3]),
-            ("the protocol", CollabSortColumn::Type, vec![1, 3, 2]),
-            ("the payload that fired", CollabSortColumn::Payload, vec![2, 3, 1]),
-            ("the label the payload was handed out under", CollabSortColumn::Label, vec![3, 1, 2]),
-            ("who it came from", CollabSortColumn::SourceIp, vec![2, 3, 1]),
-            ("the comment", CollabSortColumn::Comment, vec![3, 2, 1]),
+        let cases: [(&str, InteractorSortColumn, Vec<usize>); 7] = [
+            ("the order they arrived in", InteractorSortColumn::Index, vec![1, 2, 3]),
+            ("when each came in", InteractorSortColumn::Time, vec![2, 1, 3]),
+            ("the protocol", InteractorSortColumn::Type, vec![1, 3, 2]),
+            ("the payload that fired", InteractorSortColumn::Payload, vec![2, 3, 1]),
+            ("the label the payload was handed out under", InteractorSortColumn::Label, vec![3, 1, 2]),
+            ("who it came from", InteractorSortColumn::SourceIp, vec![2, 3, 1]),
+            ("the comment", InteractorSortColumn::Comment, vec![3, 2, 1]),
         ];
         assert_table!(cases, |idx, (what, col, ascending)| {
-            let mut view = CollabView::default();
+            let mut view = InteractorView::default();
             view.sort_column = Some(col);
             view.sort_ascending = true;
             assert_eq!(shown(&hits, &session, &view), ascending, "case #{idx} ({what}): ascending");
@@ -1752,8 +1752,8 @@ mod tests {
             assert_eq!(shown(&hits, &session, &view), reversed, "case #{idx} ({what}): descending");
 
             // a different column sorts by that one, ascending again
-            view.click_column(CollabSortColumn::Index);
-            assert_eq!(view.sort_column, Some(CollabSortColumn::Index), "case #{idx} ({what})");
+            view.click_column(InteractorSortColumn::Index);
+            assert_eq!(view.sort_column, Some(InteractorSortColumn::Index), "case #{idx} ({what})");
             assert!(view.sort_ascending, "case #{idx} ({what}): another column starts ascending");
         });
     }
@@ -1769,7 +1769,7 @@ mod tests {
         assert_eq!(label_of(Some(&session), &hits[2]), "alpha");
 
         // an interaction for a payload this session never handed out
-        let stranger = CollabInteraction { id: 9, unique_id: "someoneelsescorrelation01".into(), ..Default::default() };
+        let stranger = InteractorInteraction { id: 9, unique_id: "someoneelsescorrelation01".into(), ..Default::default() };
         assert_eq!(label_of(Some(&session), &stranger), "", "no label rather than another payload's");
         assert_eq!(label_of(None, &hits[0]), "", "and none at all without a session");
     }
@@ -1779,10 +1779,10 @@ mod tests {
     #[test]
     fn the_protocols_offered_are_the_ones_that_came_in() {
         let kinds = ["http", "DNS", "ZZZ-CUSTOM", "SMB", "smtp", "LDAP", "DNS", "Anycast-Thing"];
-        let hits: Vec<CollabInteraction> = kinds
+        let hits: Vec<InteractorInteraction> = kinds
             .iter()
             .enumerate()
-            .map(|(i, k)| CollabInteraction { id: i + 1, interaction_type: normalize_protocol(k), ..Default::default() })
+            .map(|(i, k)| InteractorInteraction { id: i + 1, interaction_type: normalize_protocol(k), ..Default::default() })
             .collect();
         assert_eq!(
             protocols(&hits),
@@ -1811,19 +1811,19 @@ mod tests {
             ("searching the comment", None, "zebra", vec![1]),
         ];
         assert_table!(cases, |idx, (what, protocol, search, want)| {
-            let view = CollabView {
+            let view = InteractorView {
                 search: search.to_string(),
                 protocol: protocol.map(normalize_protocol),
-                ..CollabView::default()
+                ..InteractorView::default()
             };
             assert_eq!(shown(&hits, &session, &view), want, "case #{idx} ({what})");
             assert_eq!(view.is_filtering(), protocol.is_some() || !search.is_empty(), "case #{idx} ({what})");
         });
 
         // the two together narrow to what passes both, and to nothing when they disagree
-        let both = CollabView { search: "ccc".into(), protocol: Some("DNS".into()), ..CollabView::default() };
+        let both = InteractorView { search: "ccc".into(), protocol: Some("DNS".into()), ..InteractorView::default() };
         assert_eq!(shown(&hits, &session, &both), [1]);
-        let disagree = CollabView { search: "ccc".into(), protocol: Some("HTTP".into()), ..CollabView::default() };
+        let disagree = InteractorView { search: "ccc".into(), protocol: Some("HTTP".into()), ..InteractorView::default() };
         assert!(shown(&hits, &session, &disagree).is_empty(), "a row has to pass both");
     }
 
@@ -1833,17 +1833,17 @@ mod tests {
     #[test]
     fn a_filter_for_a_protocol_that_is_gone_is_dropped() {
         let (_, hits) = table_fixture();
-        let mut view = CollabView { protocol: Some("DNS".into()), ..CollabView::default() };
+        let mut view = InteractorView { protocol: Some("DNS".into()), ..InteractorView::default() };
         view.reconcile(&hits);
         assert_eq!(view.protocol.as_deref(), Some("DNS"), "a protocol that is still here stays on");
 
         // the last DNS interaction goes
-        let rest: Vec<CollabInteraction> = hits.iter().filter(|h| h.interaction_type != "DNS").cloned().collect();
+        let rest: Vec<InteractorInteraction> = hits.iter().filter(|h| h.interaction_type != "DNS").cloned().collect();
         view.reconcile(&rest);
         assert_eq!(view.protocol, None, "the pill it was on is gone, so the filter comes off");
 
         // and the table being cleared takes any filter with it
-        let mut view = CollabView { protocol: Some("HTTP".into()), ..CollabView::default() };
+        let mut view = InteractorView { protocol: Some("HTTP".into()), ..InteractorView::default() };
         view.reconcile(&[]);
         assert_eq!(view.protocol, None);
     }
@@ -1861,14 +1861,14 @@ mod tests {
         assert_eq!(next_interaction_id(&hits), 3, "the highest still held is 2");
 
         // everything read back as 0: a project saved before interactions had ids
-        let mut old: Vec<CollabInteraction> = (0..3).map(|_| CollabInteraction::default()).collect();
+        let mut old: Vec<InteractorInteraction> = (0..3).map(|_| InteractorInteraction::default()).collect();
         renumber(&mut old);
         assert_eq!(old.iter().map(|h| h.id).collect::<Vec<_>>(), [1, 2, 3], "each is given one of its own");
 
         // ids that are already distinct are left exactly as they are
         let mut kept = vec![
-            CollabInteraction { id: 7, ..Default::default() },
-            CollabInteraction { id: 4, ..Default::default() },
+            InteractorInteraction { id: 7, ..Default::default() },
+            InteractorInteraction { id: 4, ..Default::default() },
         ];
         renumber(&mut kept);
         assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), [7, 4], "a project that already had them keeps them");
@@ -1879,15 +1879,15 @@ mod tests {
     #[test]
     fn the_same_interaction_polled_twice_is_recognised_whatever_id_it_was_given() {
         let (_, hits) = table_fixture();
-        let same = CollabInteraction { id: 0, ..hits[0].clone() };
+        let same = InteractorInteraction { id: 0, ..hits[0].clone() };
         assert!(hits[0].is_same_event(&same), "the id is not part of what makes it the same event");
         assert!(same.is_same_event(&hits[0]), "whichever way round");
 
-        let renumbered = CollabInteraction { id: 999, ..hits[0].clone() };
+        let renumbered = InteractorInteraction { id: 999, ..hits[0].clone() };
         assert!(hits[0].is_same_event(&renumbered));
 
         // anything the relay actually said differently makes it another interaction
-        let elsewhere = CollabInteraction { client_ip: "203.0.113.1".into(), ..hits[0].clone() };
+        let elsewhere = InteractorInteraction { client_ip: "203.0.113.1".into(), ..hits[0].clone() };
         assert!(!hits[0].is_same_event(&elsewhere), "a different address is a different event");
         assert!(!hits[0].is_same_event(&hits[1]));
     }
@@ -1923,24 +1923,24 @@ mod tests {
         };
         let (server, log) = test_relay(answers, session.clone());
 
-        let (ctx, mut app) = MockAppBuilder::new().with_tab(crate::state::Tab::Collaborator).build_with_ctx();
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(crate::state::Tab::Interactor).build_with_ctx();
         let mut session = OastSession { server: server.clone(), ..session };
         let payload = session.new_payload("login", true);
         // the identifier the relay answers under, so what comes back is matched to the payload
         session.payloads[0].unique_id = format!("{}nonce00000000", session.correlation_id);
-        app.collab_server = server.clone();
-        app.collab_token = "s3cret".into();
-        app.collab_payloads.push(payload);
-        app.collab_session = Some(session);
+        app.interactor_server = server.clone();
+        app.interactor_token = "s3cret".into();
+        app.interactor_payloads.push(payload);
+        app.interactor_session = Some(session);
 
-        crate::actions::register_collaborator(&mut app);
-        run_frames_until(&ctx, &mut app, |a| !a.collab_registering);
-        assert!(app.collab_session.as_ref().expect("a session").registered, "the relay took the registration");
+        crate::actions::register_interactor(&mut app);
+        run_frames_until(&ctx, &mut app, |a| !a.interactor_registering);
+        assert!(app.interactor_session.as_ref().expect("a session").registered, "the relay took the registration");
 
-        crate::actions::poll_collaborator(&mut app);
-        run_frames_until(&ctx, &mut app, |a| !a.collab_polling);
-        assert_eq!(app.collab_interactions.len(), 1, "the interaction came back ({})", app.collab_msg);
-        assert_eq!(app.collab_interactions[0].interaction_type, "HTTP");
+        crate::actions::poll_interactor(&mut app);
+        run_frames_until(&ctx, &mut app, |a| !a.interactor_polling);
+        assert_eq!(app.interactor_interactions.len(), 1, "the interaction came back ({})", app.interactor_msg);
+        assert_eq!(app.interactor_interactions[0].interaction_type, "HTTP");
 
         // the relay really was spoken to, both times
         {

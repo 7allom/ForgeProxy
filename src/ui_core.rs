@@ -35,7 +35,7 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
             Tab::Proxy => crate::ui_proxy::proxy(app, ui, &p),
             Tab::Intruder => crate::ui_tools::intruder(app, ui, &p),
             Tab::Repeater => crate::ui_tools::repeater(app, ui, &p),
-            Tab::Collaborator => crate::ui_tools::collaborator(app, ui, &p),
+            Tab::Interactor => crate::ui_tools::interactor(app, ui, &p),
             Tab::Sequencer => crate::ui_sequencer::sequencer(app, ui, &p),
             Tab::Decoder => crate::ui_tools::decoder(app, ui, &p),
             Tab::Comparer => crate::ui_comparer::comparer(app, ui, &p),
@@ -604,7 +604,7 @@ pub fn status_color(p: &Palette, status: &str) -> Color32 {
 /// protocol at all, so anything not named here is drawn in the neutral colour the tables use
 /// for a method they do not know either -- readable, and plainly not one of the named ones.
 pub fn protocol_color(p: &Palette, protocol: &str) -> Color32 {
-    match crate::collab::normalize_protocol(protocol).as_str() {
+    match crate::interactor::normalize_protocol(protocol).as_str() {
         // a name lookup is the one almost every payload fires first
         "DNS" => p.get,
         "HTTP" | "HTTPS" => p.post,
@@ -1041,11 +1041,11 @@ mod chrome_tests {
     /// the title: the words are still reachable, but they cost no height.
     #[test]
     fn a_tool_header_is_one_strip_with_its_words_behind_the_question_mark() {
-        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Collaborator).build_with_ctx();
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Interactor).build_with_ctx();
         ctx.enable_accesskit();
         frame(&ctx, &mut app);
         let seen = labels(&frame(&ctx, &mut app));
-        assert!(seen.iter().any(|l| l == "Collaborator"), "the tool is named");
+        assert!(seen.iter().any(|l| l == "Interactor"), "the tool is named");
         // the sentence that used to sit under the title is no longer laid out as a label
         assert!(
             !seen.iter().any(|l| l.starts_with("Test whether an application can be made")),
