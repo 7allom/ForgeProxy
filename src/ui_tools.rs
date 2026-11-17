@@ -17,7 +17,7 @@ fn sev_color(p: &Palette, s: &str) -> Color32 {
 
 // ---- Target (picture-9, 10, 11) -----------------------------------------
 pub fn target(app: &mut App, ui: &mut Ui, p: &Palette) {
-    sub_tabs(ui, p, &["Site map", "Scope", "Issues"], &mut app.target_sub);
+    sub_tabs(ui, p, Tab::Target.sub_views(), &mut app.target_sub);
     match app.target_sub {
         1 => target_scope(app, ui, p),
         2 => target_issues(app, ui, p),
@@ -1693,7 +1693,7 @@ pub fn decoder_delete_message(idx: usize, total_stages: usize) -> String {
 }
 
 pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
-    sub_tabs(ui, p, &["Transform", "JWT Inspector"], &mut app.dec_view);
+    sub_tabs(ui, p, Tab::Decoder.sub_views(), &mut app.dec_view);
     if app.dec_view == 1 {
         jwt_inspector(app, ui, p);
         return;

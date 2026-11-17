@@ -5,19 +5,19 @@
 
 use crate::editor;
 use crate::sequencer::{self, TokenFormat, TokenLocation};
-use crate::state::App;
+use crate::state::{App, Tab};
 use crate::theme::{self, bold, Palette};
 use crate::ui_core::sub_tabs;
 use eframe::egui;
 use egui::{FontId, RichText, Ui};
 
-/// The sub-tabs, in the order they are shown; `App::seq_sub` is an index into this.
-const TABS: [&str; 3] = ["Capture", "Manual load", "Analysis"];
+// The sub-views `App::seq_sub` indexes are named once, in `Tab::sub_views`, so the shell and
+// this tool cannot disagree about what the second view is called.
 const TAB_MANUAL: u8 = 1;
 const TAB_ANALYSIS: u8 = 2;
 
 pub fn sequencer(app: &mut App, ui: &mut Ui, p: &Palette) {
-    sub_tabs(ui, p, &TABS, &mut app.seq_sub);
+    sub_tabs(ui, p, Tab::Sequencer.sub_views(), &mut app.seq_sub);
     ui.add_space(8.0);
     match app.seq_sub {
         TAB_MANUAL => manual_load(app, ui, p),

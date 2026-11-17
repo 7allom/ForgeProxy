@@ -240,7 +240,11 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
 }
 
 /// Carry out one action.
-fn perform(app: &mut App, action: Action) {
+///
+/// Public because the shell's navigation rail, the View menu and the command palette all
+/// switch tools by asking for the same action a shortcut would, rather than each assigning
+/// `app.tab` for itself. There is one dispatch, and this is it.
+pub fn perform(app: &mut App, action: Action) {
     match action {
         Action::GoTo(tab) => app.tab = tab,
         Action::SendToRepeater => send_somewhere(app, SendTo::Repeater),

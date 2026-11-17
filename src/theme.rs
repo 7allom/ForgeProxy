@@ -1431,3 +1431,374 @@ mod tests {
         }
     }
 }
+
+// ---- the outer shell -----------------------------------------------------------------------
+//
+// The workstation shell is a navigation rail down the left, one slim command bar across the
+// top, and the open tool as an inset card on the canvas. The geometry it is laid out to lives
+// here with everything else, so the shell and the tools round, inset and shade alike.
+
+/// The rail with room for a group caption and a label beside every icon.
+pub const RAIL_W: f32 = 200.0;
+/// The rail with room for the icons alone, each carrying its name as a tooltip.
+pub const RAIL_W_COLLAPSED: f32 = 52.0;
+/// At or above this window width the rail may show labels.
+pub const RAIL_LABELS_MIN: f32 = 1200.0;
+/// Below this window width the rail has no column of its own and opens over the work.
+pub const RAIL_OVERLAY_MAX: f32 = 820.0;
+/// One rail row, tall enough to hit comfortably without spreading twelve of them off-screen.
+pub const RAIL_ROW_H: f32 = 28.0;
+/// The gutter of canvas left around the tool card on every side.
+pub const CARD_GUTTER: i8 = 10;
+/// The command bar's height, which is the whole of the chrome above the work.
+pub const COMMAND_BAR_H: f32 = 34.0;
+
+/// The glyph a tool is known by in the rail. Drawn in code rather than set as text: the
+/// interface font is not guaranteed to carry any particular symbol, and a missing glyph in
+/// the only label a collapsed rail has would leave a tool unreachable by eye.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolIcon {
+    /// Dashboard: a dial with its needle.
+    Gauge,
+    /// Target: a crosshair over a ring.
+    Crosshair,
+    /// Proxy: traffic passing through a point in the middle.
+    Relay,
+    /// Intruder: a grid of positions to substitute at.
+    Grid,
+    /// Repeater: one request going round again.
+    Loop,
+    /// Interactor: a signal arriving from outside.
+    Waves,
+    /// Sequencer: sampled tokens as columns of differing height.
+    Bars,
+    /// Decoder: a transformation, written as brackets.
+    Braces,
+    /// Comparer: two panes side by side.
+    Columns,
+    /// Logger: a page of recorded lines.
+    Lines,
+    /// Organizer: a tray things are filed into.
+    Tray,
+    /// Automation: two cogs, one driving the other.
+    Cogs,
+}
+
+/// Draw `icon` centred on `centre`, inside a 16x16 box, in `col`.
+pub fn paint_tool_icon(painter: &egui::Painter, centre: egui::Pos2, icon: ToolIcon, col: Color32) {
+    let s = Stroke::new(1.4_f32, col);
+    let thin = Stroke::new(1.0_f32, col);
+    let at = |dx: f32, dy: f32| centre + egui::vec2(dx, dy);
+    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], s);
+    let box_of = |a: egui::Pos2, b: egui::Pos2, stroke: Stroke| {
+        painter.rect_stroke(egui::Rect::from_min_max(a, b), egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+    };
+    match icon {
+        ToolIcon::Gauge => {
+            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: (0..=12).map(|k| {
+                    let t = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
+                    at(6.5 * t.cos(), 6.5 * t.sin())
+                }).collect(),
+                closed: false,
+                fill: Color32::TRANSPARENT,
+                stroke: s.into(),
+            }));
+            line(centre, at(4.0, -4.5));
+        }
+        ToolIcon::Crosshair => {
+            painter.circle_stroke(centre, 5.5, s);
+            for (dx, dy) in [(0.0, -8.0), (0.0, 8.0), (-8.0, 0.0), (8.0, 0.0)] {
+                line(at(dx * 0.7, dy * 0.7), at(dx, dy));
+            }
+        }
+        ToolIcon::Relay => {
+            line(at(-8.0, -4.0), at(-2.5, -4.0));
+            line(at(2.5, -4.0), at(8.0, -4.0));
+            line(at(-8.0, 4.0), at(-2.5, 4.0));
+            line(at(2.5, 4.0), at(8.0, 4.0));
+            painter.circle_stroke(centre, 2.5, s);
+        }
+        ToolIcon::Grid => {
+            box_of(at(-7.0, -7.0), at(7.0, 7.0), s);
+            line(at(-7.0, -2.0), at(7.0, -2.0));
+            line(at(-7.0, 3.0), at(7.0, 3.0));
+            line(at(-2.0, -7.0), at(-2.0, 7.0));
+        }
+        ToolIcon::Loop => {
+            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: (0..=16).map(|k| {
+                    let t = std::f32::consts::PI * (0.35 + 1.5 * k as f32 / 16.0);
+                    at(6.5 * t.cos(), 6.5 * t.sin())
+                }).collect(),
+                closed: false,
+                fill: Color32::TRANSPARENT,
+                stroke: s.into(),
+            }));
+            // the arrow head that says which way round it goes
+            line(at(2.0, -7.5), at(6.0, -4.5));
+            line(at(1.5, -1.5), at(6.0, -4.5));
+        }
+        ToolIcon::Waves => {
+            for r in [2.5_f32, 5.5, 8.0] {
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: (0..=10).map(|k| {
+                        let t = std::f32::consts::PI * (-0.4 + 0.8 * k as f32 / 10.0);
+                        at(-5.0 + r * t.cos(), r * t.sin())
+                    }).collect(),
+                    closed: false,
+                    fill: Color32::TRANSPARENT,
+                    stroke: thin.into(),
+                }));
+            }
+            painter.circle_filled(at(-6.5, 0.0), 1.8, col);
+        }
+        ToolIcon::Bars => {
+            for (dx, h) in [(-5.5_f32, 4.0_f32), (-1.8, 7.5), (1.8, 2.5), (5.5, 6.0)] {
+                line(at(dx, 7.0), at(dx, 7.0 - h * 2.0));
+            }
+        }
+        ToolIcon::Braces => {
+            for dir in [-1.0_f32, 1.0] {
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: vec![
+                        at(dir * 3.0, -7.0), at(dir * 6.5, -7.0), at(dir * 6.5, -2.0),
+                        at(dir * 8.5, 0.0), at(dir * 6.5, 2.0), at(dir * 6.5, 7.0),
+                        at(dir * 3.0, 7.0),
+                    ],
+                    closed: false,
+                    fill: Color32::TRANSPARENT,
+                    stroke: thin.into(),
+                }));
+            }
+        }
+        ToolIcon::Columns => {
+            box_of(at(-8.0, -6.5), at(-1.0, 6.5), s);
+            box_of(at(1.0, -6.5), at(8.0, 6.5), s);
+            line(at(-6.0, -3.0), at(-3.0, -3.0));
+            line(at(3.0, 1.0), at(6.0, 1.0));
+        }
+        ToolIcon::Lines => {
+            box_of(at(-6.5, -8.0), at(6.5, 8.0), thin);
+            for dy in [-4.0, 0.0, 4.0] {
+                line(at(-3.5, dy), at(3.5, dy));
+            }
+        }
+        ToolIcon::Tray => {
+            line(at(-7.0, -6.5), at(-1.0, -6.5));
+            box_of(at(-8.0, -3.0), at(8.0, 7.5), s);
+            line(at(-8.0, 1.5), at(8.0, 1.5));
+        }
+        ToolIcon::Cogs => {
+            painter.circle_stroke(at(-2.5, -2.0), 4.5, s);
+            painter.circle_stroke(at(4.0, 4.5), 3.0, thin);
+            for k in 0..6 {
+                let t = std::f32::consts::TAU * k as f32 / 6.0;
+                let (cs, sn) = (t.cos(), t.sin());
+                painter.line_segment(
+                    [at(-2.5 + 4.5 * cs, -2.0 + 4.5 * sn), at(-2.5 + 7.0 * cs, -2.0 + 7.0 * sn)],
+                    thin,
+                );
+            }
+        }
+    }
+}
+
+/// The app's own mark: a diamond of the accent inside a square of the raised surface. The
+/// window icon is the same shape, so the mark in the bar and the one in the task bar agree.
+pub fn paint_app_mark(painter: &egui::Painter, rect: egui::Rect, p: &Palette) {
+    painter.rect_filled(rect, egui::CornerRadius::same(CORNER), p.header);
+    let c0 = rect.center();
+    let r = rect.width() * 0.26;
+    painter.add(egui::Shape::convex_polygon(
+        vec![c0 - egui::vec2(0.0, r), c0 + egui::vec2(r, 0.0), c0 + egui::vec2(0.0, r), c0 - egui::vec2(r, 0.0)],
+        p.accent,
+        Stroke::NONE,
+    ));
+}
+
+/// A magnifier, for the command bar's search affordance.
+pub fn paint_search(painter: &egui::Painter, centre: egui::Pos2, rad: f32, col: Color32) {
+    let s = Stroke::new(1.3_f32, col);
+    painter.circle_stroke(centre - egui::vec2(rad * 0.2, rad * 0.2), rad * 0.7, s);
+    painter.line_segment([centre + egui::vec2(rad * 0.25, rad * 0.25), centre + egui::vec2(rad, rad)], s);
+}
+
+/// The three dots of an overflow menu.
+pub fn paint_overflow(painter: &egui::Painter, centre: egui::Pos2, col: Color32) {
+    for dx in [-4.5_f32, 0.0, 4.5] {
+        painter.circle_filled(centre + egui::vec2(dx, 0.0), 1.5, col);
+    }
+}
+
+/// The three bars that open the rail when it has no column of its own.
+pub fn paint_rail_handle(painter: &egui::Painter, centre: egui::Pos2, col: Color32) {
+    let s = Stroke::new(1.4_f32, col);
+    for dy in [-4.0_f32, 0.0, 4.0] {
+        painter.line_segment([centre + egui::vec2(-6.0, dy), centre + egui::vec2(6.0, dy)], s);
+    }
+}
+
+/// A pair of chevrons, pointing left to collapse the rail or right to open it again.
+pub fn paint_chevrons(painter: &egui::Painter, centre: egui::Pos2, left: bool, col: Color32) {
+    let s = Stroke::new(1.3_f32, col);
+    let dir = if left { -1.0_f32 } else { 1.0 };
+    for dx in [-3.0_f32, 1.5] {
+        let tip = centre + egui::vec2(dx + dir * 1.5, 0.0);
+        painter.line_segment([tip + egui::vec2(-dir * 3.0, -3.5), tip], s);
+        painter.line_segment([tip + egui::vec2(-dir * 3.0, 3.5), tip], s);
+    }
+}
+
+/// The frame the open tool is drawn in: the workspace surface, inset from the canvas on every
+/// side, with one hairline around it and the shared corner.
+///
+/// This is what replaced a full-bleed pane meeting the chrome with no edge at all. The canvas
+/// showing around it is [`Palette::deep`], so the card reads as a sheet laid on the desk.
+pub fn tool_card(p: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(p.panel)
+        .stroke(Stroke::new(1.0_f32, p.border_subtle))
+        .corner_radius(egui::CornerRadius::same(CORNER))
+        .inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 8 })
+}
+
+/// One row of the navigation rail: the tool's icon, its name when there is room for one, and
+/// an accent bar down the left of whichever row is open.
+///
+/// Collapsed, the name becomes the row's tooltip and its accessibility label, so the tool is
+/// still named to a screen reader and to the tests.
+pub fn rail_item(
+    ui: &mut Ui,
+    p: &Palette,
+    icon: ToolIcon,
+    label: &str,
+    shortcut: &str,
+    selected: bool,
+    collapsed: bool,
+) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, RAIL_ROW_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label));
+    // the row being read is a raised surface; one not being read lifts only under the pointer
+    let body = rect.shrink2(egui::vec2(3.0, 1.0));
+    if selected {
+        ui.painter().rect_filled(body, egui::CornerRadius::same(CORNER), p.header);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(body, egui::CornerRadius::same(CORNER), p.hover);
+    }
+    // the accent is a bar down the open row's left edge, where the old strip put an underline:
+    // it is what tells one level of navigation from the other at a glance
+    if selected {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(body.left(), body.top() + 4.0),
+            egui::pos2(body.left() + 2.0, body.bottom() - 4.0),
+        );
+        ui.painter().rect_filled(bar, egui::CornerRadius::same(1), p.accent);
+    }
+    let ink = if selected { p.strong } else if resp.hovered() { p.strong } else { p.text };
+    paint_tool_icon(ui.painter(), egui::pos2(body.left() + 18.0, body.center().y), icon, ink);
+    if collapsed {
+        return resp.on_hover_text(format!("{label}   {shortcut}"));
+    }
+    let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(FONT_UI), ink);
+    let pos = egui::pos2(body.left() + 34.0, body.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, ink);
+    resp.on_hover_text(format!("{label}   {shortcut}"))
+}
+
+/// A group caption in the rail: small, dimmed and letter-spaced by the eye rather than the
+/// font, because it is a divider that happens to have a name and not something to read.
+pub fn rail_caption(ui: &mut Ui, p: &Palette, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(FONT_CAPTION), p.disabled);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 11.0, rect.bottom() - galley.size().y - 4.0),
+        galley,
+        p.disabled,
+    );
+}
+
+/// A hairline across the rail, standing in for a caption there is no room to write.
+pub fn rail_rule(ui: &mut Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 11.0), egui::Sense::hover());
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(rect.left() + 10.0, y), egui::pos2(rect.right() - 10.0, y)],
+        Stroke::new(1.0_f32, p.border_subtle),
+    );
+}
+
+/// The segmented bar a tool's sub-views are chosen with: one track of the recessed surface,
+/// with the open view as a raised pill inside it.
+///
+/// This is deliberately not [`underline_tabs`]. The rail now carries the accent for choosing a
+/// *tool*, so choosing a *view within* one had to look like something else or the two levels
+/// would read as the same control at two sizes.
+pub fn segmented(ui: &mut Ui, p: &Palette, labels: &[&str], sel: &mut u8) {
+    if labels.is_empty() {
+        return;
+    }
+    const PAD: f32 = 13.0;
+    const H: f32 = 23.0;
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| ui.painter().layout_no_wrap((*l).to_string(), FontId::proportional(FONT_UI), p.text).size().x + PAD * 2.0)
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + 4.0;
+    let (track, _) = ui.allocate_exact_size(egui::vec2(total.min(ui.available_width()), H + 4.0), egui::Sense::hover());
+    ui.painter().rect_filled(track, egui::CornerRadius::same(CORNER), p.bg_input);
+    ui.painter().rect_stroke(
+        track,
+        egui::CornerRadius::same(CORNER),
+        Stroke::new(1.0_f32, p.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    let mut x = track.left() + 2.0;
+    for (i, label) in labels.iter().enumerate() {
+        let is_sel = *sel as usize == i;
+        let seg = egui::Rect::from_min_size(egui::pos2(x, track.top() + 2.0), egui::vec2(widths[i], H));
+        x += widths[i];
+        let resp = ui.interact(seg, ui.id().with(("segment", i, *label)), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, is_sel, *label));
+        if is_sel {
+            ui.painter().rect_filled(seg.shrink(1.0), egui::CornerRadius::same(CORNER), p.header);
+            ui.painter().rect_stroke(
+                seg.shrink(1.0),
+                egui::CornerRadius::same(CORNER),
+                Stroke::new(1.0_f32, p.accent),
+                egui::StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(seg.shrink(1.0), egui::CornerRadius::same(CORNER), p.hover);
+        }
+        let ink = if is_sel { p.strong } else { p.text };
+        let galley = ui.painter().layout_no_wrap((*label).to_string(), FontId::proportional(FONT_UI), ink);
+        ui.painter().galley(
+            egui::pos2(seg.center().x - galley.size().x / 2.0, seg.center().y - galley.size().y / 2.0),
+            galley,
+            ink,
+        );
+        if resp.clicked() {
+            *sel = i as u8;
+        }
+    }
+}
+
+/// A read-only chip in the command bar -- the project, the listener -- as a dot of `colour`,
+/// a label, and the raised surface behind both. Clickable, so every chip can lead somewhere.
+pub fn bar_chip(ui: &mut Ui, p: &Palette, text: &str, colour: Option<Color32>) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(FONT_UI), p.text);
+    let dot = if colour.is_some() { 14.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 18.0 + dot, 22.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    let fill = if resp.hovered() { p.hover } else { p.header };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(CORNER), fill);
+    let mut x = rect.left() + 9.0;
+    if let Some(c0) = colour {
+        ui.painter().circle_filled(egui::pos2(x + 2.0, rect.center().y), 3.5, c0);
+        x += dot;
+    }
+    ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, p.text);
+    resp
+}

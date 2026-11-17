@@ -1,14 +1,50 @@
-//! Window chrome: top menu, tab row, status bar, project dialogs; and shared row helpers.
+//! The workstation shell: the command bar, the navigation rail, the status bar, the bottom
+//! drawer, the card the open tool is drawn in, and the project dialogs; plus shared row
+//! helpers.
+//!
+//! The shell is one strip across the top and one rail down the left. Tools are chosen on the
+//! rail, grouped, with the accent as a bar down the open row; the views *within* a tool are
+//! chosen on a segmented bar in its own card header, and only the four tools that have more
+//! than one view draw one. The work itself sits on the canvas as an inset card rather than
+//! running flush to the window's edges.
+//!
+//! Nothing here switches tools by hand: the rail asks [`crate::hotkeys::perform`] for the same
+//! `GoTo` action a shortcut would, so the rail, the shortcuts, the View menu and the command
+//! palette cannot drift apart.
 
 use crate::state::{App, DrawerTab, ProjectDialog, Tab};
 use crate::theme::{self, bold, Palette};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Ui};
 
-/// Outer padding of every tab's content, so text and buttons never touch the window edges.
-pub const TAB_MARGIN: egui::Margin = egui::Margin { left: 10, right: 10, top: 6, bottom: 10 };
-
 pub fn c(hex: u32) -> Color32 { Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8) }
+
+/// How much of the navigation rail the window has room for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RailMode {
+    /// A column wide enough for group captions and a label beside every icon.
+    Labels,
+    /// A narrow column of icons, each naming its tool on hover.
+    Icons,
+    /// No column at all: the rail opens over the work from the handle on the command bar.
+    Overlay,
+}
+
+/// Which rail the window can carry, from its width and the user's own say.
+///
+/// Width has the final word. `rail_collapsed` can narrow a rail that would otherwise show
+/// labels, but it cannot widen one on a window with no room for it, and on a narrow window
+/// the rail becomes an overlay whatever either of them holds.
+pub fn rail_mode(app: &App, ctx: &egui::Context) -> RailMode {
+    let w = ctx.screen_rect().width();
+    if w < theme::RAIL_OVERLAY_MAX {
+        RailMode::Overlay
+    } else if app.rail_collapsed || w < theme::RAIL_LABELS_MIN {
+        RailMode::Icons
+    } else {
+        RailMode::Labels
+    }
+}
 
 pub fn frame(app: &mut App, ctx: &egui::Context) {
     let p = app.p();
@@ -17,82 +53,327 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
     crate::editor::set_display_limit(ctx, app.settings.display_limit_kib.saturating_mul(1024));
     // another tab or sub-tab: the Auto-Decoder starts empty there
     crate::editor::decoder_context(ctx, "view", format!("{}/{}/{}", app.tab.label(), app.proxy_sub, app.target_sub));
-    top_menu(app, ctx, &p);
+    let mode = rail_mode(app, ctx);
+    // a window that has grown back out of overlay territory has no handle to close the overlay
+    // with, so it is dropped rather than left hanging over a rail that is on screen anyway
+    if mode != RailMode::Overlay {
+        app.rail_overlay = false;
+    }
+    command_bar(app, ctx, &p, mode);
     crate::hotkeys::handle(app, ctx);
-    tab_bar(app, ctx, &p);
     status_bar(app, ctx, &p);
     drawer(app, ctx, &p);
+    if mode != RailMode::Overlay {
+        rail(app, ctx, &p, mode);
+    }
     crate::ui_dash::windows(app, ctx, &p);
     crate::windows::show(app, ctx, &p);
     crate::ui_tools::attack_window(app, ctx, &p);
     project_dialog(app, ctx, &p);
     new_project_dialog(app, ctx, &p);
     exit_dialog(app, ctx, &p);
-    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(TAB_MARGIN)).show(ctx, |ui| {
-        match app.tab {
-            Tab::Dashboard => crate::ui_dash::dashboard(app, ui, &p),
-            Tab::Target => crate::ui_tools::target(app, ui, &p),
-            Tab::Proxy => crate::ui_proxy::proxy(app, ui, &p),
-            Tab::Intruder => crate::ui_tools::intruder(app, ui, &p),
-            Tab::Repeater => crate::ui_tools::repeater(app, ui, &p),
-            Tab::Interactor => crate::ui_tools::interactor(app, ui, &p),
-            Tab::Sequencer => crate::ui_sequencer::sequencer(app, ui, &p),
-            Tab::Decoder => crate::ui_tools::decoder(app, ui, &p),
-            Tab::Comparer => crate::ui_comparer::comparer(app, ui, &p),
-            Tab::Logger => crate::ui_tools::logger(app, ui, &p),
-            Tab::Organizer => crate::ui_organizer::organizer(app, ui, &p),
-            Tab::Automation => crate::ui_automation::automation(app, ui, &p),
-        }
-    });
+    // the canvas, with the open tool on it as a card inset from every edge
+    let gutter = egui::Margin::same(theme::CARD_GUTTER);
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(p.deep).inner_margin(gutter))
+        .show(ctx, |ui| {
+            theme::tool_card(&p).show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                tool_body(app, ui, &p);
+            });
+        });
+    // last, so it covers the card and its own scrim catches the clicks meant for neither
+    rail_overlay(app, ctx, &p);
 }
 
-fn top_menu(app: &mut App, ctx: &egui::Context, p: &Palette) {
-    egui::TopBottomPanel::top("menu")
-        .frame(
-            egui::Frame::new()
-                .fill(p.panel)
-                .inner_margin(egui::Margin::symmetric(8, 4))
-                // the strip is closed off from the tab row below it by one crisp line
-                .stroke(egui::Stroke::NONE),
-        )
+/// Draw whichever tool is open. Every arm is the tool exactly as it was: the shell decides
+/// where the body goes and what frames it, never what is in it.
+fn tool_body(app: &mut App, ui: &mut Ui, p: &Palette) {
+    match app.tab {
+        Tab::Dashboard => crate::ui_dash::dashboard(app, ui, p),
+        Tab::Target => crate::ui_tools::target(app, ui, p),
+        Tab::Proxy => crate::ui_proxy::proxy(app, ui, p),
+        Tab::Intruder => crate::ui_tools::intruder(app, ui, p),
+        Tab::Repeater => crate::ui_tools::repeater(app, ui, p),
+        Tab::Interactor => crate::ui_tools::interactor(app, ui, p),
+        Tab::Sequencer => crate::ui_sequencer::sequencer(app, ui, p),
+        Tab::Decoder => crate::ui_tools::decoder(app, ui, p),
+        Tab::Comparer => crate::ui_comparer::comparer(app, ui, p),
+        Tab::Logger => crate::ui_tools::logger(app, ui, p),
+        Tab::Organizer => crate::ui_organizer::organizer(app, ui, p),
+        Tab::Automation => crate::ui_automation::automation(app, ui, p),
+    }
+}
+
+/// The one strip above the work: the app's mark, the open project, the command search, and the
+/// three controls that are not a tool (settings, browser, overflow).
+///
+/// This replaced two stacked full-width strips -- a row of menu titles over a row of twelve
+/// tabs -- which is most of what made the old shell's silhouette someone else's.
+fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) {
+    egui::TopBottomPanel::top("command_bar")
+        .exact_height(theme::COMMAND_BAR_H)
+        .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 }))
         .show_separator_line(false)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // "Suite" starts the row, flush with the Dashboard tab under it
-                crate::menus::bar(app, ui);
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // on a window too narrow for a rail of its own, this is the way to the tools
+                if mode == RailMode::Overlay {
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Tools"));
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, egui::CornerRadius::same(theme::CORNER), p.hover);
+                    }
+                    theme::paint_rail_handle(ui.painter(), r.center(), p.text);
+                    if resp.on_hover_text("Tools").clicked() {
+                        app.rail_overlay = !app.rail_overlay;
+                    }
+                }
+                let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                theme::paint_app_mark(ui.painter(), mark, p);
+                ui.label(theme::bold("ForgeProxy", theme::FONT_UI).color(p.strong));
+
+                // the open project, as the chip that also opens the Project menu
+                ui.add_space(2.0);
+                let project = match (&app.project_path, app.project_name.is_empty()) {
+                    (Some(_), false) => app.project_name.clone(),
+                    (Some(path), true) => short_name(path),
+                    (None, _) => "Temporary project".to_string(),
+                };
+                project_chip(app, ui, p, &project);
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let title = match &app.project_path {
-                        Some(_) if !app.project_name.is_empty() => format!("ForgeProxy — {}", app.project_name),
-                        Some(path) => format!("ForgeProxy — {path}"),
-                        None => "ForgeProxy — Temporary Project".to_string(),
+                    let icon = |ui: &mut Ui, name: &str| -> (egui::Rect, egui::Response) {
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, egui::CornerRadius::same(theme::CORNER), p.hover);
+                        }
+                        (r, resp)
                     };
-                    ui.label(RichText::new(title).size(theme::FONT_UI).color(p.disabled));
+                    overflow_menu(app, ui, p);
+                    let (g, gs) = icon(ui, "Settings");
+                    theme::paint_gear(ui.painter(), g.center(), 7.0, p.text);
+                    if gs.on_hover_text("Settings").clicked() {
+                        app.show_settings = true;
+                    }
+                    let (b, bs) = icon(ui, "Open browser");
+                    theme::paint_globe(ui.painter(), b.center(), 7.5, p.text);
+                    if bs.on_hover_text("Open browser").clicked() {
+                        crate::ui_proxy::open_browser(app);
+                    }
+                    theme::chrome_divider(ui, p);
+                    // the search affordance: the command palette is the fastest way to any of
+                    // the twelve tools and every action, so it is said out loud rather than
+                    // left to the shortcut
+                    search_chip(app, ui, p);
                 });
             });
         });
 }
 
-fn tab_bar(app: &mut App, ctx: &egui::Context, p: &Palette) {
-    egui::TopBottomPanel::top("tabs")
-        .frame(egui::Frame::new().fill(p.deep).inner_margin(egui::Margin { left: 4, right: 8, top: 0, bottom: 0 }))
+/// "Search or run a command   Ctrl+K": opens the command palette.
+fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let width = (ui.available_width() - 8.0).clamp(0.0, 300.0);
+    if width < 60.0 {
+        return;
+    }
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Search or run a command"));
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::CORNER), p.bg_input);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::CORNER),
+        egui::Stroke::new(1.0_f32, if resp.hovered() { p.border_focus } else { p.border_subtle }),
+        egui::StrokeKind::Inside,
+    );
+    theme::paint_search(ui.painter(), egui::pos2(rect.left() + 13.0, rect.center().y), 5.5, p.disabled);
+    let galley = ui.painter().layout_no_wrap("Search or run a command".into(), FontId::proportional(theme::FONT_UI), p.disabled);
+    let label_w = galley.size().x;
+    ui.painter().galley(egui::pos2(rect.left() + 26.0, rect.center().y - galley.size().y / 2.0), galley, p.disabled);
+    let keys = ui.painter().layout_no_wrap("Ctrl+K".into(), FontId::proportional(theme::FONT_CAPTION), p.disabled);
+    let kw = keys.size().x;
+    if rect.width() > 26.0 + label_w + kw + 20.0 {
+        ui.painter().galley(egui::pos2(rect.right() - kw - 9.0, rect.center().y - keys.size().y / 2.0), keys, p.disabled);
+    }
+    if resp.on_hover_text("Search or run a command (Ctrl+K)").clicked() {
+        app.show_palette = true;
+        app.palette_query.clear();
+    }
+}
+
+/// The chip naming the open project, which opens the Project menu.
+fn project_chip(app: &mut App, ui: &mut Ui, p: &Palette, project: &str) {
+    let saved = app.project_path.is_some();
+    let colour = if saved { p.success } else { p.warning };
+    let hint = if saved {
+        "The open project. Click for the Project menu."
+    } else {
+        "Nothing is being saved to disk. Click for the Project menu."
+    };
+    // a menu that opens from a chip of our own drawing: the menu's own button is invisible and
+    // laid exactly over the chip, so the chip is what is seen and the menu is what happens
+    let resp = theme::bar_chip(ui, p, project, Some(colour)).on_hover_text(hint);
+    let rect = resp.rect;
+    let mut builder = egui::UiBuilder::new()
+        .max_rect(rect)
+        .layout(egui::Layout::left_to_right(egui::Align::Center));
+    builder.sense = Some(egui::Sense::click());
+    let mut over = ui.new_child(builder);
+    {
+        let widgets = &mut over.visuals_mut().widgets;
+        for w in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+            w.weak_bg_fill = Color32::TRANSPARENT;
+            w.bg_fill = Color32::TRANSPARENT;
+            w.bg_stroke = egui::Stroke::NONE;
+        }
+    }
+    over.menu_button(RichText::new(" ").size(1.0), |ui| crate::menus::project_items(app, ui));
+}
+
+/// The `...` overflow: every menu the old strip of titles used to hold.
+///
+/// The dots are drawn rather than set as text. The interface font is not guaranteed to carry
+/// an ellipsis glyph, and the one control that reaches every menu must not depend on a font
+/// fallback to be visible at all.
+fn overflow_menu(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    let mut builder = egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center));
+    builder.sense = Some(egui::Sense::click());
+    let mut over = ui.new_child(builder);
+    {
+        let widgets = &mut over.visuals_mut().widgets;
+        for w in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+            w.weak_bg_fill = Color32::TRANSPARENT;
+            w.bg_fill = Color32::TRANSPARENT;
+            w.bg_stroke = egui::Stroke::NONE;
+        }
+    }
+    let resp = over
+        .menu_button(RichText::new(" ").size(1.0), |ui| crate::menus::overflow(app, ui))
+        .response;
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Menus"));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::CORNER), p.hover);
+    }
+    theme::paint_overflow(ui.painter(), rect.center(), p.text);
+    resp.on_hover_text("Menus");
+}
+
+/// The last component of a path, for naming a project that has no name of its own.
+fn short_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// The navigation rail: the Dashboard on its own, then the three groups of tools.
+///
+/// Every row goes through [`crate::hotkeys::perform`], so the rail cannot disagree with the
+/// shortcuts about what switching to a tool means.
+fn rail(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) {
+    let collapsed = mode == RailMode::Icons;
+    let width = if collapsed { theme::RAIL_W_COLLAPSED } else { theme::RAIL_W };
+    egui::SidePanel::left("rail")
+        .resizable(false)
+        .exact_width(width)
+        .frame(egui::Frame::new().fill(p.deep).inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 6 }))
+        .show_separator_line(false)
+        .show(ctx, |ui| rail_contents(app, ui, p, collapsed));
+}
+
+/// The rail's rows, drawn the same whether the rail is a column of its own or an overlay.
+fn rail_contents(app: &mut App, ui: &mut Ui, p: &Palette, collapsed: bool) {
+    ui.spacing_mut().item_spacing.y = 1.0;
+    let keys = crate::hotkeys::bindings(&app.settings.hotkeys);
+    let shortcut_for = |tab: Tab| -> String {
+        keys.iter()
+            .find(|(a, _)| a.action == crate::hotkeys::Action::GoTo(tab))
+            .map(|(_, b)| b.label())
+            .unwrap_or_default()
+    };
+    let mut go: Option<Tab> = None;
+    // the Dashboard is pinned above the groups: it is where a session starts, and it belongs
+    // to none of them
+    let open = app.tab == Tab::Dashboard;
+    if theme::rail_item(ui, p, Tab::Dashboard.icon(), Tab::Dashboard.label(), &shortcut_for(Tab::Dashboard), open, collapsed).clicked() {
+        go = Some(Tab::Dashboard);
+    }
+    for (caption, tabs) in Tab::GROUPS {
+        // collapsed there is no room to write the caption, so the group becomes a rule: the
+        // grouping still reads, which is the whole point of having one
+        if collapsed {
+            theme::rail_rule(ui, p);
+        } else {
+            theme::rail_caption(ui, p, caption);
+        }
+        for tab in tabs {
+            let open = app.tab == *tab;
+            if theme::rail_item(ui, p, tab.icon(), tab.label(), &shortcut_for(*tab), open, collapsed).clicked() {
+                go = Some(*tab);
+            }
+        }
+    }
+    // the collapse control sits at the foot of the rail, out of the way of the tools
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+        let now = app.rail_collapsed;
+        let hint = if now { "Expand the rail" } else { "Collapse the rail to icons" };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
+        if resp.hovered() {
+            ui.painter().rect_filled(r.shrink2(egui::vec2(3.0, 2.0)), egui::CornerRadius::same(theme::CORNER), p.hover);
+        }
+        let x = if collapsed { r.center().x } else { r.left() + 16.0 };
+        theme::paint_chevrons(ui.painter(), egui::pos2(x, r.center().y), !now, p.disabled);
+        if resp.on_hover_text(hint).clicked() {
+            app.rail_collapsed = !now;
+        }
+    });
+    if let Some(tab) = go {
+        crate::hotkeys::perform(app, crate::hotkeys::Action::GoTo(tab));
+        // an overlay has done its job the moment a tool is chosen
+        app.rail_overlay = false;
+    }
+}
+
+/// The rail as an overlay, for a window with no room for a column of its own: a scrim over the
+/// work and the rail's own rows on top of it. Clicking the scrim, or pressing Escape, closes it.
+fn rail_overlay(app: &mut App, ctx: &egui::Context, p: &Palette) {
+    if !app.rail_overlay {
+        return;
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.rail_overlay = false;
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let body = egui::Rect::from_min_max(egui::pos2(screen.left(), screen.top() + theme::COMMAND_BAR_H), screen.max);
+    egui::Area::new(egui::Id::new("rail_scrim"))
+        .order(egui::Order::Middle)
+        .fixed_pos(body.min)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let items: Vec<(Tab, &str)> = Tab::ALL.iter().map(|t| (*t, t.label())).collect();
-                theme::underline_tabs(ui, p, &items, &mut app.tab, 30.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(2.0);
-                    let (g, gs) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                    theme::paint_gear(ui.painter(), g.center(), 7.0, p.text);
-                    if gs.on_hover_text("Settings").clicked() { app.show_settings = true; }
-                    let (cr, cs) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                    ui.painter().text(cr.center(), egui::Align2::CENTER_CENTER, ">_", FontId::monospace(11.0), p.text);
-                    if cs.on_hover_text("Command palette (Ctrl+K)").clicked() { app.show_palette = true; app.palette_query.clear(); }
-                    let (gr, bs) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                    theme::paint_globe(ui.painter(), gr.center(), 7.5, p.text);
-                    if bs.on_hover_text("Open browser").clicked() { crate::ui_proxy::open_browser(app); }
+            let resp = ui.allocate_rect(body, egui::Sense::click());
+            ui.painter().rect_filled(body, 0.0, Color32::from_black_alpha(120));
+            if resp.clicked() {
+                app.rail_overlay = false;
+            }
+        });
+    egui::Area::new(egui::Id::new("rail_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(body.min)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(p.deep)
+                .stroke(egui::Stroke::new(1.0_f32, p.border_subtle))
+                .shadow(ui.visuals().popup_shadow)
+                .inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 6 })
+                .show(ui, |ui| {
+                    ui.set_width(theme::RAIL_W);
+                    ui.set_height((body.height() - 12.0).max(0.0));
+                    rail_contents(app, ui, p, false);
                 });
-            });
         });
 }
 
@@ -571,16 +852,14 @@ fn submit_project_dialog(app: &mut App, d: ProjectDialog) {
     }
 }
 
-/// Second-level tab row with the orange underline.
+/// A tool's second level, as a compact segmented bar in its card header.
+///
+/// Only the four tools with more than one view call this (see [`Tab::sub_views`]); the other
+/// eight draw nothing here and their bodies get that height instead. It is deliberately a
+/// different control from the rail: the rail chooses the tool, this chooses the view inside
+/// it, and when both were an accent underline the two levels read as one.
 pub fn sub_tabs(ui: &mut Ui, p: &Palette, labels: &[&str], sel: &mut u8) {
-    egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { left: 4, right: 4, top: 0, bottom: 0 }).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let items: Vec<(u8, &str)> = labels.iter().enumerate().map(|(i, l)| (i as u8, *l)).collect();
-            theme::underline_tabs(ui, p, &items, sel, 28.0);
-        });
-        ui.add(egui::Separator::default().horizontal().spacing(0.0));
-    });
+    ui.horizontal(|ui| theme::segmented(ui, p, labels, sel));
 }
 
 pub fn method_color(p: &Palette, m: &str) -> Color32 {
@@ -1191,32 +1470,224 @@ mod chrome_tests {
     }
 
 
-    /// The menu row starts with "Suite" itself: the orange square that used to sit before it
-    /// was not a control, and it pushed the whole row out of line with the tabs underneath.
+    /// The shell is one strip of chrome above the work, not two.
+    ///
+    /// What this replaced was a row of menu titles stacked directly on a row of twelve tabs,
+    /// both running the full width of the window -- the single thing that most made the outer
+    /// shell look like something else's. The test is on the geometry rather than on the names:
+    /// everything above the tool card has to fit in one bar's height, and the tools have to be
+    /// somewhere else entirely, which here means to the left of the card.
     #[test]
-    fn the_menu_row_starts_with_suite_in_line_with_the_first_tab() {
-        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+    fn the_chrome_above_the_work_is_one_bar_and_the_tools_are_on_the_rail() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
         ctx.enable_accesskit();
         frame(&ctx, &mut app);
         let update = frame(&ctx, &mut app);
-        let nodes = &update.as_ref().expect("accesskit output").nodes;
-        let left_of = |want: &str| {
-            nodes
-                .iter()
-                .filter(|(_, n)| n.label().as_deref() == Some(want) || n.value().as_deref() == Some(want))
-                .filter_map(|(_, n)| n.bounds())
-                .map(|b| b.x0 as f32)
-                .fold(f32::INFINITY, f32::min)
-        };
-        let (suite, dashboard) = (left_of("Suite"), left_of("Dashboard"));
-        assert!(suite.is_finite(), "the Suite menu is there");
-        assert!(dashboard.is_finite(), "and the Dashboard tab under it");
-        // both start at the window's left edge, give or take each one's own padding
-        assert!(suite < 40.0, "Suite sits at the left edge, not pushed in by a badge: x {suite}");
+
+        // one top strip, and no second one stacked under it
+        let bar = panel_rect(&ctx, "command_bar");
         assert!(
-            (suite - dashboard).abs() < 16.0,
-            "and lines up with the first tab (Suite x {suite}, Dashboard x {dashboard})"
+            bar.height() <= crate::theme::COMMAND_BAR_H + 0.5,
+            "the chrome above the work is one bar: {:.0}px tall",
+            bar.height()
         );
+        assert!(bar.left() <= 0.5, "and it spans the window: {bar:?}");
+
+        // the tools are a rail down the left, which starts under that bar and not beside it
+        let rail = panel_rect(&ctx, "rail");
+        assert!(
+            rail.top() >= bar.bottom() - 0.5,
+            "the rail starts below the command bar (bar {bar:?}, rail {rail:?})"
+        );
+        assert!(
+            rail.height() > bar.height() * 4.0,
+            "the rail is a column, not another strip (rail {:.0} tall, bar {:.0})",
+            rail.height(),
+            bar.height()
+        );
+        assert!(
+            (rail.width() - crate::theme::RAIL_W).abs() < 0.5,
+            "at this width it is the rail with labels: {:.0}px",
+            rail.width()
+        );
+
+        // every one of the twelve tools is named on it, each inside the rail's own column
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let box_of = |want: &str| -> egui::Rect {
+            let b = nodes
+                .iter()
+                .filter(|(_, n)| n.label().as_deref() == Some(want))
+                .filter_map(|(_, n)| n.bounds())
+                .next()
+                .unwrap_or_else(|| panic!("nothing labelled {want:?}"));
+            egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+        };
+        for tab in Tab::ALL {
+            let row = box_of(tab.label());
+            assert!(
+                row.right() <= rail.right() + 0.5 && row.top() >= rail.top() - 0.5,
+                "{} is a row on the rail, not chrome somewhere else ({row:?} against {rail:?})",
+                tab.label()
+            );
+        }
+
+        // the work sits to the right of the rail and below the bar, inset from both
+        let card = ctx.available_rect();
+        assert!(card.left() >= rail.right() - 0.5, "the work starts after the rail ({card:?})");
+        assert!(card.top() >= bar.bottom() - 0.5, "and below the bar ({card:?})");
+    }
+
+    /// The rail groups the twelve tools, and the grouping accounts for every one of them
+    /// exactly once: the Dashboard pinned on its own, then the three named groups.
+    #[test]
+    fn the_rail_grouping_covers_every_tool_exactly_once() {
+        let mut seen = vec![Tab::Dashboard];
+        for (caption, tabs) in Tab::GROUPS {
+            assert!(!caption.is_empty(), "every group is named");
+            for tab in tabs {
+                assert!(!seen.contains(tab), "{} is in more than one group", tab.label());
+                seen.push(*tab);
+            }
+        }
+        for tab in Tab::ALL {
+            assert!(seen.contains(&tab), "{} is on the rail somewhere", tab.label());
+        }
+        assert_eq!(seen.len(), Tab::ALL.len(), "and nothing is on it that is not a tool: {seen:?}");
+        // the Dashboard is pinned above the groups rather than filed into one of them
+        for (_, tabs) in Tab::GROUPS {
+            assert!(!tabs.contains(&Tab::Dashboard), "the Dashboard is not in a group");
+        }
+    }
+
+    /// Choosing a tool on the rail goes through the same dispatch a shortcut does, and lands on
+    /// that tool. If the rail ever assigned `app.tab` for itself this would still pass -- so the
+    /// test that matters is the one below it, on the shortcut labels the rail reads back.
+    #[test]
+    fn clicking_a_rail_row_opens_that_tool_matrix() {
+        assert_table!(Tab::ALL, |idx, tab| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Dashboard).build_with_ctx();
+            ctx.enable_accesskit();
+            frame(&ctx, &mut app);
+            let update = frame(&ctx, &mut app);
+            let nodes = &update.as_ref().expect("accesskit output").nodes;
+            let b = nodes
+                .iter()
+                .filter(|(_, n)| n.label().as_deref() == Some(tab.label()))
+                .filter_map(|(_, n)| n.bounds())
+                .next()
+                .unwrap_or_else(|| panic!("case #{idx}: no rail row for {}", tab.label()));
+            let centre = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+            let button = |pressed| egui::Event::PointerButton {
+                pos: centre,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            events(&ctx, &mut app, vec![egui::Event::PointerMoved(centre)]);
+            events(&ctx, &mut app, vec![button(true)]);
+            events(&ctx, &mut app, vec![button(false)]);
+            assert_eq!(app.tab, tab, "case #{idx}: the rail opened {}", tab.label());
+        });
+    }
+
+    /// The rail answers the window's width: labels on a wide one, icons on a middling one, and
+    /// an overlay on one too narrow for a column at all -- where the rail takes no width from
+    /// the work and is reached from the handle on the command bar instead.
+    ///
+    /// The old tab strip had none of this. Twelve labels came to around 950px and the strip had
+    /// no scroll and no overflow, so under about 1020px the tabs ran under the icons on its
+    /// right and were simply clipped -- invisible at the default window size, broken on half a
+    /// screen.
+    #[test]
+    fn the_rail_follows_the_window_width_matrix() {
+        struct Case {
+            name: &'static str,
+            width: f32,
+            collapsed: bool,
+            want: crate::ui_core::RailMode,
+        }
+        let cases = [
+            Case { name: "a wide window", width: 1460.0, collapsed: false, want: crate::ui_core::RailMode::Labels },
+            Case { name: "and collapsed by hand", width: 1460.0, collapsed: true, want: crate::ui_core::RailMode::Icons },
+            Case { name: "too narrow for labels", width: 1000.0, collapsed: false, want: crate::ui_core::RailMode::Icons },
+            Case { name: "and collapsing it changes nothing", width: 1000.0, collapsed: true, want: crate::ui_core::RailMode::Icons },
+            Case { name: "too narrow for a column", width: 700.0, collapsed: false, want: crate::ui_core::RailMode::Overlay },
+            Case { name: "narrow and collapsed", width: 700.0, collapsed: true, want: crate::ui_core::RailMode::Overlay },
+        ];
+        assert_table!(cases, |idx, case| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+            ctx.enable_accesskit();
+            app.rail_collapsed = case.collapsed;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(case.width, 900.0))),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let _ = ctx.run(input.clone(), |ctx| crate::ui_core::frame(&mut app, ctx));
+            }
+            let what = format!("case #{idx} ({}, {}px)", case.name, case.width);
+            assert_eq!(crate::ui_core::rail_mode(&app, &ctx), case.want, "{what}");
+
+            match case.want {
+                crate::ui_core::RailMode::Labels => {
+                    let r = panel_rect(&ctx, "rail");
+                    assert!((r.width() - crate::theme::RAIL_W).abs() < 0.5, "{what}: {:.0}px wide", r.width());
+                }
+                crate::ui_core::RailMode::Icons => {
+                    let r = panel_rect(&ctx, "rail");
+                    assert!(
+                        (r.width() - crate::theme::RAIL_W_COLLAPSED).abs() < 0.5,
+                        "{what}: {:.0}px wide",
+                        r.width()
+                    );
+                }
+                crate::ui_core::RailMode::Overlay => {
+                    // no column: the work has the window's whole width, bar the card's gutter
+                    assert!(
+                        crate::ui_core::rail_mode(&app, &ctx) == crate::ui_core::RailMode::Overlay,
+                        "{what}: the rail is an overlay"
+                    );
+                    let work = ctx.available_rect();
+                    assert!(
+                        work.left() < crate::theme::RAIL_W_COLLAPSED,
+                        "{what}: the rail takes no width from the work (work starts at {:.0})",
+                        work.left()
+                    );
+                }
+            }
+            // whatever the rail is doing, nothing is ever clipped off the right of the window
+            let bar = panel_rect(&ctx, "command_bar");
+            assert!(bar.right() <= case.width + 0.5, "{what}: the bar fits the window ({bar:?})");
+        });
+    }
+
+    /// Only the four tools with more than one view draw a segmented bar in their card header.
+    /// The other eight draw none at all, which is the whole point: that height goes to the work.
+    #[test]
+    fn only_the_tools_with_sub_views_draw_a_segmented_bar_matrix() {
+        assert_table!(Tab::ALL, |idx, tab| {
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(tab).build_with_ctx();
+            ctx.enable_accesskit();
+            frame(&ctx, &mut app);
+            let seen = labels(&frame(&ctx, &mut app));
+            let views = tab.sub_views();
+            if views.is_empty() {
+                continue;
+            }
+            for view in views {
+                assert!(
+                    seen.iter().any(|l| l == view),
+                    "case #{idx} ({}): the segmented bar offers {view:?} in {seen:?}",
+                    tab.label()
+                );
+            }
+        });
+
+        // and the four are the four they are meant to be
+        let with: Vec<&str> = Tab::ALL.iter().filter(|t| !t.sub_views().is_empty()).map(|t| t.label()).collect();
+        assert_eq!(with, vec!["Target", "Proxy", "Sequencer", "Decoder"], "which tools have a second level");
+        // the Dashboard's own `task_sub` belongs to a scan card inside the body, not to the tool
+        assert!(Tab::Dashboard.sub_views().is_empty(), "the Dashboard's card header carries no bar");
     }
 
     /// Every tool draws under both themes. The palette is swapped underneath a live app rather

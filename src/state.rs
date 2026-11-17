@@ -31,6 +31,55 @@ impl Tab {
             Tab::Logger => "Logger", Tab::Organizer => "Organizer", Tab::Automation => "Automation",
         }
     }
+
+    /// How the navigation rail groups the tools. `Dashboard` is pinned on its own above these,
+    /// so it is deliberately absent here; every other tab appears exactly once, which
+    /// [`Tab::ALL`] and this list are checked against in the tests.
+    pub const GROUPS: [(&'static str, &'static [Tab]); 3] = [
+        ("TRAFFIC", &[Tab::Proxy, Tab::Target, Tab::Logger]),
+        ("TESTING", &[Tab::Repeater, Tab::Intruder, Tab::Interactor, Tab::Sequencer]),
+        ("TOOLS", &[Tab::Decoder, Tab::Comparer, Tab::Organizer, Tab::Automation]),
+    ];
+
+    /// The drawn glyph the rail identifies this tool by, which is all there is to go on once
+    /// the rail is collapsed to icons.
+    pub fn icon(&self) -> theme::ToolIcon {
+        use theme::ToolIcon as I;
+        match self {
+            Tab::Dashboard => I::Gauge,
+            Tab::Target => I::Crosshair,
+            Tab::Proxy => I::Relay,
+            Tab::Intruder => I::Grid,
+            Tab::Repeater => I::Loop,
+            Tab::Interactor => I::Waves,
+            Tab::Sequencer => I::Bars,
+            Tab::Decoder => I::Braces,
+            Tab::Comparer => I::Columns,
+            Tab::Logger => I::Lines,
+            Tab::Organizer => I::Tray,
+            Tab::Automation => I::Cogs,
+        }
+    }
+
+    /// The sub-views this tool is divided into, in the order the segmented bar shows them, or
+    /// an empty slice for a tool that has only one view.
+    ///
+    /// Four of the twelve tools have a second level, and each keeps its own index in `App`
+    /// (`target_sub`, `proxy_sub`, `seq_sub`, `dec_view`). A tool with nothing here draws no
+    /// bar at all, so its body starts at the top of the card and keeps that height.
+    ///
+    /// The Dashboard is not one of them. Its `task_sub` switches the views of a single scan
+    /// card *inside* the body, several levels down, and belongs to that card rather than to
+    /// the tool -- so the Dashboard's card header carries no bar either.
+    pub fn sub_views(&self) -> &'static [&'static str] {
+        match self {
+            Tab::Target => &["Site map", "Scope", "Issues"],
+            Tab::Proxy => &["Intercept", "HTTP history", "Match and replace", "Proxy settings"],
+            Tab::Sequencer => &["Capture", "Manual load", "Analysis"],
+            Tab::Decoder => &["Transform", "JWT Inspector"],
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -625,6 +674,15 @@ pub struct App {
     pub palette_sel: usize,
     /// Bottom drawer above the status bar: which tab is open, if any.
     pub drawer: Option<DrawerTab>,
+    /// The navigation rail collapsed to icons by hand, with the `<<` button at its foot.
+    ///
+    /// This is the user's own say, and only ever *narrows* the rail: the window's width has
+    /// the final word on how wide the rail may be (see [`crate::ui_core::rail_mode`]), so a
+    /// window too narrow for labels shows icons whatever this holds.
+    pub rail_collapsed: bool,
+    /// Whether the rail is showing as an overlay, which is the only way to reach it on a
+    /// window too narrow to give it a column of its own. Closes on any navigation.
+    pub rail_overlay: bool,
     pub rep_follow: bool,
     pub int_concurrency: usize,
     pub int_delay_ms: u64,
@@ -877,6 +935,8 @@ impl App {
             palette_query: String::new(),
             palette_sel: 0,
             drawer: None,
+            rail_collapsed: false,
+            rail_overlay: false,
             rep_follow: rules::REPEATER_FOLLOW_REDIRECTS,
             int_concurrency: rules::POOL_CONCURRENT_LIMIT,
             int_delay_ms: 0,

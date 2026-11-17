@@ -4,7 +4,7 @@ use crate::editor;
 use crate::proxy::{self, Decision};
 use crate::rewrite::{self, RuleAction, RuleType};
 use crate::rules;
-use crate::state::App;
+use crate::state::{App, Tab};
 use crate::theme::{self, bold, EmptyIcon, Palette};
 use crate::ui_core::sub_tabs;
 use eframe::egui;
@@ -12,7 +12,7 @@ use egui::{FontId, RichText, Ui};
 use std::sync::atomic::Ordering;
 
 pub fn proxy(app: &mut App, ui: &mut Ui, p: &Palette) {
-    sub_tabs(ui, p, &["Intercept", "HTTP history", "Match and replace", "Proxy settings"], &mut app.proxy_sub);
+    sub_tabs(ui, p, Tab::Proxy.sub_views(), &mut app.proxy_sub);
     match app.proxy_sub {
         1 => history(app, ui, p),
         2 => match_replace(app, ui, p),
