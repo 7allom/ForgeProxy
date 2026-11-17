@@ -165,17 +165,65 @@ fn log_level(events: &Events, level: Level, msg: impl Into<String>) {
 
 /// Start listening on `addr`. Returns an error text if the port can't be opened.
 pub fn start(shared: Shared, addr: String) -> Result<(), String> {
+    // the app stops the listener through `shared.stop`; the handle is not needed here
+    listen(shared, addr).map(drop)
+}
+
+/// A running listener: what is needed to stop it and wait for the traffic it let in.
+pub struct Listener {
+    stop: Arc<AtomicBool>,
+    accept_loop: std::thread::JoinHandle<()>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Listener {
+    /// Stop taking new connections, close the listening socket, and wait up to `grace` for the
+    /// connections already accepted to finish, so what they record lands in the history.
+    /// Returns how many were still open when the grace ran out (0 when all finished).
+    pub fn shutdown(self, grace: Duration) -> usize {
+        self.stop.store(true, Ordering::SeqCst);
+        // the accept loop polls the flag every few milliseconds; joining it drops the socket
+        let _ = self.accept_loop.join();
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let open = self.in_flight.load(Ordering::SeqCst);
+            if open == 0 || std::time::Instant::now() >= deadline {
+                return open;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Counts a connection as open for as long as it lives, even if its handler panics.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Start listening on `addr` and return the handle that stops it. Setting `shared.stop` stops
+/// it as well; the handle adds a join of the accept loop and a wait for open connections.
+pub fn listen(shared: Shared, addr: String) -> Result<Listener, String> {
     let listener = TcpListener::bind(&addr).map_err(|e| format!("Proxy could not listen on {addr}: {e}"))?;
     listener.set_nonblocking(true).ok();
     shared.running.store(true, Ordering::SeqCst);
     shared.stop.store(false, Ordering::SeqCst);
     log(&shared.events, format!("Proxy service started on {addr}"));
-    std::thread::spawn(move || {
+    let stop = shared.stop.clone();
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open = in_flight.clone();
+    let accept_loop = std::thread::spawn(move || {
         while !shared.stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let sh = shared.clone();
+                    open.fetch_add(1, Ordering::SeqCst);
+                    let guard = InFlight(open.clone());
                     std::thread::spawn(move || {
+                        let _guard = guard;
                         let _ = stream.set_nonblocking(false);
                         handle(sh, stream);
                     });
@@ -183,10 +231,11 @@ pub fn start(shared: Shared, addr: String) -> Result<(), String> {
                 Err(_) => std::thread::sleep(Duration::from_millis(30)),
             }
         }
+        drop(listener);
         shared.running.store(false, Ordering::SeqCst);
         log(&shared.events, "Proxy service stopped");
     });
-    Ok(())
+    Ok(Listener { stop, accept_loop, in_flight })
 }
 
 impl Shared {

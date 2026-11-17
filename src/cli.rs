@@ -13,6 +13,8 @@ use crate::tooling::{
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Everything asked for went as it should.
 pub const EXIT_OK: i32 = 0;
@@ -1490,12 +1492,56 @@ Options:
   --project <path>       The .forge file the captured traffic is written to. Required.
   --bind <host>          The address to listen on (default from settings).
   --port <n>             The port to listen on (default from settings).
-  --duration <secs>      Stop after this many seconds. Without it, runs until the process is
-                         ended, writing what it has every couple of seconds so nothing is lost.
+  --duration <secs>      Stop after this many seconds. Without it, runs until interrupted.
+
+Ctrl+C or a termination request stops the listener, writes the project one last time and
+exits 0. A snapshot is also written every couple of seconds in case the process is killed.
   --config <dir>         Read settings.json from here.
 ";
 
 fn sub_proxy(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    sub_proxy_until(argv, out, err, None)
+}
+
+/// A flag that turns true when the process is asked to stop (Ctrl+C, or a termination
+/// request), set up once per process; later calls hand back the same flag. When the handler
+/// cannot be set up, the flag still works for `--duration` and the process can be ended as before.
+fn interrupt_flag(err: &mut dyn Write) -> Arc<AtomicBool> {
+    static FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    let mut failure = None;
+    let flag = FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let raised = flag.clone();
+        match ctrlc::set_handler(move || raised.store(true, Ordering::SeqCst)) {
+            // something else in the process already listens for it; carry on without ours
+            Ok(()) | Err(ctrlc::Error::MultipleHandlers) => {}
+            Err(e) => failure = Some(e.to_string()),
+        }
+        flag
+    });
+    if let Some(e) = failure {
+        let _ = writeln!(err, "Couldn't listen for Ctrl+C ({e}); ending the process still keeps the last snapshot.");
+    }
+    flag.clone()
+}
+
+/// How long a stopping proxy waits for connections it already accepted to finish.
+const PROXY_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often the headless proxy checks whether it should stop.
+const PROXY_WAKE: std::time::Duration = std::time::Duration::from_millis(50);
+/// How often the headless proxy writes a snapshot of the capture while it runs.
+const PROXY_SNAPSHOT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The `proxy` subcommand, stopping when `shutdown` turns true or `--duration` runs out,
+/// whichever comes first. Either way the listener is closed, open connections get a moment to
+/// finish, and the project is written one last time. With `shutdown` left `None`, the
+/// process-wide Ctrl+C flag is set up just before listening; tests pass a flag of their own.
+fn sub_proxy_until(
+    argv: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    shutdown: Option<Arc<AtomicBool>>,
+) -> i32 {
     let parsed = match SubArgs::parse(
         argv,
         &["--project", "--bind", "--port", "--duration", "--config"],
@@ -1542,15 +1588,20 @@ fn sub_proxy(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let tls = load_ca_cache(&config_dir_of(&parsed));
     let shared = crate::proxy::Shared::headless(history.clone(), next_id.clone(), rules, &settings, tls);
     let addr = format!("{host}:{port}");
-    if let Err(e) = crate::proxy::start(shared, addr.clone()) {
-        return refuse(err, &e);
-    }
+    let shutdown = match shutdown {
+        Some(flag) => flag,
+        None => interrupt_flag(err),
+    };
+    let listener = match crate::proxy::listen(shared, addr.clone()) {
+        Ok(l) => l,
+        Err(e) => return refuse(err, &e),
+    };
     match &duration {
         Some(d) => {
             let _ = writeln!(err, "Listening on {addr} for {} s. Point a browser's proxy at it.", d.as_secs());
         }
         None => {
-            let _ = writeln!(err, "Listening on {addr}. End the process to stop; progress is saved as it arrives.");
+            let _ = writeln!(err, "Listening on {addr}. Press Ctrl+C to stop; progress is saved as it arrives.");
         }
     }
 
@@ -1564,22 +1615,39 @@ fn sub_proxy(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
 
     let started = std::time::Instant::now();
-    let step = std::time::Duration::from_millis(500);
-    let mut last_flush = std::time::Instant::now();
-    loop {
-        std::thread::sleep(step);
-        if duration.map_or(false, |d| started.elapsed() >= d) {
-            break;
+    let mut last_flush = started;
+    let interrupted = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break true;
         }
-        // with no deadline, write a snapshot every couple of seconds so a kill loses nothing
-        if duration.is_none() && last_flush.elapsed() >= std::time::Duration::from_secs(2) {
-            let _ = flush(&mut file);
+        if duration.map_or(false, |d| started.elapsed() >= d) {
+            break false;
+        }
+        // a snapshot every couple of seconds, so a process that is killed outright loses little
+        if last_flush.elapsed() >= PROXY_SNAPSHOT {
+            if let Err(e) = flush(&mut file) {
+                let _ = writeln!(err, "Couldn't write a snapshot of {project_path}: {e}");
+            }
             last_flush = std::time::Instant::now();
         }
+        std::thread::sleep(PROXY_WAKE);
+    };
+    if interrupted {
+        let _ = writeln!(err, "Stopping: closing the listener and saving the capture.");
+    }
+    // no new connections from here; the ones already open get a moment to record what they carry
+    let still_open = listener.shutdown(PROXY_DRAIN);
+    if still_open > 0 {
+        let _ = writeln!(err, "{still_open} connection(s) still open after {} s; saving without them.", PROXY_DRAIN.as_secs());
     }
     match flush(&mut file) {
         Ok(n) => {
-            let _ = writeln!(err, "Captured {n} {}; wrote {project_path}.", if n == 1 { "request" } else { "requests" });
+            let _ = writeln!(
+                err,
+                "Captured {n} {}; wrote {project_path} after {:.1} s.",
+                if n == 1 { "request" } else { "requests" },
+                started.elapsed().as_secs_f64()
+            );
             EXIT_OK
         }
         Err(e) => refuse(err, &format!("Couldn't save {project_path}: {e}")),
@@ -3097,7 +3165,8 @@ mod subcommand_tests {
                 .map(|s| s.to_string())
                 .collect();
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            sub_proxy(&argv, &mut out, &mut err)
+            // a flag of its own, so the test process's Ctrl+C is left alone
+            sub_proxy_until(&argv, &mut out, &mut err, Some(Arc::new(AtomicBool::new(false))))
         });
 
         // give the listener a moment, then send an absolute-form request as a browser's proxy would
@@ -3114,6 +3183,76 @@ mod subcommand_tests {
         let saved = crate::project::read(&project.display().to_string()).expect("the project was written");
         assert!(saved.history.iter().any(|e| e.path == "/proxied"), "the proxied request was captured: {:?}",
             saved.history.iter().map(|e| e.path.clone()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A free loopback port, released for the proxy to take.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// Send one absolute-form request through the proxy on `proxy_port`, retrying while the
+    /// listener comes up, and read the whole answer.
+    fn through_proxy(proxy_port: u16, host_port: &str, path: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::net::TcpStream::connect(("127.0.0.1", proxy_port)) {
+                Ok(mut stream) => {
+                    let req = format!("GET http://{host_port}{path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+                    stream.write_all(req.as_bytes()).expect("the request is sent");
+                    let mut answer = String::new();
+                    let _ = stream.read_to_string(&mut answer);
+                    return answer;
+                }
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => panic!("the proxy never listened on {proxy_port}: {e}"),
+            }
+        }
+    }
+
+    /// Raising the shutdown flag ends a long --duration run within moments: the listener closes,
+    /// everything captured is in the project, and the exit code is 0.
+    #[test]
+    fn proxy_stops_at_once_when_the_shutdown_flag_is_raised() {
+        let origin = serve(|path, _| (200, format!("served {path}")));
+        let host_port = origin.trim_start_matches("http://").to_string();
+        let dir = work_dir("proxy-stop");
+        let project = dir.join("stop.forge");
+        let proxy_port = free_port();
+        let project_arg = project.display().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let raised = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            let argv: Vec<String> = ["--bind", "127.0.0.1", "--port", &proxy_port.to_string(), "--project", &project_arg, "--duration", "600"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = sub_proxy_until(&argv, &mut out, &mut err, Some(raised));
+            (code, String::from_utf8_lossy(&err).into_owned())
+        });
+
+        for path in ["/first", "/second"] {
+            let answer = through_proxy(proxy_port, &host_port, path);
+            assert!(answer.contains(&format!("served {path}")), "the proxy forwarded {path}: {answer:?}");
+        }
+
+        let asked = std::time::Instant::now();
+        shutdown.store(true, Ordering::SeqCst);
+        let (code, err) = handle.join().expect("the proxy thread");
+        let took = asked.elapsed();
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(took < std::time::Duration::from_secs(2), "stopped in {took:?}, not at the 600 s deadline");
+        assert!(err.contains("Captured 2 requests") && err.contains(&project.display().to_string()), "{err}");
+
+        // the listener is closed: nothing answers on its port any more
+        assert!(std::net::TcpStream::connect(("127.0.0.1", proxy_port)).is_err(), "the port was released");
+
+        let saved = crate::project::read(&project.display().to_string()).expect("the project was written");
+        let mut paths: Vec<String> = saved.history.iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, ["/first", "/second"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -31,6 +31,8 @@ rsa = "0.10.0"
 aes = "0.9.4"
 ctr = "0.10.1"
 rand = "0.10.3"
+# headless `proxy`: catch Ctrl+C and termination requests to flush the project and exit 0
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [profile.dev]
 opt-level = 1
