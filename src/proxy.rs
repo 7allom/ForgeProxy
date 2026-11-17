@@ -803,10 +803,16 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
     lines.push("Connection: close".into());
     let headers_text = lines.join("\n");
     let rules_now = sh.rules.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let (headers_text, body_text) = match &text_body {
-        Some(t) => rewrite::apply(&rules_now, true, &headers_text, t),
-        None => (rewrite::apply(&rules_now, true, &headers_text, "").0, placeholder.clone()),
+    let (headers_text, body_text, req_warnings) = match &text_body {
+        Some(t) => rewrite::apply_collecting(&rules_now, true, &headers_text, t),
+        None => {
+            let (h, _, w) = rewrite::apply_collecting(&rules_now, true, &headers_text, "");
+            (h, placeholder.clone(), w)
+        }
     };
+    for w in &req_warnings {
+        log_warning(&sh.events, format!("Match & Replace: {w} on {method} {}", at.url(&path)));
+    }
     // the request line gets its own rules, so a path or a method can be rewritten without a
     // rule reaching the same text in a header; history then follows what the rule produced
     let first_line = rewrite::apply_first_line(&rules_now, &format!("{method} {path} HTTP/1.1"));
@@ -915,10 +921,27 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
             Err(msg) => fail(msg),
         };
     let truncated = remainder.is_some();
-    // response rules apply to headers (body passes through unchanged)
+    // response rules apply to the headers, and to a body that was buffered whole and is text;
+    // a streamed (truncated) or binary body passes through unchanged, since it cannot be
+    // transformed as one piece. apply_collecting keeps Content-Length honest when a body rule
+    // changes the body's length.
     let resp_head_lf = resp_head.replace("\r\n", "\n");
     let (first, rest) = resp_head_lf.trim_end().split_once('\n').unwrap_or((resp_head_lf.trim_end(), ""));
-    let (mut rest2, _) = rewrite::apply(&rules_now, false, rest, "");
+    let resp_is_text = !truncated && std::str::from_utf8(&resp_body).is_ok();
+    let (mut rest2, resp_body) = if resp_is_text {
+        let text = String::from_utf8(resp_body).expect("checked as UTF-8 just above");
+        let (h, b, warns) = rewrite::apply_collecting(&rules_now, false, rest, &text);
+        for w in &warns {
+            log_warning(&sh.events, format!("Match & Replace: {w} on the response to {method} {}", at.url(&path)));
+        }
+        (h, b.into_bytes())
+    } else {
+        let (h, _, warns) = rewrite::apply_collecting(&rules_now, false, rest, "");
+        for w in &warns {
+            log_warning(&sh.events, format!("Match & Replace: {w} on the response to {method} {}", at.url(&path)));
+        }
+        (h, resp_body)
+    };
     if truncated {
         // the total length isn't known yet: the response ends when the connection does
         let kept: Vec<String> = rest2.lines().filter(|l| !l.to_ascii_lowercase().starts_with("connection:")).map(String::from).collect();
@@ -1202,6 +1225,7 @@ mod tests {
         sh.rules.lock().unwrap().push(crate::rewrite::Rule {
             enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::ResponseHeader, regex: true,
             match_text: "^Set-Cookie.*$".into(), replace_text: String::new(), comment: String::new(),
+            ..Default::default()
         });
         let pp = free_port();
         start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
@@ -1411,6 +1435,7 @@ mod tests {
             enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestFirstLine,
             regex: true, match_text: "^GET /api/v1/".into(), replace_text: "POST /api/v2/".into(),
             comment: String::new(),
+            ..Default::default()
         });
         let pp = free_port();
         start(sh.clone(), format!("127.0.0.1:{pp}")).unwrap();
@@ -1750,6 +1775,7 @@ mod tests {
         sh.rules.lock().unwrap().push(crate::rewrite::Rule {
             enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestHeader, regex: false,
             match_text: String::new(), replace_text: "X-Forge: yes".into(), comment: String::new(),
+            ..Default::default()
         });
         let tls = https_client(pp, &format!("127.0.0.1:{up}"), "127.0.0.1", &proxy_ca).expect("client trusts the proxy's certificate");
         let mut io = BufReader::new(tls);
@@ -2182,6 +2208,7 @@ mod tests {
         crate::rewrite::Rule {
             enabled: true, case_sensitive: true, kind: crate::rewrite::RuleType::RequestBody, regex: false,
             match_text: from.into(), replace_text: to.into(), comment: String::new(),
+            ..Default::default()
         }
     }
 
@@ -2216,6 +2243,46 @@ mod tests {
         let sent = got.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(sent.ends_with("lion=café".as_bytes()), "{}", String::from_utf8_lossy(&sent));
         assert!(String::from_utf8_lossy(&sent).contains("Content-Length: 10\r\n"));
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// An External Command rule transforms a request body before it is forwarded, and the
+    /// forwarded Content-Length matches what the command produced.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_rule_transforms_a_request_body_on_the_wire() {
+        let (up, got) = capture_upstream(ok_response());
+        let sh = shared();
+        let mut rule = crate::rewrite::Rule::new(crate::rewrite::RuleType::RequestBody);
+        rule.action = crate::rewrite::RuleAction::TransformCommand;
+        rule.command = "tr -d -".into(); // drop every hyphen, shrinking the body
+        sh.rules.lock().unwrap().push(rule);
+        let pp = running_proxy(&sh);
+        let req = format!("POST http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\na-b-c-d");
+        bytes_through(pp, req.as_bytes());
+        let sent = got.recv_timeout(Duration::from_secs(5)).unwrap();
+        let text = String::from_utf8_lossy(&sent);
+        assert!(text.ends_with("abcd"), "the command's output was forwarded: {text}");
+        assert!(text.contains("Content-Length: 4\r\n"), "the length followed the shorter body: {text}");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// An External Command rule transforms a buffered response body on its way to the client.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_rule_transforms_a_response_body_to_the_client() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let (up, _got) = capture_upstream(resp);
+        let sh = shared();
+        let mut rule = crate::rewrite::Rule::new(crate::rewrite::RuleType::ResponseBody);
+        rule.action = crate::rewrite::RuleAction::TransformCommand;
+        rule.command = "tr a-z A-Z".into(); // upper-case, same length
+        sh.rules.lock().unwrap().push(rule);
+        let pp = running_proxy(&sh);
+        let req = format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let back = bytes_through(pp, req.as_bytes());
+        let text = String::from_utf8_lossy(&back);
+        assert!(text.ends_with("HELLO"), "the response body reached the client transformed: {text}");
         sh.stop.store(true, Ordering::SeqCst);
     }
 

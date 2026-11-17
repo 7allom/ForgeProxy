@@ -12,6 +12,37 @@
 //!   text alike.
 
 use regex::Regex;
+use std::time::{Duration, Instant};
+
+/// What a matching rule does to the text it matched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RuleAction {
+    /// Literal or regular-expression replacement, the long-standing behaviour.
+    #[default]
+    Replace,
+    /// Pipe the matched header block or body through an external command and take its output
+    /// in their place. The command is named by [`Rule::command`] and stopped after
+    /// [`Rule::timeout_ms`].
+    TransformCommand,
+}
+
+impl RuleAction {
+    pub const ALL: [RuleAction; 2] = [RuleAction::Replace, RuleAction::TransformCommand];
+    pub fn label(&self) -> &'static str {
+        match self {
+            RuleAction::Replace => "Replace",
+            RuleAction::TransformCommand => "External command",
+        }
+    }
+}
+
+/// How long an External Command transform may run before it is stopped, when a rule names no
+/// timeout of its own.
+pub const DEFAULT_TRANSFORM_TIMEOUT_MS: u64 = 1000;
+
+/// The most output one External Command transform may return. A process that writes more than
+/// this is stopped and its output discarded, so a runaway filter cannot exhaust memory.
+pub const MAX_TRANSFORM_OUTPUT: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuleType {
@@ -64,10 +95,32 @@ pub struct Rule {
     /// case sensitive, which is how they behaved when they were saved.
     #[serde(default = "case_sensitive_default")]
     pub case_sensitive: bool,
+    /// What the rule does when it matches: a replacement, or an external command transform.
+    /// Rules saved before this setting existed read back as [`RuleAction::Replace`].
+    #[serde(default)]
+    pub action: RuleAction,
+    /// The command line an [`RuleAction::TransformCommand`] rule runs: the first word is the
+    /// program, the rest its arguments. Empty for a replacement rule.
+    #[serde(default)]
+    pub command: String,
+    /// How long that command may run, in milliseconds, before it is stopped and the original
+    /// bytes are kept. Rules saved before this setting existed read back at the default.
+    #[serde(default = "transform_timeout_default")]
+    pub timeout_ms: u64,
 }
 
 fn case_sensitive_default() -> bool {
     true
+}
+
+fn transform_timeout_default() -> u64 {
+    DEFAULT_TRANSFORM_TIMEOUT_MS
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Rule::new(RuleType::RequestHeader)
+    }
 }
 
 impl Rule {
@@ -81,8 +134,104 @@ impl Rule {
             replace_text: String::new(),
             comment: String::new(),
             case_sensitive: kind.starts_case_sensitive(),
+            action: RuleAction::Replace,
+            command: String::new(),
+            timeout_ms: DEFAULT_TRANSFORM_TIMEOUT_MS,
         }
     }
+
+    /// The transform timeout as a [`Duration`], never zero so a rule cannot ask for a command
+    /// that is killed before it can start.
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.max(1))
+    }
+
+    /// Does this rule's match gate let its command run against `slice`? An empty match always
+    /// does; otherwise the pattern must be found somewhere in the slice. An invalid pattern
+    /// matches nothing, so the command is skipped rather than run on everything.
+    fn command_gate_open(&self, slice: &str) -> bool {
+        if self.match_text.is_empty() {
+            return true;
+        }
+        matcher(self).is_some_and(|re| re.is_match(slice))
+    }
+}
+
+/// Run `command` as a child process, write `input` to its stdin, and return what it writes to
+/// stdout. Stdin and stdout are each drained on their own thread so a filter that writes a lot
+/// before reading all of its input cannot deadlock against a full pipe.
+///
+/// The guardrails are strict: the child is killed if it outlives `timeout`, its output is
+/// capped at [`MAX_TRANSFORM_OUTPUT`], and a failure to spawn, an over-cap, a timeout or a
+/// non-zero exit all return `Err` so the caller can keep the original bytes.
+fn run_transform(command: &str, timeout: Duration, input: &[u8]) -> Result<Vec<u8>, String> {
+    use std::process::{Command, Stdio};
+    let mut parts = command.split_whitespace();
+    let program = parts.next().ok_or_else(|| "the command is empty".to_string())?;
+    let args: Vec<&str> = parts.collect();
+    let mut child = Command::new(program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {program:?}: {e}"))?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| "the command took no input".to_string())?;
+    let input_owned = input.to_vec();
+    // dropping `stdin` at the end of the closure sends EOF; a broken pipe (the child read none
+    // of it) is not an error here
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(&input_owned);
+    });
+
+    let mut stdout = child.stdout.take().ok_or_else(|| "the command gave no output".to_string())?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        // one byte past the cap, so going over it can be told apart from landing exactly on it
+        let _ = stdout.by_ref().take((MAX_TRANSFORM_OUTPUT as u64) + 1).read_to_end(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writer.join();
+                let _ = reader.join();
+                return Err(format!("{program:?} could not be waited on: {e}"));
+            }
+        }
+    };
+    let Some(status) = status else {
+        // over its time: stop it, let the pipe close, and abandon whatever it produced
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = writer.join();
+        let _ = reader.join();
+        return Err(format!("{program:?} ran longer than {} ms and was stopped", timeout.as_millis()));
+    };
+    let _ = writer.join();
+    let out = reader.join().map_err(|_| "the command output could not be read".to_string())?;
+    if out.len() > MAX_TRANSFORM_OUTPUT {
+        return Err(format!("{program:?} wrote more than {} MiB", MAX_TRANSFORM_OUTPUT >> 20));
+    }
+    if !status.success() {
+        let how = status.code().map(|c| format!("code {c}")).unwrap_or_else(|| "a signal".into());
+        return Err(format!("{program:?} exited with {how}"));
+    }
+    Ok(out)
 }
 
 fn matcher(rule: &Rule) -> Option<Regex> {
@@ -90,7 +239,27 @@ fn matcher(rule: &Rule) -> Option<Regex> {
     crate::regex_cache::get_with(&pattern, !rule.case_sensitive)
 }
 
-fn apply_headers(rule: &Rule, headers: &str) -> String {
+/// Run a header or body slice through a [`RuleAction::TransformCommand`] rule's command,
+/// returning the transformed text. When the gate is closed the slice is returned unchanged;
+/// when the command fails, times out or over-runs its cap, the slice is kept and a concise
+/// warning is pushed for the caller to log, so a bad command never drops the exchange.
+fn apply_command(rule: &Rule, slice: &str, warnings: &mut Vec<String>) -> String {
+    if rule.command.trim().is_empty() || !rule.command_gate_open(slice) {
+        return slice.to_string();
+    }
+    match run_transform(&rule.command, rule.timeout(), slice.as_bytes()) {
+        Ok(out) => String::from_utf8_lossy(&out).into_owned(),
+        Err(why) => {
+            warnings.push(format!("the {} command was kept out ({why})", rule.kind.label().to_lowercase()));
+            slice.to_string()
+        }
+    }
+}
+
+fn apply_headers(rule: &Rule, headers: &str, warnings: &mut Vec<String>) -> String {
+    if rule.action == RuleAction::TransformCommand {
+        return apply_command(rule, headers, warnings);
+    }
     if rule.match_text.is_empty() {
         if rule.replace_text.is_empty() {
             return headers.to_string();
@@ -121,7 +290,10 @@ fn apply_headers(rule: &Rule, headers: &str) -> String {
     out.join("\n")
 }
 
-fn apply_body(rule: &Rule, body: &str) -> String {
+fn apply_body(rule: &Rule, body: &str, warnings: &mut Vec<String>) -> String {
+    if rule.action == RuleAction::TransformCommand {
+        return apply_command(rule, body, warnings);
+    }
     if rule.match_text.is_empty() {
         return body.to_string();
     }
@@ -137,28 +309,71 @@ fn apply_body(rule: &Rule, body: &str) -> String {
     }
 }
 
-/// Apply enabled request (or response) rules to (headers, body). The request line is not
-/// part of either: [`apply_first_line`] handles the rules that work on it.
-pub fn apply(rules: &[Rule], request: bool, headers: &str, body: &str) -> (String, String) {
-    let mut h = headers.to_string();
-    let mut b = body.to_string();
-    for r in rules.iter().filter(|r| r.enabled && r.kind.is_request() == request && !r.kind.is_first_line()) {
-        if r.kind.is_header() {
-            h = apply_headers(r, &h);
+/// Update a header block to frame a body of `body_len` bytes: an existing `Content-Length` is
+/// corrected, and a chunked `Transfer-Encoding` is dropped (the body has been buffered and
+/// transformed, so it is now framed by length). A block that named neither is left untouched
+/// but for a length added when a chunked encoding was stripped.
+fn reconcile_content_length(headers: &str, body_len: usize) -> String {
+    let mut out = Vec::new();
+    let mut had_length = false;
+    let mut stripped_chunked = false;
+    for line in headers.lines() {
+        let key = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        if key == "content-length" {
+            had_length = true;
+            out.push(format!("Content-Length: {body_len}"));
+        } else if key == "transfer-encoding" && line.to_ascii_lowercase().contains("chunked") {
+            stripped_chunked = true;
         } else {
-            b = apply_body(r, &b);
+            out.push(line.to_string());
         }
     }
+    if stripped_chunked && !had_length {
+        out.push(format!("Content-Length: {body_len}"));
+    }
+    out.join("\n")
+}
+
+/// Apply enabled request (or response) rules to (headers, body), discarding any warnings. The
+/// request line is not part of either: [`apply_first_line`] handles the rules that work on it.
+pub fn apply(rules: &[Rule], request: bool, headers: &str, body: &str) -> (String, String) {
+    let (h, b, _) = apply_collecting(rules, request, headers, body);
     (h, b)
+}
+
+/// As [`apply`], but also returning a concise warning for each external-command transform that
+/// could not run, so a caller that forwards live traffic can log them rather than lose them.
+///
+/// When a body command transform changes the body's byte length, the returned header block is
+/// reconciled so its `Content-Length` frames the body the function returns.
+pub fn apply_collecting(rules: &[Rule], request: bool, headers: &str, body: &str) -> (String, String, Vec<String>) {
+    let mut h = headers.to_string();
+    let mut b = body.to_string();
+    let mut warnings = Vec::new();
+    for r in rules.iter().filter(|r| r.enabled && r.kind.is_request() == request && !r.kind.is_first_line()) {
+        if r.kind.is_header() {
+            h = apply_headers(r, &h, &mut warnings);
+        } else {
+            b = apply_body(r, &b, &mut warnings);
+        }
+    }
+    // a body rule (a command especially) may have changed the body's length; keep the headers
+    // it is framed by honest
+    if b.len() != body.len() {
+        h = reconcile_content_length(&h, b.len());
+    }
+    (h, b, warnings)
 }
 
 /// Apply the enabled "Request first line" rules to a request line ("GET /a?b=1 HTTP/1.1").
 /// Only that line is offered to them, so a path can be rewritten without a rule reaching the
-/// same text in a header or in the body.
+/// same text in a header or in the body. External-command rules never run on the request line;
+/// a command transforms a header block or a body, never the one line a method and path live on.
 pub fn apply_first_line(rules: &[Rule], line: &str) -> String {
+    let mut sink = Vec::new();
     let mut out = line.to_string();
-    for r in rules.iter().filter(|r| r.enabled && r.kind.is_first_line()) {
-        out = apply_body(r, &out);
+    for r in rules.iter().filter(|r| r.enabled && r.kind.is_first_line() && r.action == RuleAction::Replace) {
+        out = apply_body(r, &out, &mut sink);
     }
     out
 }
@@ -192,6 +407,7 @@ pub fn defaults() -> Vec<Rule> {
         comment: c.into(),
         case_sensitive: kind.starts_case_sensitive(),
         kind,
+        ..Rule::new(kind)
     };
     use RuleType::*;
     vec![
@@ -216,7 +432,7 @@ mod tests {
     use crate::test_utils::assert_table;
 
     fn r(kind: RuleType, regex: bool, m: &str, rep: &str) -> Rule {
-        Rule { enabled: true, kind, regex, match_text: m.into(), replace_text: rep.into(), comment: String::new(), case_sensitive: true }
+        Rule { enabled: true, kind, regex, match_text: m.into(), replace_text: rep.into(), comment: String::new(), case_sensitive: true, ..Rule::new(kind) }
     }
 
     /// The same rule, matched loosely.
@@ -583,5 +799,106 @@ mod tests {
         for kind in RuleType::ALL {
             assert!(!kind.label().is_empty());
         }
+    }
+
+    /// Build an enabled External Command rule of `kind` with the given command line.
+    fn cmd(kind: RuleType, command: &str, timeout_ms: u64) -> Rule {
+        Rule { action: RuleAction::TransformCommand, command: command.into(), timeout_ms, ..Rule::new(kind) }
+    }
+
+    /// A rule saved before the action model existed reads back as a plain replacement with an
+    /// empty command and the default timeout, so old projects behave exactly as they did.
+    #[test]
+    fn a_rule_saved_before_external_commands_reads_as_a_replacement() {
+        let json = r#"{"enabled":true,"kind":"RequestBody","regex":false,"match_text":"a","replace_text":"b","comment":"","case_sensitive":true}"#;
+        let old: Rule = serde_json::from_str(json).unwrap();
+        assert_eq!(old.action, RuleAction::Replace);
+        assert!(old.command.is_empty());
+        assert_eq!(old.timeout_ms, DEFAULT_TRANSFORM_TIMEOUT_MS);
+        // and the default timeout on a fresh rule is the documented 1000 ms
+        assert_eq!(Rule::new(RuleType::RequestBody).timeout_ms, 1000);
+    }
+
+    /// A fast local filter transforms the body and the returned headers are reframed: the
+    /// Content-Length follows the new byte length, for a request and a response alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_transform_updates_the_body_and_content_length() {
+        // `tr -d x` removes every 'x', so the body shrinks and its length must follow
+        for request in [true, false] {
+            let kind = if request { RuleType::RequestBody } else { RuleType::ResponseBody };
+            let rule = cmd(kind, "tr -d x", 2000);
+            let headers = "Content-Type: text/plain\nContent-Length: 7";
+            let (h, b, warns) = apply_collecting(&[rule], request, headers, "xaxbxcx");
+            assert_eq!(b, "abc", "the filter's output replaces the body (request={request})");
+            assert!(h.contains("Content-Length: 3"), "the length was reframed: {h}");
+            assert!(!h.contains("Content-Length: 7"), "the stale length is gone: {h}");
+            assert!(warns.is_empty(), "a clean run warns about nothing: {warns:?}");
+        }
+    }
+
+    /// A chunked response body transformed whole is reframed by length, the stale chunked
+    /// Transfer-Encoding removed, when the command changes the byte count.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_transform_strips_chunked_encoding_when_it_reframes() {
+        let rule = cmd(RuleType::ResponseBody, "tr -d x", 2000);
+        let headers = "Content-Type: text/plain\nTransfer-Encoding: chunked";
+        let (h, b, _) = apply_collecting(&[rule], false, headers, "xxhixx");
+        assert_eq!(b, "hi");
+        assert!(!h.to_ascii_lowercase().contains("transfer-encoding"), "chunked framing is gone: {h}");
+        assert!(h.contains("Content-Length: 2"), "a length frames it instead: {h}");
+    }
+
+    /// A command that outruns its timeout is stopped promptly, the original body is kept, and a
+    /// warning is recorded rather than the exchange being dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_command_times_out_and_keeps_the_original() {
+        let rule = cmd(RuleType::RequestBody, "sleep 5", 120);
+        let started = std::time::Instant::now();
+        let (h, b, warns) = apply_collecting(&[rule], true, "Content-Length: 8", "original");
+        assert!(started.elapsed() < Duration::from_secs(2), "the slow command was stopped near its timeout, not waited out");
+        assert_eq!(b, "original", "the body is untouched when the command is stopped");
+        assert!(h.contains("Content-Length: 8"), "and so the length header stands: {h}");
+        assert_eq!(warns.len(), 1, "one warning explains the fallback");
+        assert!(warns[0].contains("stopped") || warns[0].to_lowercase().contains("longer"), "{:?}", warns);
+    }
+
+    /// A command that exits non-zero, and one whose program does not exist, both fall back to
+    /// the original bytes without breaking the message, each with a warning.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_or_missing_command_falls_back_cleanly() {
+        let cases: [(&str, &str); 2] = [
+            ("non-zero exit", "false"),
+            ("missing program", "forgeproxy_no_such_program_42"),
+        ];
+        assert_table!(cases, |idx, (name, command)| {
+            let rule = cmd(RuleType::ResponseBody, command, 1000);
+            let (h, b, warns) = apply_collecting(&[rule], false, "Content-Length: 4", "keep");
+            assert_eq!(b, "keep", "case #{idx} ({name}): the body survives");
+            assert!(h.contains("Content-Length: 4"), "case #{idx} ({name}): the headers survive: {h}");
+            assert_eq!(warns.len(), 1, "case #{idx} ({name}): the fallback is noted, not silent");
+        });
+    }
+
+    /// The match text gates a command: a non-matching gate leaves the slice alone and never
+    /// starts the process, while a matching or blank gate lets it run. A header block is piped
+    /// and replaced whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_gate_decides_whether_the_process_runs() {
+        // gate matches: the whole header block is upper-cased by `tr`
+        let run = cmd(RuleType::RequestHeader, "tr a-z A-Z", 2000);
+        let run = Rule { match_text: "accept".into(), ..run };
+        let (h, _, warns) = apply_collecting(&[run], true, "Accept: text/html\nHost: a.test", "");
+        assert_eq!(h, "ACCEPT: TEXT/HTML\nHOST: A.TEST", "a matched gate runs the command on the block");
+        assert!(warns.is_empty());
+
+        // gate does not match: the command never runs, the block is untouched
+        let skip = Rule { match_text: "x-absent".into(), ..cmd(RuleType::RequestHeader, "tr a-z A-Z", 2000) };
+        let (h, _, _) = apply_collecting(&[skip], true, "Accept: text/html", "");
+        assert_eq!(h, "Accept: text/html", "a closed gate leaves the block as it was");
     }
 }

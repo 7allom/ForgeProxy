@@ -2,7 +2,7 @@
 
 use crate::editor;
 use crate::proxy::{self, Decision};
-use crate::rewrite::{self, RuleType};
+use crate::rewrite::{self, RuleAction, RuleType};
 use crate::rules;
 use crate::state::App;
 use crate::theme::{self, bold, EmptyIcon, Palette};
@@ -291,9 +291,27 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
                 }
             });
             ui.end_row();
-            ui.label("Match:"); ui.add(egui::TextEdit::singleline(&mut r.match_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
-            ui.label("Replace:"); ui.add(egui::TextEdit::singleline(&mut r.replace_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
-            ui.label("Regex match:"); ui.checkbox(&mut r.regex, ""); ui.end_row();
+            ui.label("Action:");
+            egui::ComboBox::from_id_salt(("mr_action", id)).selected_text(r.action.label()).show_ui(ui, |ui| {
+                for a in RuleAction::ALL {
+                    ui.selectable_value(&mut r.action, a, a.label());
+                }
+            });
+            ui.end_row();
+            let command = r.action == RuleAction::TransformCommand;
+            let match_hint = if command { "Match (gate, blank runs always):" } else { "Match:" };
+            ui.label(match_hint); ui.add(egui::TextEdit::singleline(&mut r.match_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
+            if command {
+                ui.label("Command:");
+                ui.add(egui::TextEdit::singleline(&mut r.command).desired_width(460.0).font(FontId::monospace(12.5)).hint_text("program arg1 arg2"));
+                ui.end_row();
+                ui.label("Timeout (ms):");
+                ui.add(egui::DragValue::new(&mut r.timeout_ms).range(1..=600_000).speed(10));
+                ui.end_row();
+            } else {
+                ui.label("Replace:"); ui.add(egui::TextEdit::singleline(&mut r.replace_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
+            }
+            ui.label("Regex match:"); ui.add_enabled(!command, egui::Checkbox::new(&mut r.regex, "")); ui.end_row();
             ui.label("Case sensitive:");
             ui.checkbox(&mut r.case_sensitive, "")
                 .on_hover_text("Off: the match ignores capitals, so user-agent matches User-Agent");
@@ -302,6 +320,7 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
         });
         ui.label(RichText::new("Header rules work line by line: a blank match adds the replacement as a new header; a blank replacement removes matching headers.").size(11.5).color(p.disabled));
         ui.label(RichText::new("A request first line rule sees only the line itself, such as \"GET /api/v1/users HTTP/1.1\".").size(11.5).color(p.disabled));
+        ui.label(RichText::new("External command: the matched header block or body is piped to the command's stdin and replaced by its stdout. On a timeout, a non-zero exit, or a command that cannot start, the original bytes are kept.").size(11.5).color(p.disabled));
     }
     ui.data_mut(|d| d.insert_temp(editing_id, editing));
 }
