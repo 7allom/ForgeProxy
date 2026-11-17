@@ -5,7 +5,7 @@ use crate::intruder::AttackType;
 use crate::rewrite;
 use crate::rules;
 use crate::scan::Finding;
-use crate::theme::{self, Look, Palette};
+use crate::theme::{self, ThemeMode, Palette};
 use eframe::egui;
 use egui::Color32;
 use std::sync::mpsc::{Receiver, Sender};
@@ -187,7 +187,7 @@ pub const SETTINGS_DEBOUNCE: std::time::Duration = std::time::Duration::from_mil
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
-    pub theme: Look,
+    pub theme: ThemeMode,
     pub editor_font_size: f32,
     pub http_timeout_secs: u64,
     pub proxy_read_timeout_secs: u64,
@@ -243,7 +243,8 @@ pub struct UserSettings {
 impl Default for UserSettings {
     fn default() -> Self {
         UserSettings {
-            theme: Look::Dark,
+            // one source of truth for which theme a fresh install opens in
+            theme: ThemeMode::default(),
             editor_font_size: crate::editor::DEFAULT_FONT,
             http_timeout_secs: DEFAULT_HTTP_TIMEOUT,
             proxy_read_timeout_secs: DEFAULT_PROXY_READ_TIMEOUT,
@@ -371,7 +372,7 @@ impl UserSettings {
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Overrides {
-    pub theme: Option<Look>,
+    pub theme: Option<ThemeMode>,
     pub http_timeout_secs: Option<u64>,
     pub proxy_read_timeout_secs: Option<u64>,
     pub upstream_proxy: Option<UpstreamProxyConfig>,
@@ -710,9 +711,9 @@ impl App {
         // write to, the real config directory); --light overrides the saved theme
         let (mut settings, settings_warning) = UserSettings::initial(shot_path.is_none());
         if light {
-            settings.theme = Look::Light;
+            settings.theme = ThemeMode::LightWorkstation;
         }
-        theme::apply(&cc.egui_ctx, settings.theme);
+        theme::apply_theme(&cc.egui_ctx, settings.theme);
         let (tx, rx) = std::sync::mpsc::channel();
         let history: crate::http::History = Arc::new(Mutex::new(Vec::new()));
         let next_id = Arc::new(Mutex::new(0usize));
@@ -967,7 +968,7 @@ impl App {
 
     /// Set the effective theme: writes to the project override when one is active, else to the
     /// global setting. Used by the menu-bar quick toggle.
-    pub fn set_theme(&mut self, look: Look) {
+    pub fn set_theme(&mut self, look: ThemeMode) {
         match &mut self.overrides.theme {
             Some(t) => *t = look,
             None => self.settings.theme = look,
@@ -1720,7 +1721,7 @@ mod settings_tests {
     fn settings_round_trip_owner_only() {
         let dir = temp_dir("round");
         let s = UserSettings {
-            theme: Look::Light, editor_font_size: 15.5, http_timeout_secs: 45, proxy_read_timeout_secs: 300,
+            theme: ThemeMode::LightWorkstation, editor_font_size: 15.5, http_timeout_secs: 45, proxy_read_timeout_secs: 300,
             upstream_proxy: UpstreamProxyConfig { enabled: true, proxy_type: UpstreamProxyType::Socks5, host: "10.1.2.3".into(), port: 1080 },
             protocol: ProtocolSettings { verify_upstream_tls: true },
             ..Default::default()
@@ -1729,7 +1730,7 @@ mod settings_tests {
         assert_eq!(UserSettings::load(&dir).unwrap(), s);
         let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
         assert!(text.contains("\"proxy_type\": \"socks5\"") && text.contains("\"verify_upstream_tls\": true"), "{text}");
-        assert!(text.contains("\"theme\": \"light\""), "{text}");
+        assert!(text.contains("\"theme\": \"light_workstation\""), "{text}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1746,7 +1747,7 @@ mod settings_tests {
         let s = UserSettings::load(&dir).unwrap();
         assert_eq!(s.http_timeout_secs, 120);
         assert_eq!(s.editor_font_size, 9.0);
-        assert_eq!(s.theme, Look::Dark, "missing fields take the defaults");
+        assert_eq!(s.theme, ThemeMode::default(), "missing fields take the defaults");
         assert_eq!(s.proxy_read_timeout_secs, DEFAULT_PROXY_READ_TIMEOUT);
         // files from before the network settings: off, and certificates not checked
         assert_eq!(s.upstream_proxy, UpstreamProxyConfig::default());
@@ -1791,9 +1792,9 @@ mod settings_tests {
         assert_eq!(repeater.1, crate::hotkeys::Binding::ctrl(eframe::egui::Key::R), "back to its default");
 
         // a file written before any of these fields existed
-        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"light"}"#).unwrap();
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"classic98"}"#).unwrap();
         let older = UserSettings::load(&dir).unwrap();
-        assert_eq!(older.theme, Look::Light, "what it did say");
+        assert_eq!(older.theme, ThemeMode::LightWorkstation, "what it did say");
         assert_eq!(older.interactor_poll_secs, DEFAULT_INTERACTOR_POLL_SECS, "and defaults for what it did not");
         assert!(older.hotkeys.is_empty() && older.ca_export_dir.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1852,7 +1853,7 @@ mod settings_tests {
         assert_eq!(fixed.display_limit_kib, *crate::rules::DISPLAY_LIMIT_KIB_RANGE.start());
 
         // a file from before any of this: the defaults, and no tools offered
-        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"theme":"dark_workstation"}"#).unwrap();
         let older = UserSettings::load(&dir).unwrap();
         assert_eq!(older.max_entries, crate::rules::MAX_RECORDED_REQUESTS);
         assert_eq!(older.max_body_kib, crate::rules::DEFAULT_BODY_LIMIT_KIB);

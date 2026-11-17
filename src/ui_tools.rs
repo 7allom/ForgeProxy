@@ -127,7 +127,7 @@ fn advanced_scope_list(app: &mut App, ui: &mut Ui, p: &Palette, exclude: bool) {
             }
             for i in 0..list.len() {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), egui::Sense::click());
-                if sel == Some(i) { ui.painter().rect_filled(rect, 0.0, p.selection); }
+                if sel == Some(i) { ui.painter().rect_filled(rect, 0.0, p.selection_soft); }
                 else if i % 2 == 1 { ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color); }
                 let mut en = list[i].enabled;
                 if ui.put(egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0)), egui::Checkbox::without_text(&mut en)).changed() {
@@ -285,7 +285,7 @@ fn scope_list(app: &mut App, ui: &mut Ui, p: &Palette, exclude: bool) {
             }
             for i in 0..list.len() {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), egui::Sense::click());
-                if sel == Some(i) { ui.painter().rect_filled(rect, 0.0, p.selection); }
+                if sel == Some(i) { ui.painter().rect_filled(rect, 0.0, p.selection_soft); }
                 else if i % 2 == 1 { ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color); }
                 let mut en = list[i].enabled;
                 if ui.put(egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0)), egui::Checkbox::without_text(&mut en)).changed() { list[i].enabled = en; }
@@ -427,7 +427,7 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let running = app.int_running;
             let problem = actions::attack_problem(app);
-            let start = ui.add_enabled(!running && problem.is_none(), egui::Button::new(bold("Start attack", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(120.0, 24.0)));
+            let start = theme::action_button(ui, p, "Start attack", !running && problem.is_none(), egui::vec2(120.0, 24.0));
             if start.clicked() {
                 actions::start_attack(app);
             }
@@ -795,7 +795,7 @@ pub fn repeater(app: &mut App, ui: &mut Ui, p: &Palette) {
                 }
                 let can_send = tab.can_send();
                 let why = if tab.waiting { "Waiting for the response" } else { "Write a request first" };
-                if ui.add_enabled(can_send, egui::Button::new(bold("Send", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(80.0, 24.0)))
+                if theme::action_button(ui, p, "Send", can_send, egui::vec2(80.0, 24.0))
                     .on_disabled_hover_text(why).clicked() {
                     send = true;
                 }
@@ -1321,12 +1321,12 @@ fn interactor_table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], act
                 let selected = sel == Some(hit.id);
                 let (row, cells) =
                     theme::table_row_cells(ui, p, ("interactor_row", hit.id), w, theme::ROW_HEIGHT, selected, nth % 2 == 1, None);
-                let fg = if selected { p.strong } else { p.text };
+                let fg = if selected { p.selection_text } else { p.text };
                 let comment = if hit.comment.trim().is_empty() { hit.summary() } else { hit.comment.clone() };
                 theme::cell_text(ui, cells[0], &hit.id.to_string(), fg);
                 theme::cell_text(ui, cells[1], &interactor_time_text(&hit.timestamp), fg);
                 theme::cell_text(ui, cells[2], &hit.interaction_type,
-                    if selected { p.strong } else { crate::ui_core::protocol_color(p, &hit.interaction_type) });
+                    if selected { p.selection_text } else { crate::ui_core::protocol_color(p, &hit.interaction_type) });
                 theme::cell_text(ui, cells[3], &hit.payload, fg);
                 theme::cell_text(ui, cells[4], &crate::interactor::label_of(session.as_ref(), hit), fg);
                 theme::cell_text(ui, cells[5], &hit.client_ip, fg);
@@ -1971,10 +1971,10 @@ pub fn decoder(app: &mut App, ui: &mut Ui, p: &Palette) {
 }
 
 /// Colours of the three JWT parts (header, payload, signature) for the current theme.
-fn jwt_colors(look: theme::Look) -> [Color32; 3] {
+fn jwt_colors(look: theme::ThemeMode) -> [Color32; 3] {
     match look {
-        theme::Look::Dark => [c(0xF07FA8), c(0x5BC0DE), c(0xA89BC8)],
-        theme::Look::Light => [c(0xC2185B), c(0x00838F), c(0x6E5F96)],
+        theme::ThemeMode::DarkWorkstation => [c(0xF07FA8), c(0x5BC0DE), c(0xA89BC8)],
+        theme::ThemeMode::LightWorkstation => [c(0xC2185B), c(0x00838F), c(0x6E5F96)],
     }
 }
 
@@ -2972,10 +2972,10 @@ mod sort_header_tests {
             let (mut origin, mut clicked) = (egui::Pos2::ZERO, None);
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
             let _ = ctx.run(input, |ctx| {
-                crate::theme::apply(ctx, crate::theme::Look::Dark);
+                crate::theme::apply_theme(ctx, crate::theme::ThemeMode::DarkWorkstation);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     origin = ui.cursor().min;
-                    clicked = crate::theme::sort_header(ui, &crate::theme::DARK, &COLS, Some(C::Request), true);
+                    clicked = crate::theme::sort_header(ui, &crate::theme::DARK_WORKSTATION, &COLS, Some(C::Request), true);
                 });
             });
             (origin, clicked)

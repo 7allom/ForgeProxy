@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn colour_jobs_keep_the_text() {
-        let p = crate::theme::palette(crate::theme::Look::Dark);
+        let p = crate::theme::palette(crate::theme::ThemeMode::DarkWorkstation);
         for raw in ["", "HTTP/1.1 200 OK\n\n{\"a\":\"b\\\"c\",\"n\":1,\"t\":true}", "<a href=\"x\">t</a>", "\u{0}\u{1}binary\u{fffd}", "{\"unterminated"] {
             let (text, kind) = pretty_message(raw);
             let job = pretty_job(&p, &text, kind, 12.0);

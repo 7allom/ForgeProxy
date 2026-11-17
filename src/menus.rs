@@ -2,7 +2,7 @@
 
 use crate::actions;
 use crate::state::{App, Tab};
-use crate::theme::{self, Look};
+use crate::theme::{self, ThemeMode};
 use crate::ui_proxy;
 use eframe::egui;
 use egui::{RichText, Ui};
@@ -16,7 +16,7 @@ fn label(t: &str, p: &theme::Palette) -> RichText {
 }
 
 pub fn bar(app: &mut App, ui: &mut Ui) {
-    let look = if ui.visuals().dark_mode { Look::Dark } else { Look::Light };
+    let look = if ui.visuals().dark_mode { ThemeMode::DarkWorkstation } else { ThemeMode::LightWorkstation };
     let p = &theme::palette(look);
     // plain-text menu titles, with no button fill behind them
     ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -110,10 +110,10 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
         }
         ui.separator();
         let current = app.eff().theme;
-        let other = if current == Look::Dark { "Light theme" } else { "Dark theme" };
+        let other = if current == ThemeMode::DarkWorkstation { "Light theme" } else { "Dark theme" };
         if ui.button(other).clicked() {
-            app.set_theme(if current == Look::Dark { Look::Light } else { Look::Dark });
-            theme::apply(ui.ctx(), app.eff().theme);
+            app.set_theme(if current == ThemeMode::DarkWorkstation { ThemeMode::LightWorkstation } else { ThemeMode::DarkWorkstation });
+            theme::apply_theme(ui.ctx(), app.eff().theme);
             ui.close_menu();
         }
     });

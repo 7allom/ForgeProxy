@@ -252,7 +252,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, p: &Palette) {
 fn draw_row(ui: &egui::Ui, p: &Palette, rect: egui::Rect, c: &PaletteCommand, available: bool, selected: bool) {
     let painter = ui.painter();
     let y = rect.center().y;
-    let main = if !available { p.disabled } else if selected { p.strong } else { p.text };
+    let main = if !available { p.disabled } else if selected { p.selection_text } else { p.text };
     let dim = if selected { p.text } else { p.disabled };
     paint_icon(painter, egui::pos2(rect.left() + 16.0, y), c.icon, main);
     let title = painter.text(egui::pos2(rect.left() + 32.0, y), Align2::LEFT_CENTER, c.title, FontId::proportional(13.0), main);

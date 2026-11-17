@@ -7,7 +7,7 @@
 //! until a project overrides it.
 
 use crate::state::{App, SettingsPage};
-use crate::theme::{self, bold, Look, Palette};
+use crate::theme::{self, bold, ThemeMode, Palette};
 use crate::ui_proxy;
 use eframe::egui;
 use egui::{Align2, FontId, RichText, Sense, Ui};
@@ -75,7 +75,7 @@ const PAGES: &[PageInfo] = &[
         card("Display scaling", "Zoom the whole interface.", Home::User),
         card("Editor font size", "Text size in the HTTP request and response editors.", Home::User),
         card("Default message view", "Which way a request or response pane opens before it is switched.", Home::User),
-        card("Theme", "Light or dark colours.", Home::Override),
+        card("Theme", "Dark Workstation or Light Workstation.", Home::Override),
     ]},
     PageInfo { page: SettingsPage::Hotkeys, group: None, name: "Hotkeys", cards: &[
         card("Keyboard shortcuts", "Keys for the actions this app supports. Copy, paste, undo, redo and select-all also work in every text box.", Home::User),
@@ -171,7 +171,7 @@ fn nav_item(app: &mut App, ui: &mut Ui, p: &Palette, info: &PageInfo) {
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, p.hover);
     }
-    let col = if selected { p.strong } else { p.text };
+    let col = if selected { p.selection_text } else { p.text };
     ui.painter().text(egui::pos2(rect.left() + 8.0, rect.center().y), Align2::LEFT_CENTER, info.name, FontId::proportional(12.5), col);
     if resp.clicked() {
         app.settings_page = info.page;
@@ -293,7 +293,7 @@ fn card_shell<R>(ui: &mut Ui, title: &str, description: &str, header: impl FnOnc
         header(ui);
     });
     egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 8, top: 2, bottom: 0 }).show(ui, |ui| {
-        ui.add(egui::Label::new(RichText::new(format!("⚙  {description}")).size(12.0).color(weak)).wrap());
+        ui.add(egui::Label::new(RichText::new(description).size(12.0).color(weak)).wrap());
     });
     ui.add_space(6.0);
     let r = egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 8, top: 0, bottom: 4 }).show(ui, add_contents).inner;
@@ -503,14 +503,15 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
             );
         }
         (SettingsPage::Display, "Theme") => {
-            let mut look = app.eff().theme;
+            let mut mode = app.eff().theme;
             ui.horizontal(|ui| {
-                ui.radio_value(&mut look, Look::Light, "Light");
-                ui.radio_value(&mut look, Look::Dark, "Dark");
+                for m in ThemeMode::ALL {
+                    ui.radio_value(&mut mode, m, m.label());
+                }
             });
-            if look != app.eff().theme {
-                app.set_theme(look);
-                theme::apply(ui.ctx(), look);
+            if mode != app.eff().theme {
+                app.set_theme(mode);
+                theme::apply_theme(ui.ctx(), mode);
             }
         }
         (SettingsPage::Hotkeys, _) => hotkeys_editor(app, ui, p),
@@ -1020,10 +1021,11 @@ fn hotkeys_editor(app: &mut App, ui: &mut Ui, p: &Palette) {
             let listening = capturing.as_deref() == Some(meta.id);
             let clash = clashing.contains(&meta.id);
             let (row, cells) = theme::table_row_cells(ui, p, ("hotkey", meta.id), w, theme::ROW_HEIGHT, listening, i % 2 == 1, None);
-            theme::cell_text(ui, cells[0], meta.label, if listening { p.strong } else { p.text });
+            theme::cell_text(ui, cells[0], meta.label, if listening { p.selection_text } else { p.text });
             let shown = if listening { "Press keys…".to_string() } else { binding.label() };
             let colour = if listening {
-                p.accent
+                // the row is filled with the selection colour while it waits for a key
+                p.selection_text
             } else if clash {
                 p.error
             } else {

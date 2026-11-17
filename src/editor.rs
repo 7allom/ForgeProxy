@@ -624,7 +624,7 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let mut buf = text.to_string();
-                let out = super::message_editor(ui, &crate::theme::DARK, "wrap_test", &mut buf, true, false, 200.0);
+                let out = super::message_editor(ui, &crate::theme::DARK_WORKSTATION, "wrap_test", &mut buf, true, false, 200.0);
                 rows = out.galley.rows.len();
             });
         });

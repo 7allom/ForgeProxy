@@ -3,17 +3,17 @@
 
 use crate::comparer::{self, Change, DiffMode, Row, BYTES_PER_ROW};
 use crate::state::App;
-use crate::theme::{self, bold, Look, Palette};
+use crate::theme::{self, bold, ThemeMode, Palette};
 use crate::ui_core::c;
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Ui};
 
 /// Highlight backgrounds: (inserted, deleted, modified), and the text colour drawn on them.
-fn diff_colors(look: Look) -> ([Color32; 3], Color32) {
+fn diff_colors(look: ThemeMode) -> ([Color32; 3], Color32) {
     match look {
         // green/cyan, red/orange, yellow/amber
-        Look::Dark => ([c(0x1F7A63), c(0x9A3B2A), c(0x8C6B12)], Color32::WHITE),
-        Look::Light => ([c(0xA6E8D0), c(0xF6B7A4), c(0xF5DA82)], Color32::BLACK),
+        ThemeMode::DarkWorkstation => ([c(0x1F7A63), c(0x9A3B2A), c(0x8C6B12)], Color32::WHITE),
+        ThemeMode::LightWorkstation => ([c(0xA6E8D0), c(0xF6B7A4), c(0xF5DA82)], Color32::BLACK),
     }
 }
 
@@ -39,11 +39,11 @@ pub fn comparer(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.horizontal(|ui| {
         let ready = matches!((app.comparer_sel_a, app.comparer_sel_b), (Some(a), Some(b)) if a != b);
         let why = "Select two different items, one in each list";
-        if ui.add_enabled(ready, egui::Button::new(bold("Compare words", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
+        if theme::action_button(ui, p, "Compare words", ready, egui::vec2(130.0, 26.0))
             .on_disabled_hover_text(why).clicked() {
             comparer::compare_selected(app, DiffMode::Words);
         }
-        if ui.add_enabled(ready, egui::Button::new(bold("Compare bytes", 13.0).color(p.accent_text)).fill(p.accent).min_size(egui::vec2(130.0, 26.0)))
+        if theme::action_button(ui, p, "Compare bytes", ready, egui::vec2(130.0, 26.0))
             .on_disabled_hover_text(why).clicked() {
             comparer::compare_selected(app, DiffMode::Bytes);
         }
@@ -463,12 +463,12 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut row_h, mut out) = (0.0, Vec::new());
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            crate::theme::apply(ctx, crate::theme::Look::Dark);
+            crate::theme::apply_theme(ctx, crate::theme::ThemeMode::DarkWorkstation);
             egui::CentralPanel::default().show(ctx, |ui| {
                 let font = egui::TextStyle::Monospace.resolve(ui.style());
                 row_h = row_height(ui);
                 let st = PaneStyle { font: &font, row_h, colors: [Color32::RED; 3], on_color: Color32::WHITE };
-                let p = &crate::theme::DARK;
+                let p = &crate::theme::DARK_WORKSTATION;
                 let jobs = [
                     gutter_job(&d.a, &st, p, mark),
                     text_job(&d.a, &st, p, active),

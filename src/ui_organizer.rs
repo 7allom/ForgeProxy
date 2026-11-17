@@ -129,7 +129,7 @@ fn collections_sidebar(app: &mut App, ui: &mut Ui, p: &Palette) {
                 let count = organizer::count_in(&app.organizer, c.id);
                 let selected = app.org_collection == c.id;
                 let (row, cells) = theme::table_row_cells(ui, p, ("org_collection", c.id), &[ui.available_width() - 44.0, 40.0], theme::WIDGET_ROW_HEIGHT, selected, false, None);
-                theme::cell_text(ui, cells[0], &c.name, if selected { p.strong } else { p.text });
+                theme::cell_text(ui, cells[0], &c.name, if selected { p.selection_text } else { p.text });
                 theme::cell_text(ui, cells[1], &count.to_string(), p.disabled);
                 row.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{} ({count})", c.name)));
                 if row.clicked() {
@@ -238,13 +238,13 @@ fn table(app: &mut App, ui: &mut Ui, p: &Palette, rows: &[usize], action: &mut O
                 let selected = sel == Some(it.id);
                 let tint = it.highlight.and_then(|h| HIGHLIGHTS.get(h)).map(|(_, c)| *c);
                 let (row, cells) = theme::table_row_cells(ui, p, ("org_row", it.id), w, theme::WIDGET_ROW_HEIGHT, selected, nth % 2 == 1, tint);
-                let fg = if selected { p.strong } else { p.text };
+                let fg = if selected { p.selection_text } else { p.text };
                 theme::cell_text(ui, cells[0], &it.id.to_string(), fg);
-                theme::cell_text(ui, cells[3], &it.method, if selected { p.strong } else { method_color(p, &it.method) });
+                theme::cell_text(ui, cells[3], &it.method, if selected { p.selection_text } else { method_color(p, &it.method) });
                 theme::cell_text(ui, cells[4], &it.host, fg);
                 theme::cell_text(ui, cells[5], &it.path, fg);
                 let status = organizer::status_text(&it.response);
-                let status_fg = if selected { p.strong } else { crate::ui_core::status_color(p, &status) };
+                let status_fg = if selected { p.selection_text } else { crate::ui_core::status_color(p, &status) };
                 theme::cell_text(ui, cells[6], &status, status_fg);
                 theme::cell_text(ui, cells[7], &organizer::body_length(&it.response).to_string(), fg);
 
@@ -416,7 +416,7 @@ fn menu_entry(ui: &mut Ui, p: &Palette, mark: Mark, label: &str, colour: Color32
     let (rect, r) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::click());
     r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, current, label));
     if current || r.hovered() {
-        ui.painter().rect_filled(rect, 4.0, if current { p.selection } else { p.hover });
+        ui.painter().rect_filled(rect, 4.0, if current { p.selection_soft } else { p.hover });
     }
     match mark {
         Mark::Dot(c) => {

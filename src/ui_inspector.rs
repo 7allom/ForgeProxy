@@ -377,7 +377,7 @@ impl Rows<'_> {
             }
         });
         let rect = row.response.rect.expand2(egui::vec2(2.0, 1.0));
-        let fill = if picked { p.selection } else if hit.hovered() || copy.hovered() { p.header.gamma_multiply(0.5) } else { egui::Color32::TRANSPARENT };
+        let fill = if picked { p.selection_soft } else if hit.hovered() || copy.hovered() { p.header.gamma_multiply(0.5) } else { egui::Color32::TRANSPARENT };
         ui.painter().set(bg, egui::Shape::rect_filled(rect, 2.0, fill));
         ui.add_space(2.0);
     }

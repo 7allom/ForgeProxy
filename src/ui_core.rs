@@ -1225,14 +1225,14 @@ mod chrome_tests {
     #[test]
     fn every_tool_tab_draws_under_both_themes_matrix() {
         assert_table!(Tab::ALL, |idx, tab| {
-            for look in [crate::theme::Look::Dark, crate::theme::Look::Light] {
+            for look in [crate::theme::ThemeMode::DarkWorkstation, crate::theme::ThemeMode::LightWorkstation] {
                 let (ctx, mut app) = MockAppBuilder::new()
                     .with_tab(tab)
-                    .with_light_theme(look == crate::theme::Look::Light)
+                    .with_light_theme(look == crate::theme::ThemeMode::LightWorkstation)
                     .build_with_ctx();
                 ctx.enable_accesskit();
                 app.set_theme(look);
-                crate::theme::apply(&ctx, look);
+                crate::theme::apply_theme(&ctx, look);
                 frame(&ctx, &mut app);
                 let seen = labels(&frame(&ctx, &mut app));
                 assert!(!seen.is_empty(), "case #{idx} ({}, {look:?}): the tab drew nothing", tab.label());
@@ -1244,7 +1244,7 @@ mod chrome_tests {
                 // the visuals really are the ones asked for, not left over from the other theme
                 assert_eq!(
                     ctx.style().visuals.dark_mode,
-                    look == crate::theme::Look::Dark,
+                    look == crate::theme::ThemeMode::DarkWorkstation,
                     "case #{idx} ({}, {look:?}): the theme took effect",
                     tab.label()
                 );
@@ -1260,9 +1260,9 @@ mod chrome_tests {
         ctx.enable_accesskit();
         for tab in Tab::ALL {
             app.tab = tab;
-            for look in [crate::theme::Look::Light, crate::theme::Look::Dark, crate::theme::Look::Light] {
+            for look in [crate::theme::ThemeMode::LightWorkstation, crate::theme::ThemeMode::DarkWorkstation, crate::theme::ThemeMode::LightWorkstation] {
                 app.set_theme(look);
-                crate::theme::apply(&ctx, look);
+                crate::theme::apply_theme(&ctx, look);
                 frame(&ctx, &mut app);
                 let v = &ctx.style().visuals;
                 let p = crate::theme::palette(look);

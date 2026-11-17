@@ -177,7 +177,7 @@ fn import_dialog(app: &mut App, ui: &mut Ui, p: &Palette) {
             .corner_radius(theme::CORNER)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 16.0);
+                ui.set_width((ui.available_width() - 16.0).max(0.0));
                 ui.add(egui::Label::new(RichText::new(IMPORT_WARNING).size(11.5).color(p.medium)).wrap());
             });
         ui.add_space(8.0);
@@ -472,7 +472,7 @@ fn list_row(
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if selected {
-            p.selection
+            p.selection_soft
         } else if response.hovered() {
             p.hover
         } else if index % 2 == 1 {
@@ -661,7 +661,7 @@ fn editor(app: &mut App, ui: &mut Ui, p: &Palette) {
                 .corner_radius(theme::CORNER * 2)
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
-                    ui.set_width(ui.available_width() - 24.0);
+                    ui.set_width((ui.available_width() - 24.0).max(0.0));
                     ui.label(bold("Nothing selected", theme::FONT_TITLE).color(p.strong));
                     ui.label(
                         RichText::new(
@@ -1170,7 +1170,7 @@ pub fn open(app: &mut App) {
 mod tests {
     use super::*;
     use crate::test_utils::{assert_table, MockAppBuilder};
-    use crate::theme::Look;
+    use crate::theme::ThemeMode;
     use crate::tooling::{AutomationPlan, PipelineStep};
 
     fn frame(ctx: &egui::Context, app: &mut App) -> Option<egui::accesskit::TreeUpdate> {
@@ -1279,14 +1279,14 @@ mod tests {
             },
         ];
         assert_table!(cases, |idx, case| {
-            for look in [Look::Dark, Look::Light] {
+            for look in [ThemeMode::DarkWorkstation, ThemeMode::LightWorkstation] {
                 let (ctx, mut app) = MockAppBuilder::new()
                     .with_tab(Tab::Automation)
-                    .with_light_theme(look == Look::Light)
+                    .with_light_theme(look == ThemeMode::LightWorkstation)
                     .build_with_ctx();
                 ctx.enable_accesskit();
                 app.set_theme(look);
-                crate::theme::apply(&ctx, look);
+                crate::theme::apply_theme(&ctx, look);
                 (case.open)(&mut app);
                 for console in ConsoleTab::ALL {
                     app.automation_console = console;

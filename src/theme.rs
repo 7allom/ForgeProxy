@@ -12,15 +12,43 @@ const fn c(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Look {
-    Dark,
-    Light,
+/// The interface theme the whole app is painted in. Two readings of one design: the same
+/// surface ladder, geometry and accent family, once on dark slate and once on cool daylight
+/// grey. `DarkWorkstation` is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    DarkWorkstation,
+    /// The daylight reading. `classic98` is accepted when reading older settings files, which
+    /// is what this slot used to hold.
+    #[serde(alias = "classic98")]
+    LightWorkstation,
+}
+
+impl ThemeMode {
+    pub const ALL: [ThemeMode; 2] = [ThemeMode::DarkWorkstation, ThemeMode::LightWorkstation];
+
+    /// The name shown in the Settings theme selector.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ThemeMode::DarkWorkstation => "Dark Workstation",
+            ThemeMode::LightWorkstation => "Light Workstation",
+        }
+    }
+
+    /// Whether this theme paints on dark surfaces. Drives egui's base `Visuals` and the few
+    /// places that still choose a colour by light-or-dark.
+    pub fn is_dark(&self) -> bool {
+        matches!(self, ThemeMode::DarkWorkstation)
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct Palette {
+    /// The corner radius every control and framed surface rounds to. Both themes share it:
+    /// they are one design read twice, and geometry is not what tells them apart.
+    pub corner: u8,
     // The surface ladder, deepest first. Each step is a clear luminance apart, so a pane
     // sitting on another reads as raised without needing a border to say so.
     /// The canvas behind every panel: editors, the tab strip, side panels.
@@ -35,8 +63,17 @@ pub struct Palette {
     pub banner: Color32,
     /// The tinted fill of a selected row.
     pub selection: Color32,
+    /// The text drawn on that fill, which has to stay legible against it.
+    pub selection_text: Color32,
+    /// The softer selected fill, for the rows and chips whose foreground belongs to egui or
+    /// to the caller and so cannot be recoloured with it: a tint the ordinary text colour is
+    /// still readable on. egui's own selected labels and in-field text selection use this.
+    pub selection_soft: Color32,
     /// Recessed text fields, which sit *below* the canvas so an input reads as a well.
     pub bg_input: Color32,
+    /// The surface a list or table row is drawn on, and the stripe every other row takes.
+    pub row_bg: Color32,
+    pub row_stripe: Color32,
     /// A 1px divider or frame: visible, never loud.
     pub border_subtle: Color32,
     /// The 1px frame around whatever has the keyboard.
@@ -87,33 +124,41 @@ pub struct Palette {
     pub st_ignored: Color32,
 }
 
-pub const DARK: Palette = Palette {
-    deep: c(0x1F2123),
-    panel: c(0x272A2D),
-    header: c(0x31353A),
-    hover: c(0x3B4046),
-    banner: c(0x2A323D),
-    selection: c(0x2E5680),
-    bg_input: c(0x191B1D),
-    border_subtle: c(0x3A3F45),
-    border_focus: c(0xE07B3C),
-    text: c(0xC8CBCE),
+/// Dark Workstation: cool dark slate with steel-blue and cyan accents, a touch of rounding,
+/// and not a trace of orange.
+pub const DARK_WORKSTATION: Palette = Palette {
+    corner: 2,
+    deep: c(0x181C24),
+    panel: c(0x202632),
+    header: c(0x2A313F),
+    hover: c(0x333C4C),
+    banner: c(0x1C2838),
+    selection: c(0x1E4258),
+    selection_text: c(0xFFFFFF),
+    selection_soft: c(0x1E4258),
+    bg_input: c(0x121620),
+    row_bg: c(0x181C24),
+    row_stripe: c(0x262D3A),
+    border_subtle: c(0x333B49),
+    border_focus: c(0x38BDF8),
+    text: c(0xC8CED8),
     strong: c(0xFFFFFF),
-    disabled: c(0x868A8E),
-    link: c(0xFF9E7A),
-    accent: c(0xE07B3C),
-    accent_hover: c(0xF08E4C),
-    accent_active: c(0xC56528),
-    accent_text: c(0x1C1203),
-    badge_info: c(0x56B6D8),
+    disabled: c(0x7C838F),
+    link: c(0x38BDF8),
+    // a bright cyan primary action with dark text over it, hovering lighter and pressing deeper
+    accent: c(0x38BDF8),
+    accent_hover: c(0x6FD0FF),
+    accent_active: c(0x1BA0E0),
+    accent_text: c(0x07283A),
+    badge_info: c(0x38BDF8),
     success: c(0x4CBE80),
-    warning: c(0xE0A33C),
+    warning: c(0xE0C24C),
     error: c(0xE4596E),
-    get: c(0xBB608D),
-    post: c(0x786FFF),
+    get: c(0x5BC0DE),
+    post: c(0x7E8AF0),
     other_method: c(0x5FBAC2),
     high: c(0xE8556A),
-    medium: c(0xFF8A4C),
+    medium: c(0xE0B84C),
     low: c(0x6AA8E0),
     info: c(0x9DA2A7),
     ed_text: c(0xCECECE),
@@ -128,66 +173,73 @@ pub const DARK: Palette = Palette {
     syn_number: c(0xD7BA7D),
     syn_literal: c(0xC586C0),
     ed_gutter: c(0x555555),
-    ed_lozenge: c(0x484C53),
+    ed_lozenge: c(0x333C4C),
     st_new: c(0xCADAF0),
-    st_progress: c(0x786FFF),
-    st_postponed: c(0xFF9E7A),
+    st_progress: c(0x7E8AF0),
+    st_postponed: c(0x38BDF8),
     st_done: c(0x7DC164),
     st_ignored: c(0xEE95A1),
 };
 
-pub const LIGHT: Palette = Palette {
-    // canvas, panels, raised chrome, then the recessed input: light mode runs the other way
-    // round from dark, with the panel the brightest surface and the canvas a shade behind it
-    deep: c(0xF3F4F6),
-    panel: c(0xFFFFFF),
-    header: c(0xE9ECF0),
-    hover: c(0xDBE0E6),
-    banner: c(0xEBF1F6),
-    selection: c(0xCBDDF0),
+/// Light Workstation: the dark theme read in daylight. The same cool slate family and the
+/// same cyan accent, turned over -- panels in a low-chroma blue-grey so the eye rests on
+/// them, and white kept for the wells where text is actually read, which is what keeps the
+/// screen's overall brightness down.
+pub const LIGHT_WORKSTATION: Palette = Palette {
+    corner: 2,
+    // the surface ladder, deepest first, mirroring the dark theme step for step
+    deep: c(0xDFE4EB),
+    panel: c(0xEAEEF3),
+    header: c(0xF2F5F8),
+    hover: c(0xFBFCFD),
+    banner: c(0xE3EDF6),
+    selection: c(0xCFE0EF),
+    selection_text: c(0x11202B),
+    selection_soft: c(0xCFE0EF),
+    // white is reserved for what is read: fields, editors and list rows
     bg_input: c(0xFFFFFF),
-    border_subtle: c(0xCBD2D9),
-    border_focus: c(0xA8491A),
-    // dark slate, in three weights
-    text: c(0x374151),
-    strong: c(0x111827),
-    disabled: c(0x6B7280),
-    link: c(0x9C4517),
-    // amber kept dark enough that its own label reads white on it, and darkening further as
-    // it is hovered and pressed -- a light theme has nowhere brighter to go
-    accent: c(0xB3511C),
-    accent_hover: c(0x9C4517),
-    accent_active: c(0x863A12),
+    row_bg: c(0xFFFFFF),
+    row_stripe: c(0xF5F7FA),
+    border_subtle: c(0xC3CCD8),
+    border_focus: c(0x0A6C9B),
+    text: c(0x2A3340),
+    strong: c(0x111820),
+    disabled: c(0x626D7C),
+    link: c(0x0A6C9B),
+    // the dark theme's cyan, taken down until white text sits safely on it
+    accent: c(0x0A6C9B),
+    accent_hover: c(0x0A77AC),
+    accent_active: c(0x07557A),
     accent_text: c(0xFFFFFF),
-    badge_info: c(0x1F7FA8),
-    success: c(0x1F8A4C),
-    warning: c(0xB4711A),
-    error: c(0xC32438),
-    get: c(0x87486F),
-    post: c(0x4B44AE),
-    other_method: c(0x2A828E),
-    high: c(0xC32438),
-    medium: c(0xA85A08),
-    low: c(0x26649D),
-    info: c(0x6B7280),
-    ed_text: c(0x141414),
-    ed_header_name: c(0x000075),
-    ed_header_value: c(0x202020),
-    ed_first_line: c(0x141414),
-    ed_line_numbers: c(0x787878),
-    ed_param_name: c(0x0000C0),
-    ed_param_value: c(0xA01010),
-    syn_key: c(0x0451A5),
-    syn_string: c(0xA31515),
-    syn_number: c(0x098658),
-    syn_literal: c(0x7A1FA2),
-    ed_gutter: c(0xDDDDDD),
-    ed_lozenge: c(0xE1E0E0),
-    st_new: c(0x5384B2),
-    st_progress: c(0x5B4FFF),
-    st_postponed: c(0xFF7B4E),
-    st_done: c(0x5FB441),
-    st_ignored: c(0xDF4C63),
+    badge_info: c(0x0A6C9B),
+    success: c(0x18703F),
+    warning: c(0x855C00),
+    error: c(0xAE2531),
+    get: c(0x18703F),
+    post: c(0x5347B8),
+    other_method: c(0x0A6C9B),
+    high: c(0xAE2531),
+    medium: c(0x855C00),
+    low: c(0x2A6098),
+    info: c(0x5A6472),
+    ed_text: c(0x2A3340),
+    ed_header_name: c(0x0A6C9B),
+    ed_header_value: c(0x3B4654),
+    ed_first_line: c(0x111820),
+    ed_line_numbers: c(0x6D7988),
+    ed_param_name: c(0x5347B8),
+    ed_param_value: c(0x18703F),
+    syn_key: c(0x0A5C94),
+    syn_string: c(0x9B2A2A),
+    syn_number: c(0x15664A),
+    syn_literal: c(0x7B3193),
+    ed_gutter: c(0xDDE3EA),
+    ed_lozenge: c(0xE6EBF1),
+    st_new: c(0x2A6098),
+    st_progress: c(0x5347B8),
+    st_postponed: c(0x855C00),
+    st_done: c(0x18703F),
+    st_ignored: c(0xAE2531),
 };
 
 /// Highlight colours (ui.highlight.0..8, same in both themes).
@@ -203,10 +255,10 @@ pub const HIGHLIGHTS: [(&str, Color32); 9] = [
     ("Gray", c(0xB4B4B4)),
 ];
 
-pub fn palette(look: Look) -> Palette {
-    match look {
-        Look::Dark => DARK,
-        Look::Light => LIGHT,
+pub fn palette(mode: ThemeMode) -> Palette {
+    match mode {
+        ThemeMode::DarkWorkstation => DARK_WORKSTATION,
+        ThemeMode::LightWorkstation => LIGHT_WORKSTATION,
     }
 }
 
@@ -231,25 +283,29 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn apply(ctx: &egui::Context, look: Look) {
-    let p = palette(look);
+/// Configure egui's `Visuals` and `Style` for `mode`: surfaces, strokes, geometry and the
+/// typography split that keeps HTTP panes monospace while the chrome follows the theme. This is
+/// the one entry point; everything the app paints reads from the palette it installs.
+pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    let p = palette(mode);
     let mut style = (*ctx.style()).clone();
-    style.visuals = if look == Look::Dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    style.visuals = if mode.is_dark() { egui::Visuals::dark() } else { egui::Visuals::light() };
     let v = &mut style.visuals;
     v.panel_fill = p.panel;
     v.window_fill = p.panel;
     // a text field is a well: it sits below the canvas rather than on it
     v.extreme_bg_color = p.bg_input;
     // the stripe on every other table row, a hair away from the surface under it
-    v.faint_bg_color = if look == Look::Dark { c(0x2C2F33) } else { c(0xE9EBEE) };
+    v.faint_bg_color = p.row_stripe;
     v.override_text_color = Some(p.text);
     v.hyperlink_color = p.link;
-    v.selection.bg_fill = p.selection;
-    v.selection.stroke = Stroke::new(1.0_f32, p.strong);
+    v.selection.bg_fill = p.selection_soft;
+    v.selection.stroke = Stroke::new(1.0_f32, p.text);
     v.window_stroke = Stroke::new(1.0_f32, p.border_subtle);
+    let corner = egui::CornerRadius::same(p.corner);
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.fg_stroke.color = p.text;
-        w.corner_radius = egui::CornerRadius::same(CORNER);
+        w.corner_radius = corner;
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
     v.widgets.inactive.weak_bg_fill = p.header;
@@ -263,25 +319,27 @@ pub fn apply(ctx: &egui::Context, look: Look) {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.border_focus);
     v.widgets.open.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
-    // a menu, a dropdown list or a tooltip floats over the work: a soft shadow is what says
-    // so, and it has to be darker than the surface it falls on, which differs by theme
-    let shade = if look == Look::Dark { Color32::from_black_alpha(96) } else { Color32::from_black_alpha(40) };
+    // a menu, a dropdown list or a tooltip floats over the work: a soft shadow is what says so
+    let shade = if mode.is_dark() { Color32::from_black_alpha(96) } else { Color32::from_black_alpha(40) };
     v.popup_shadow = egui::epaint::Shadow { offset: [0, 3], blur: 10, spread: 0, color: shade };
     v.window_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: shade };
     // the surface those float on, and the frame around it
     v.window_fill = p.panel;
     v.widgets.open.bg_fill = p.header;
-    // text the user has selected inside a field, which must not vanish into the selection
-    v.selection.bg_fill = p.selection;
-    v.selection.stroke = Stroke::new(1.0_f32, p.strong);
+    // text the user has selected inside a field, which must not vanish into the selection.
+    // egui keeps drawing it in the ordinary text colour, so the fill behind it has to be one
+    // that colour still reads on.
+    v.selection.bg_fill = p.selection_soft;
+    v.selection.stroke = Stroke::new(1.0_f32, p.text);
+    // menus, dropdown lists and dialogs carry the same corner as everything else
+    v.menu_corner_radius = corner;
+    v.window_corner_radius = corner;
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
     // one height for every button, field and dropdown, so a toolbar row lines up
     style.spacing.interact_size.y = CONTROL_H;
     style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(FONT_UI));
     style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(FONT_UI));
-    // metrics and message bodies: a monospace face gives the fixed-width digits that keep a
-    // column of ids, sizes and timestamps lined up
     style.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(FONT_CODE));
     style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(FONT_CAPTION));
     style.text_styles.insert(egui::TextStyle::Heading, FontId::new(FONT_TITLE, FontFamily::Name("bold".into())));
@@ -308,7 +366,8 @@ pub fn bold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).font(FontId::new(size, FontFamily::Name("bold".into())))
 }
 
-/// Primary (orange) button, as "Start attack", "Open browser", "Next".
+/// The primary action, as "Start attack", "Open browser", "Next": the accent as a fill, with
+/// [`Palette::accent_text`] over it.
 pub fn primary_button(ui: &mut Ui, p: &Palette, label: &str) -> egui::Response {
     // drawn twice: once to learn whether the pointer is on it, then again in the shade that
     // answers. egui settles on the second frame, which is the frame anyone can see.
@@ -321,15 +380,27 @@ pub fn primary_button(ui: &mut Ui, p: &Palette, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(bold(label, FONT_UI).color(p.accent_text))
             .fill(fill)
-            .corner_radius(egui::CornerRadius::same(CORNER))
+            .corner_radius(egui::CornerRadius::same(p.corner))
             .min_size(egui::vec2(0.0, CONTROL_H)),
+    )
+}
+
+/// A named action sized by the caller ("Send", "Start attack", "Compare words"). The same
+/// face as [`primary_button`], with a width and height the caller fixes.
+pub fn action_button(ui: &mut Ui, p: &Palette, label: &str, enabled: bool, min_size: egui::Vec2) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(bold(label, 13.0).color(if enabled { p.accent_text } else { p.disabled }))
+            .fill(p.accent)
+            .corner_radius(egui::CornerRadius::same(p.corner))
+            .min_size(min_size),
     )
 }
 
 /// Grey button with bold label, as "Add", "Edit".
 pub fn plain_button(ui: &mut Ui, p: &Palette, label: &str, enabled: bool) -> egui::Response {
     let txt = bold(label, 13.0).color(if enabled { p.text } else { p.disabled });
-    ui.add_enabled(enabled, egui::Button::new(txt).fill(p.header).min_size(egui::vec2(0.0, 22.0)))
+    ui.add_enabled(enabled, egui::Button::new(txt).fill(p.header).corner_radius(egui::CornerRadius::same(p.corner)).min_size(egui::vec2(0.0, 22.0)))
 }
 
 /// Fixed-width stacked button for the left-of-table button columns.
@@ -338,7 +409,7 @@ pub fn side_button(ui: &mut Ui, p: &Palette, label: &str, enabled: bool) -> egui
     ui.add_enabled(enabled, egui::Button::new(txt).fill(p.header).min_size(egui::vec2(74.0, 20.0)))
 }
 
-/// Text tabs with an orange underline under the selected one (main and sub tabs).
+/// Text tabs with an accent underline under the selected one (main and sub tabs).
 pub fn underline_tabs<T: Copy + PartialEq>(ui: &mut Ui, p: &Palette, items: &[(T, &str)], selected: &mut T, height: f32) {
     for (value, label) in items {
         let is_sel = *selected == *value;
@@ -353,10 +424,10 @@ pub fn underline_tabs<T: Copy + PartialEq>(ui: &mut Ui, p: &Palette, items: &[(T
         // the tab being read is a surface of its own; one not being read lifts only under the
         // pointer, as a rounded pill inset from the strip
         if is_sel {
-            ui.painter().rect_filled(rect, egui::CornerRadius { nw: CORNER, ne: CORNER, sw: 0, se: 0 }, p.panel);
+            ui.painter().rect_filled(rect, egui::CornerRadius { nw: p.corner, ne: p.corner, sw: 0, se: 0 }, p.panel);
         } else if resp.hovered() {
             let pill = rect.shrink2(egui::vec2(2.0, 4.0));
-            ui.painter().rect_filled(pill, egui::CornerRadius::same(CORNER), p.hover);
+            ui.painter().rect_filled(pill, egui::CornerRadius::same(p.corner), p.hover);
         }
         let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(pos, galley, p.text);
@@ -437,7 +508,7 @@ pub fn paint_globe(painter: &egui::Painter, c0: egui::Pos2, rad: f32, col: Color
 
 /// Small toggle switch, filled in the accent when on, as "Capturing".
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
-    let p = palette(if ui.visuals().dark_mode { Look::Dark } else { Look::Light });
+    let p = palette(if ui.visuals().dark_mode { ThemeMode::DarkWorkstation } else { ThemeMode::LightWorkstation });
     let p = &p;
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(28.0, 15.0), egui::Sense::click());
     if resp.clicked() {
@@ -499,7 +570,7 @@ const EMPTY_MAX_WIDTH: f32 = 340.0;
 /// or any other text as a glyph), a bold title, a dimmed wrapped subtitle, and an optional
 /// button. Returns the button's response.
 pub fn empty_state_card(ui: &mut Ui, icon: Option<&str>, title: &str, subtitle: &str, action_label: Option<&str>) -> Option<egui::Response> {
-    let p = palette(if ui.visuals().dark_mode { Look::Dark } else { Look::Light });
+    let p = palette(if ui.visuals().dark_mode { ThemeMode::DarkWorkstation } else { ThemeMode::LightWorkstation });
     let avail = ui.available_rect_before_wrap();
     let width = EMPTY_MAX_WIDTH.min(avail.width() - 32.0).max(120.0);
     // measure first, so the whole card (not just its top) sits in the middle
@@ -690,9 +761,9 @@ pub fn table_row_cells(
     } else if resp.hovered() {
         p.hover
     } else if stripe {
-        ui.visuals().faint_bg_color
+        p.row_stripe
     } else {
-        p.deep
+        p.row_bg
     };
     // a selected row keeps the selection colour: of the two things a row can be, which one is
     // being read matters more than which colour it was marked with
@@ -819,9 +890,9 @@ pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32
     } else if resp.hovered() {
         p.hover
     } else if stripe {
-        ui.visuals().faint_bg_color
+        p.row_stripe
     } else {
-        p.deep
+        p.row_bg
     };
     ui.painter().rect_filled(rect, 0.0, bg);
     if selected {
@@ -836,7 +907,7 @@ pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32
             egui::Align2::LEFT_CENTER,
             text,
             FontId::proportional(12.5),
-            if selected { p.strong } else { col.unwrap_or(p.text) },
+            if selected { p.selection_text } else { col.unwrap_or(p.text) },
         );
         x += w;
     }
@@ -942,6 +1013,8 @@ pub fn resizable_window<'a>(ctx: &egui::Context, id: egui::Id, title: impl Into<
         .max_width(max.x)
         .max_height(max.y)
         .resizable(true)
+        // there is no roll-up caret on a dialog of this era: it is closed, not collapsed
+        .collapsible(false)
         .constrain(true)
 }
 
@@ -1043,7 +1116,7 @@ pub fn table_well(ui: &mut Ui, p: &Palette, height: f32, add: impl FnOnce(&mut U
 /// The width and height are floored at zero: a window dragged narrower than the panels
 /// inside it leaves negative space over, and egui asserts on a negative size.
 pub fn table_well_sized(ui: &mut Ui, p: &Palette, width: f32, height: f32, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::new().fill(p.deep).stroke(Stroke::new(1.0_f32, p.header)).show(ui, |ui| {
+    let r = egui::Frame::new().fill(p.row_bg).stroke(Stroke::new(1.0_f32, p.border_subtle)).show(ui, |ui| {
         ui.set_min_height(height.max(0.0));
         ui.set_width((width - 2.0).max(0.0));
         ui.vertical(|ui| {
@@ -1051,6 +1124,7 @@ pub fn table_well_sized(ui: &mut Ui, p: &Palette, width: f32, height: f32, add: 
             add(ui);
         });
     });
+    let _ = r;
 }
 
 /// Column widths for a table `avail` wide: every column gets its minimum, and what's left
@@ -1093,7 +1167,7 @@ pub fn text_on(fill: Color32) -> Color32 {
     };
     let l = 0.2126 * channel(fill.r()) + 0.7152 * channel(fill.g()) + 0.0722 * channel(fill.b());
     // 0.18 is where white text and black text are about equally readable
-    if l > 0.18 { DARK.bg_input } else { LIGHT.panel }
+    if l > 0.18 { DARK_WORKSTATION.bg_input } else { LIGHT_WORKSTATION.bg_input }
 }
 
 /// A status pill for the chrome: a filled dot in `colour` and a word beside it, on a raised
@@ -1164,7 +1238,7 @@ mod tests {
     /// column layout, whose egui original divides the space left without checking there is any.
     #[test]
     fn the_layout_helpers_cope_with_no_room_at_all() {
-        let p = &DARK;
+        let p = &DARK_WORKSTATION;
         let widths: [f32; 5] = [800.0, 100.0, 10.0, 1.0, 0.0];
         assert_table!(widths, |idx, width| {
             // the width a table well subtracts its border from, and the width the columns
@@ -1232,7 +1306,7 @@ mod tests {
     #[test]
     fn every_foreground_is_legible_on_its_surface_in_both_themes() {
         let mut bad: Vec<String> = Vec::new();
-        for (theme, p) in [("dark", &DARK), ("light", &LIGHT)] {
+        for (theme, p) in [("dark", &DARK_WORKSTATION), ("light", &LIGHT_WORKSTATION)] {
             // the surfaces text is read on
             let body: [(&str, Color32, &str, Color32); 11] = [
                 ("text on the canvas", p.text, "deep", p.deep),
@@ -1240,7 +1314,7 @@ mod tests {
                 ("text on raised chrome", p.text, "header", p.header),
                 ("text in an input", p.text, "bg_input", p.bg_input),
                 ("text under the pointer", p.text, "hover", p.hover),
-                ("text on a selected row", p.strong, "selection", p.selection),
+                ("text on a selected row", p.selection_text, "selection", p.selection),
                 ("emphasis on a panel", p.strong, "panel", p.panel),
                 ("emphasis on the canvas", p.strong, "deep", p.deep),
                 ("a banner's text", p.text, "banner", p.banner),
@@ -1316,5 +1390,44 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{} contrast shortfalls:\n  {}", bad.len(), bad.join("\n  "));
+    }
+
+    /// The dark theme is the default, both readings share one geometry, and the mode
+    /// round-trips through its settings form -- including the name the light slot used to be
+    /// saved under, which older settings files still hold.
+    #[test]
+    fn the_theme_mode_defaults_geometry_and_serde() {
+        assert_eq!(ThemeMode::default(), ThemeMode::DarkWorkstation, "the dark theme is the default");
+        assert!(ThemeMode::DarkWorkstation.is_dark());
+        assert!(!ThemeMode::LightWorkstation.is_dark());
+
+        assert_eq!(palette(ThemeMode::LightWorkstation).corner, palette(ThemeMode::DarkWorkstation).corner,
+            "one geometry, read twice: the themes differ in colour alone");
+
+        for m in ThemeMode::ALL {
+            let json = serde_json::to_string(&m).unwrap();
+            assert_eq!(serde_json::from_str::<ThemeMode>(&json).unwrap(), m, "{m:?} round-trips as {json}");
+            assert!(!m.label().is_empty());
+        }
+        assert_eq!(serde_json::to_string(&ThemeMode::LightWorkstation).unwrap(), "\"light_workstation\"");
+        assert_eq!(serde_json::to_string(&ThemeMode::DarkWorkstation).unwrap(), "\"dark_workstation\"");
+        // a settings file written before the light theme was reworked still loads
+        assert_eq!(serde_json::from_str::<ThemeMode>("\"classic98\"").unwrap(), ThemeMode::LightWorkstation);
+    }
+
+    /// `apply_theme` installs each theme's surfaces and geometry onto a live context: the panel
+    /// fill, the widget corner radius and egui's own dark-mode flag all follow the mode.
+    #[test]
+    fn apply_theme_installs_the_palette_and_geometry() {
+        let ctx = egui::Context::default();
+        for mode in ThemeMode::ALL {
+            apply_theme(&ctx, mode);
+            let v = ctx.style().visuals.clone();
+            let p = palette(mode);
+            assert_eq!(v.panel_fill, p.panel, "{mode:?}: the panel fill is the palette's");
+            assert_eq!(v.extreme_bg_color, p.bg_input, "{mode:?}: the editor well is the palette's input");
+            assert_eq!(v.dark_mode, mode.is_dark(), "{mode:?}: egui's dark-mode flag follows the theme");
+            assert_eq!(v.widgets.inactive.corner_radius, egui::CornerRadius::same(p.corner), "{mode:?}: widgets round to the palette corner");
+        }
     }
 }

@@ -55,6 +55,42 @@ pub mod test_utils;
 use eframe::egui;
 use state::{App, Tab};
 
+/// The window icon: the bundled logo when it decodes, otherwise a drawn fallback in the
+/// theme's own colours — a cyan square on dark slate.
+fn window_icon() -> egui::IconData {
+    // the shipped logo, embedded so a moved binary still finds it
+    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        return egui::IconData { rgba: rgba.into_raw(), width: w, height: h };
+    }
+    fallback_icon()
+}
+
+/// A 32x32 icon drawn in code, in the theme's own colours: the dark canvas, a one-pixel
+/// border a shade above it, and the cyan accent as a square at the centre. Used only when the
+/// bundled logo cannot be decoded, so it needs no outside asset of its own.
+fn fallback_icon() -> egui::IconData {
+    const N: usize = 32;
+    const CANVAS: [u8; 3] = [0x18, 0x1C, 0x24];
+    const EDGE: [u8; 3] = [0x33, 0x3B, 0x49];
+    const ACCENT: [u8; 3] = [0x38, 0xBD, 0xF8];
+    let mut rgba = Vec::with_capacity(N * N * 4);
+    for y in 0..N {
+        for x in 0..N {
+            let rgb = if x == 0 || y == 0 || x == N - 1 || y == N - 1 {
+                EDGE
+            } else if (9..N - 9).contains(&x) && (9..N - 9).contains(&y) {
+                ACCENT
+            } else {
+                CANVAS
+            };
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xFF]);
+        }
+    }
+    egui::IconData { rgba, width: N as u32, height: N as u32 }
+}
+
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     // a subcommand (scan, intruder, repeat, proxy, sequence, decode) runs its own engine and
@@ -100,7 +136,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1460.0, 800.0])
-            .with_title("ForgeProxy"),
+            .with_title("ForgeProxy")
+            .with_icon(window_icon()),
         vsync: shot_path.is_none(),
         ..Default::default()
     };
