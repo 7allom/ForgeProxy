@@ -1196,7 +1196,11 @@ fn sub_repeat(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 
         },
         None => None,
     };
-    let rules = project.as_ref().map(|(_, f)| f.match_replace.clone()).unwrap_or_default();
+    // External command rules run only programs registered in this machine's settings
+    let rules = crate::rewrite::resolve(
+        &project.as_ref().map(|(_, f)| f.match_replace.clone()).unwrap_or_default(),
+        &settings.external_tools,
+    );
 
     // the request as it is sent, after any rewrite rules act on it
     let sent = crate::rewrite::apply_first_line_of(&rules, &raw);
@@ -1602,6 +1606,8 @@ fn sub_proxy_until(
         Err(e) => return refuse(err, &e),
     };
     let rules = if file.match_replace.is_empty() { crate::rewrite::defaults() } else { file.match_replace.clone() };
+    // External command rules run only programs registered in this machine's settings
+    let rules = crate::rewrite::resolve(&rules, &settings.external_tools);
     let tls = load_ca_cache(&config_dir_of(&parsed));
     let shared = crate::proxy::Shared::headless(history.clone(), next_id.clone(), rules, &settings, tls);
     let addr = format!("{host}:{port}");

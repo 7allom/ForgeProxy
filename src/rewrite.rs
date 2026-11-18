@@ -99,14 +99,74 @@ pub struct Rule {
     /// Rules saved before this setting existed read back as [`RuleAction::Replace`].
     #[serde(default)]
     pub action: RuleAction,
-    /// The command line an [`RuleAction::TransformCommand`] rule runs: the first word is the
-    /// program, the rest its arguments. Empty for a replacement rule.
+    /// The registered program an [`RuleAction::TransformCommand`] rule runs, by its name in
+    /// Settings > External tools. Empty for a replacement rule.
+    ///
+    /// This name is all a rule ever stores. The command line it stands for lives in the user's
+    /// own settings, so a project file handed over by someone else can name a program but never
+    /// supply one: a name that is not registered on this machine runs nothing.
     #[serde(default)]
-    pub command: String,
+    pub program: String,
     /// How long that command may run, in milliseconds, before it is stopped and the original
     /// bytes are kept. Rules saved before this setting existed read back at the default.
     #[serde(default = "transform_timeout_default")]
     pub timeout_ms: u64,
+    /// What [`program`](Rule::program) resolves to among the user's registered programs, filled
+    /// in by [`resolve`] when rules are handed to whatever applies them. Never read from or
+    /// written to a file, so nothing loaded from disk can set it.
+    #[serde(skip)]
+    pub transform: Option<Transform>,
+}
+
+/// The program and arguments an External command rule runs, taken from the user's registered
+/// program of the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transform {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+/// The registered program called `name`, as a [`Transform`], or `None` when no runnable program
+/// of that name is registered.
+pub fn registered(tools: &[crate::tooling::ExternalTool], name: &str) -> Option<Transform> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    tools
+        .iter()
+        .find(|t| t.name.trim() == name && t.is_runnable())
+        .map(|t| Transform { command: t.command.trim().to_string(), args: crate::tooling::tokenize(&t.args) })
+}
+
+/// `rules`, ready to apply: each External command rule has its program looked up among `tools`,
+/// the user's registered programs, and every other rule carries no transform at all.
+///
+/// This is the only way a rule gets something to run. Rules read from a project, a settings
+/// file or anywhere else arrive with none, and a rule whose program is not registered keeps
+/// none, so it leaves the traffic exactly as it found it.
+pub fn resolve(rules: &[Rule], tools: &[crate::tooling::ExternalTool]) -> Vec<Rule> {
+    rules
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            r.transform = if r.action == RuleAction::TransformCommand { registered(tools, &r.program) } else { None };
+            r
+        })
+        .collect()
+}
+
+/// The program names enabled External command rules ask for that are not registered among
+/// `tools`, each once, in rule order: what to tell the user after opening a project.
+pub fn unregistered_programs(rules: &[Rule], tools: &[crate::tooling::ExternalTool]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in rules.iter().filter(|r| r.enabled && r.action == RuleAction::TransformCommand) {
+        let name = r.program.trim().to_string();
+        if registered(tools, &name).is_none() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 fn case_sensitive_default() -> bool {
@@ -135,8 +195,9 @@ impl Rule {
             comment: String::new(),
             case_sensitive: kind.starts_case_sensitive(),
             action: RuleAction::Replace,
-            command: String::new(),
+            program: String::new(),
             timeout_ms: DEFAULT_TRANSFORM_TIMEOUT_MS,
+            transform: None,
         }
     }
 
@@ -157,20 +218,21 @@ impl Rule {
     }
 }
 
-/// Run `command` as a child process, write `input` to its stdin, and return what it writes to
+/// Run `t` as a child process, write `input` to its stdin, and return what it writes to
 /// stdout. Stdin and stdout are each drained on their own thread so a filter that writes a lot
 /// before reading all of its input cannot deadlock against a full pipe.
 ///
 /// The guardrails are strict: the child is killed if it outlives `timeout`, its output is
 /// capped at [`MAX_TRANSFORM_OUTPUT`], and a failure to spawn, an over-cap, a timeout or a
 /// non-zero exit all return `Err` so the caller can keep the original bytes.
-fn run_transform(command: &str, timeout: Duration, input: &[u8]) -> Result<Vec<u8>, String> {
+fn run_transform(t: &Transform, timeout: Duration, input: &[u8]) -> Result<Vec<u8>, String> {
     use std::process::{Command, Stdio};
-    let mut parts = command.split_whitespace();
-    let program = parts.next().ok_or_else(|| "the command is empty".to_string())?;
-    let args: Vec<&str> = parts.collect();
+    let program = t.command.as_str();
+    if program.is_empty() {
+        return Err("the program has no command".to_string());
+    }
     let mut child = Command::new(program)
-        .args(&args)
+        .args(&t.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -239,15 +301,17 @@ fn matcher(rule: &Rule) -> Option<Regex> {
     crate::regex_cache::get_with(&pattern, !rule.case_sensitive)
 }
 
-/// Run a header or body slice through a [`RuleAction::TransformCommand`] rule's command,
-/// returning the transformed text. When the gate is closed the slice is returned unchanged;
+/// Run a header or body slice through a [`RuleAction::TransformCommand`] rule's program,
+/// returning the transformed text. A rule with no resolved program (see [`resolve`]) leaves
+/// the slice alone. When the gate is closed the slice is returned unchanged;
 /// when the command fails, times out or over-runs its cap, the slice is kept and a concise
 /// warning is pushed for the caller to log, so a bad command never drops the exchange.
 fn apply_command(rule: &Rule, slice: &str, warnings: &mut Vec<String>) -> String {
-    if rule.command.trim().is_empty() || !rule.command_gate_open(slice) {
+    let Some(t) = rule.transform.as_ref() else { return slice.to_string() };
+    if !rule.command_gate_open(slice) {
         return slice.to_string();
     }
-    match run_transform(&rule.command, rule.timeout(), slice.as_bytes()) {
+    match run_transform(t, rule.timeout(), slice.as_bytes()) {
         Ok(out) => String::from_utf8_lossy(&out).into_owned(),
         Err(why) => {
             warnings.push(format!("the {} command was kept out ({why})", rule.kind.label().to_lowercase()));
@@ -801,9 +865,18 @@ mod tests {
         }
     }
 
-    /// Build an enabled External Command rule of `kind` with the given command line.
+    /// A registered program called `name` that runs `command` (the first word the program,
+    /// the rest its arguments).
+    fn tool(name: &str, command: &str) -> crate::tooling::ExternalTool {
+        let (program, args) = command.split_once(' ').unwrap_or((command, ""));
+        crate::tooling::ExternalTool { name: name.into(), command: program.into(), args: args.into(), ..Default::default() }
+    }
+
+    /// Build an enabled External Command rule of `kind` running `command`, resolved through a
+    /// registered program the way every caller resolves rules.
     fn cmd(kind: RuleType, command: &str, timeout_ms: u64) -> Rule {
-        Rule { action: RuleAction::TransformCommand, command: command.into(), timeout_ms, ..Rule::new(kind) }
+        let rule = Rule { action: RuleAction::TransformCommand, program: "filter".into(), timeout_ms, ..Rule::new(kind) };
+        resolve(&[rule], &[tool("filter", command)]).remove(0)
     }
 
     /// A rule saved before the action model existed reads back as a plain replacement with an
@@ -813,7 +886,8 @@ mod tests {
         let json = r#"{"enabled":true,"kind":"RequestBody","regex":false,"match_text":"a","replace_text":"b","comment":"","case_sensitive":true}"#;
         let old: Rule = serde_json::from_str(json).unwrap();
         assert_eq!(old.action, RuleAction::Replace);
-        assert!(old.command.is_empty());
+        assert!(old.program.is_empty());
+        assert!(old.transform.is_none());
         assert_eq!(old.timeout_ms, DEFAULT_TRANSFORM_TIMEOUT_MS);
         // and the default timeout on a fresh rule is the documented 1000 ms
         assert_eq!(Rule::new(RuleType::RequestBody).timeout_ms, 1000);
@@ -900,5 +974,48 @@ mod tests {
         let skip = Rule { match_text: "x-absent".into(), ..cmd(RuleType::RequestHeader, "tr a-z A-Z", 2000) };
         let (h, _, _) = apply_collecting(&[skip], true, "Accept: text/html", "");
         assert_eq!(h, "Accept: text/html", "a closed gate leaves the block as it was");
+    }
+
+    /// A rule read from a file cannot carry a command line. A project written by a build that
+    /// stored one in the rule (`"command"`) reads back with nothing to run, and even a rule that
+    /// names a program runs nothing until that name is registered on this machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_rule_from_a_file_runs_only_a_program_registered_here() {
+        let json = r#"{"enabled":true,"kind":"RequestHeader","regex":false,"match_text":"","replace_text":"","comment":"",
+            "case_sensitive":false,"action":"TransformCommand","command":"tr a-z A-Z","program":"upper","timeout_ms":2000}"#;
+        let loaded: Rule = serde_json::from_str(json).unwrap();
+        assert!(loaded.transform.is_none(), "nothing loaded from disk has anything to run");
+        // and the command line in the file is not kept anywhere
+        let back = serde_json::to_string(&loaded).unwrap();
+        assert!(!back.contains("tr a-z"), "a saved rule carries no command line: {back}");
+
+        let headers = "Accept: text/html";
+        let unresolved = apply_collecting(std::slice::from_ref(&loaded), true, headers, "");
+        assert_eq!(unresolved.0, headers, "an unresolved rule leaves the traffic alone");
+
+        // nothing registered under that name: still nothing runs
+        let other = [tool("lower", "tr A-Z a-z")];
+        let rules = resolve(std::slice::from_ref(&loaded), &other);
+        assert!(rules[0].transform.is_none());
+        assert_eq!(apply_collecting(&rules, true, headers, "").0, headers);
+        assert_eq!(unregistered_programs(&rules, &other), vec!["upper".to_string()]);
+
+        // registered here: the user's own command line runs, not the file's
+        let mine = [tool("upper", "tr a-z A-Z")];
+        let rules = resolve(std::slice::from_ref(&loaded), &mine);
+        assert_eq!(apply_collecting(&rules, true, headers, "").0, "ACCEPT: TEXT/HTML");
+        assert!(unregistered_programs(&rules, &mine).is_empty());
+    }
+
+    /// Only an External command rule is given a transform; a replacement rule naming a program
+    /// (left over from being switched back) is not.
+    #[test]
+    fn only_command_rules_resolve_to_a_program() {
+        let tools = [tool("upper", "tr a-z A-Z")];
+        let replace = Rule { program: "upper".into(), ..Rule::new(RuleType::RequestBody) };
+        assert!(resolve(&[replace], &tools)[0].transform.is_none());
+        assert!(registered(&tools, "  ").is_none(), "a blank name is never a program");
+        assert!(registered(&[tool("upper", "")], "upper").is_none(), "a program with no command is not runnable");
     }
 }

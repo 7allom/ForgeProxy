@@ -2255,8 +2255,10 @@ mod tests {
         let sh = shared();
         let mut rule = crate::rewrite::Rule::new(crate::rewrite::RuleType::RequestBody);
         rule.action = crate::rewrite::RuleAction::TransformCommand;
-        rule.command = "tr -d -".into(); // drop every hyphen, shrinking the body
-        sh.rules.lock().unwrap().push(rule);
+        rule.program = "strip".into();
+        // drop every hyphen, shrinking the body
+        let tools = [crate::tooling::ExternalTool { name: "strip".into(), command: "tr".into(), args: "-d -".into(), ..Default::default() }];
+        sh.rules.lock().unwrap().extend(crate::rewrite::resolve(&[rule], &tools));
         let pp = running_proxy(&sh);
         let req = format!("POST http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\na-b-c-d");
         bytes_through(pp, req.as_bytes());
@@ -2276,8 +2278,10 @@ mod tests {
         let sh = shared();
         let mut rule = crate::rewrite::Rule::new(crate::rewrite::RuleType::ResponseBody);
         rule.action = crate::rewrite::RuleAction::TransformCommand;
-        rule.command = "tr a-z A-Z".into(); // upper-case, same length
-        sh.rules.lock().unwrap().push(rule);
+        rule.program = "upper".into();
+        // upper-case, same length
+        let tools = [crate::tooling::ExternalTool { name: "upper".into(), command: "tr".into(), args: "a-z A-Z".into(), ..Default::default() }];
+        sh.rules.lock().unwrap().extend(crate::rewrite::resolve(&[rule], &tools));
         let pp = running_proxy(&sh);
         let req = format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n");
         let back = bytes_through(pp, req.as_bytes());

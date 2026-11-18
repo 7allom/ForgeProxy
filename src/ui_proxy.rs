@@ -286,6 +286,8 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
     if let Some(i) = app.mr_sel.filter(|&i| show_editor && i < app.mr_rules.len()) {
         ui.add_space(8.0);
         ui.label(bold("Edit selected rule", 13.0).color(p.strong));
+        // the registered programs an External command rule can name
+        let names: Vec<String> = app.settings.external_tools.iter().filter(|t| t.is_runnable()).map(|t| t.name.trim().to_string()).collect();
         let r = &mut app.mr_rules[i];
         egui::Grid::new(("mr_edit", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label("Enabled:"); ui.checkbox(&mut r.enabled, ""); ui.end_row();
@@ -311,8 +313,24 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
             let match_hint = if command { "Match (gate, blank runs always):" } else { "Match:" };
             ui.label(match_hint); ui.add(egui::TextEdit::singleline(&mut r.match_text).desired_width(460.0).font(FontId::monospace(12.5))); ui.end_row();
             if command {
-                ui.label("Command:");
-                ui.add(egui::TextEdit::singleline(&mut r.command).desired_width(460.0).font(FontId::monospace(12.5)).hint_text("program arg1 arg2"));
+                // a rule names one of the user's registered programs; the command line itself
+                // stays in their settings and never travels in the project
+                ui.label("Program:");
+                let shown = if r.program.trim().is_empty() {
+                    "Choose a registered program".to_string()
+                } else if names.contains(&r.program.trim().to_string()) {
+                    r.program.clone()
+                } else {
+                    format!("{} (not registered)", r.program)
+                };
+                egui::ComboBox::from_id_salt(("mr_program", id)).selected_text(shown).width(300.0).show_ui(ui, |ui| {
+                    for n in &names {
+                        ui.selectable_value(&mut r.program, n.clone(), n);
+                    }
+                    if names.is_empty() {
+                        ui.label(RichText::new("No programs registered. Add one under Settings > External tools.").color(p.disabled));
+                    }
+                });
                 ui.end_row();
                 ui.label("Timeout (ms):");
                 ui.add(egui::DragValue::new(&mut r.timeout_ms).range(1..=600_000).speed(10));
@@ -329,7 +347,7 @@ pub fn rules_editor(app: &mut App, ui: &mut Ui, p: &Palette, id: &str, edit_butt
         });
         ui.label(RichText::new("Header rules work line by line: a blank match adds the replacement as a new header; a blank replacement removes matching headers.").size(11.5).color(p.disabled));
         ui.label(RichText::new("A request first line rule sees only the line itself, such as \"GET /api/v1/users HTTP/1.1\".").size(11.5).color(p.disabled));
-        ui.label(RichText::new("External command: the matched header block or body is piped to the command's stdin and replaced by its stdout. On a timeout, a non-zero exit, or a command that cannot start, the original bytes are kept.").size(11.5).color(p.disabled));
+        ui.label(RichText::new("External command: the matched header block or body is piped to a program registered under Settings > External tools (its command and arguments, as registered) and replaced by what it prints. On a timeout, a non-zero exit, or a program that cannot start, the original bytes are kept. A project stores only the program's name.").size(11.5).color(p.disabled));
     }
     ui.data_mut(|d| d.insert_temp(editing_id, editing));
 }

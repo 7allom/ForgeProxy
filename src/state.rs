@@ -1397,7 +1397,9 @@ impl eframe::App for App {
 
         // keep the proxy's copies of the match-and-replace rules, the scope and the
         // "Only in scope" switch current
-        *self.proxy.rules.lock().unwrap_or_else(|e| e.into_inner()) = self.mr_rules.clone();
+        // (External command rules get their program from the user's own registered programs)
+        *self.proxy.rules.lock().unwrap_or_else(|e| e.into_inner()) =
+            crate::rewrite::resolve(&self.mr_rules, &self.settings.external_tools);
         {
             let mut scope = self.proxy.scope.lock().unwrap_or_else(|e| e.into_inner());
             if *scope != self.target_scope { *scope = self.target_scope.clone(); }

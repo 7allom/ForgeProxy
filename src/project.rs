@@ -174,6 +174,15 @@ pub fn apply_settings(app: &mut App, f: &ProjectFile) {
     app.overrides = f.overrides.clone();
     if !f.match_replace.is_empty() {
         app.mr_rules = f.match_replace.clone();
+        // a project names the programs its External command rules run, but the programs
+        // themselves are this machine's: say which ones are missing, since those rules will
+        // leave the traffic alone until a program of that name is registered here
+        for name in crate::rewrite::unregistered_programs(&app.mr_rules, &app.settings.external_tools) {
+            let what = if name.is_empty() { "no program".to_string() } else { format!("the program \"{name}\"") };
+            crate::proxy::log_warning(&app.proxy.events, format!(
+                "Match and replace: a rule from this project runs {what}, which is not registered in Settings > External tools. It does nothing until it is."
+            ));
+        }
     }
 }
 
@@ -821,5 +830,34 @@ mod tests {
         app.interactor_server = "something.else".into();
         reset(&mut app);
         assert_eq!(app.interactor_server, "", "and on nothing when none is set");
+    }
+
+    /// A project can name the program an External command rule runs, but never supply it. One
+    /// crafted to carry a command line opens with that line gone, the rule does nothing to the
+    /// traffic the proxy and Repeater apply rules to, and the Event log says which program is
+    /// missing.
+    #[test]
+    fn a_project_cannot_bring_a_command_with_it() {
+        let mut app = crate::test_utils::MockAppBuilder::new().build();
+        app.settings.external_tools.clear();
+        let json = r#"{"enabled":true,"kind":"RequestHeader","regex":false,"match_text":"","replace_text":"",
+            "comment":"Emulate desktop UA","case_sensitive":false,"action":"TransformCommand",
+            "command":"touch /tmp/forgeproxy-should-never-exist","program":"helper","timeout_ms":60000}"#;
+        let mut f = snapshot(&app);
+        f.match_replace = vec![serde_json::from_str(json).unwrap()];
+        apply_settings(&mut app, &f);
+
+        assert_eq!(app.mr_rules.len(), 1, "the rule itself is kept");
+        let saved = serde_json::to_string(&snapshot(&app)).unwrap();
+        assert!(!saved.contains("touch /tmp"), "the command line was not kept: it is gone on the next save");
+        let ready = crate::rewrite::resolve(&app.mr_rules, &app.settings.external_tools);
+        assert!(ready[0].transform.is_none(), "with no program called helper registered, nothing can run");
+        assert_eq!(crate::rewrite::apply(&ready, true, "Accept: */*", "").0, "Accept: */*");
+
+        let events = app.proxy.events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            events.iter().any(|e| e.message.contains("\"helper\"") && e.message.contains("not registered")),
+            "the missing program is named in the Event log"
+        );
     }
 }

@@ -22,14 +22,16 @@ pub fn send_repeater(app: &mut App) {
     // the address bar follows the user's own request; the rules then act on the copy that is
     // sent, so a rewritten request line never writes itself back into the editor
     tab.url = repeater_target(&tab.request, &tab.url);
-    let req_sent = rewrite::apply_first_line_of(&app.mr_rules, &app.rep().request);
+    // External command rules run the user's registered program of the name they give
+    let rules = rewrite::resolve(&app.mr_rules, &app.settings.external_tools);
+    let req_sent = rewrite::apply_first_line_of(&rules, &app.rep().request);
     let (method, _, headers, body) = parse_raw_request(&req_sent);
     // and the send follows the rewritten line, so a rewritten path is the path asked for
     let url = repeater_target(&req_sent, &app.rep().url);
     let htext = headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n");
-    let (htext, body2) = rewrite::apply(&app.mr_rules, true, &htext, &body);
+    let (htext, body2) = rewrite::apply(&rules, true, &htext, &body);
     let hv = parse_headers(&htext);
-    let rules_copy = app.mr_rules.clone();
+    let rules_copy = rules;
     let follow = app.rep_follow;
     let unpack = app.rep_unpack;
     let opts = app.send_options();
