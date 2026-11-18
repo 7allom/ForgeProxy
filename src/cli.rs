@@ -1611,7 +1611,9 @@ fn sub_proxy_until(
     // External command rules run only programs registered in this machine's settings
     let rules = crate::rewrite::resolve(&rules, &settings.external_tools);
     let tls = load_ca_cache(&config_dir_of(&parsed));
-    let shared = crate::proxy::Shared::headless(history.clone(), next_id.clone(), rules, &settings, tls);
+    // the captured WebSocket messages go into the project beside the requests
+    let ws_messages: crate::websocket::MessageLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared = crate::proxy::Shared::headless(history.clone(), next_id.clone(), rules, &settings, tls, ws_messages.clone());
     let addr = format!("{host}:{port}");
     let shutdown = match shutdown {
         Some(flag) => flag,
@@ -1636,6 +1638,8 @@ fn sub_proxy_until(
             history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| (**e).clone()).collect();
         let n = captured.len();
         file.history = captured;
+        file.websocket_messages =
+            ws_messages.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| (**m).clone()).collect();
         crate::project::write(file, &project_path).map(|()| n)
     };
 
@@ -1669,8 +1673,13 @@ fn sub_proxy_until(
         Ok(n) => {
             let _ = writeln!(
                 err,
-                "Captured {n} {}; wrote {project_path} after {:.1} s.",
+                "Captured {n} {}{}; wrote {project_path} after {:.1} s.",
                 if n == 1 { "request" } else { "requests" },
+                match ws_messages.lock().unwrap_or_else(|e| e.into_inner()).len() {
+                    0 => String::new(),
+                    1 => " and 1 WebSocket message".to_string(),
+                    m => format!(" and {m} WebSocket messages"),
+                },
                 started.elapsed().as_secs_f64()
             );
             EXIT_OK

@@ -15,8 +15,9 @@ pub fn proxy(app: &mut App, ui: &mut Ui, p: &Palette) {
     sub_tabs(ui, p, Tab::Proxy.sub_views(), &mut app.proxy_sub);
     match app.proxy_sub {
         1 => history(app, ui, p),
-        2 => match_replace(app, ui, p),
-        3 => settings(app, ui, p),
+        2 => websockets(app, ui, p),
+        3 => match_replace(app, ui, p),
+        4 => settings(app, ui, p),
         _ => intercept(app, ui, p),
     }
 }
@@ -209,6 +210,226 @@ pub fn drop_held(app: &mut App) {
         let _ = h.reply.send(Decision::Drop);
     }
     app.held_loaded = None;
+}
+
+/// Proxy > WebSockets: the frames captured on upgraded connections, and the payload of the
+/// one picked.
+///
+/// Columns, as (minimum width, share of the spare width): #, Time, Host, Path, Direction,
+/// Opcode, Length, Payload. The payload takes the slack, as the path does in HTTP history.
+const WS_COLS: [(f32, f32); 8] = [(50.0, 0.0), (72.0, 0.0), (150.0, 0.0), (150.0, 0.0),
+    (90.0, 0.0), (90.0, 0.0), (70.0, 0.0), (220.0, 1.0)];
+
+fn websockets(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let messages = app.proxy.ws_messages.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let any_open = !app.proxy.ws_live.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    // a connection that has opened but said nothing yet is still worth a composer
+    if messages.is_empty() && !any_open {
+        let (_, open) = theme::empty_state(
+            ui,
+            p,
+            EmptyIcon::History,
+            "No WebSocket messages yet",
+            "Frames sent over connections the proxy has upgraded will display here, both ways.",
+            Some("Open browser"),
+        );
+        if open {
+            open_browser(app);
+        }
+        return;
+    }
+
+    // registered first, so it keeps the bottom of the tab and the detail pane sits above it
+    compose_bar(app, ui, p);
+
+    // the message being read, and the handshake it belongs to
+    let selected = app.ws_sel.and_then(|id| messages.iter().find(|m| m.id == id)).cloned();
+    let mut clicked = None;
+    let avail = ui.available_height();
+    if let Some(m) = &selected {
+        egui::TopBottomPanel::bottom("ws_detail")
+            .resizable(true)
+            .default_height(260.0)
+            .min_height(120.0)
+            // the table above always keeps a usable height, however far this is dragged
+            .max_height((avail - 120.0).max(120.0))
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { top: 6, ..Default::default() }))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("#{}", m.id)).color(p.text));
+                    ui.label(RichText::new(m.direction.label()).color(p.strong));
+                    ui.label(RichText::new(m.opcode.label()).color(p.text));
+                    ui.label(RichText::new(format!("{} bytes in {} frame(s)", m.length, m.frames)).size(11.5).color(p.disabled));
+                    if m.compressed {
+                        ui.label(RichText::new("compressed").size(11.5).color(p.badge_info));
+                    }
+                    if m.truncated {
+                        ui.label(RichText::new("kept in part").size(11.5).color(p.warning));
+                    }
+                });
+                // a scroll area inside, so the payload cannot drive the height the pane was
+                // dragged to
+                egui::ScrollArea::vertical().id_salt("ws_detail_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    let h = (ui.available_height() - 10.0).max(80.0);
+                    let _ = crate::editor::message_view(ui, p, "ws_payload", &m.payload, h);
+                });
+            });
+    }
+
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+        let table_h = ui.available_height().max(120.0);
+        theme::fitted_table(ui, p, "ws_table", table_h, &WS_COLS, |ui, w| {
+            theme::table_header(ui, p, &[("#", w[0]), ("Time", w[1]), ("Host", w[2]), ("Path", w[3]),
+                ("Direction", w[4]), ("Opcode", w[5]), ("Length", w[6]), ("Payload", w[7])]);
+            let sel = app.ws_sel;
+            egui::ScrollArea::vertical().id_salt("ws_rows").show_rows(ui, theme::ROW_HEIGHT, messages.len(), |ui, range| {
+                for (i, m) in messages.iter().enumerate().skip(range.start).take(range.len()) {
+                    let direction = m.direction.label();
+                    let opcode = m.opcode.label();
+                    // one line of the payload: a message with newlines in it must not make
+                    // the row taller than every other one
+                    let preview: String = m.payload.lines().next().unwrap_or("").chars().take(200).collect();
+                    let cells = [
+                        (m.id.to_string(), w[0], None),
+                        (crate::history::time_of_day(m.time), w[1], Some(p.disabled)),
+                        (m.host.clone(), w[2], None),
+                        (m.path.clone(), w[3], None),
+                        (direction.to_string(), w[4], Some(direction_color(p, m.direction))),
+                        (opcode.clone(), w[5], None),
+                        (m.length.to_string(), w[6], None),
+                        (preview, w[7], None),
+                    ];
+                    let row = theme::table_row(ui, p, &cells, sel == Some(m.id), i % 2 == 1);
+                    // named, so a row can be found by what it stands for rather than by where
+                    // it happens to be drawn
+                    row.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            true,
+                            sel == Some(m.id),
+                            format!("Message #{} {direction} {opcode}", m.id),
+                        )
+                    });
+                    if row.clicked() {
+                        clicked = Some(m.id);
+                    }
+                }
+            });
+        });
+    });
+    // applied after the drawing, which borrows the app
+    if let Some(id) = clicked {
+        app.ws_sel = Some(id);
+    }
+}
+
+/// The bar for sending a message of your own on a connection that is still open.
+///
+/// Only the thread relaying a connection may write to it, so what is composed here is handed
+/// to that thread rather than sent from the interface.
+fn compose_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let links = app.proxy.ws_live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // the connection the message goes on: the one the picked message belongs to when it is
+    // still open, else whichever is
+    let on = app
+        .ws_sel
+        .and_then(|id| {
+            let messages = app.proxy.ws_messages.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let entry = messages.iter().find(|m| m.id == id)?.entry_id;
+            links.iter().find(|l| l.entry_id == entry).cloned()
+        })
+        .or_else(|| links.first().cloned());
+
+    egui::TopBottomPanel::bottom("ws_compose")
+        .resizable(false)
+        .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(8, 6)))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = theme::TOOLBAR_H;
+                match &on {
+                    Some(l) => {
+                        let since = crate::history::time_of_day(l.opened);
+                        let label = if since.is_empty() {
+                            format!("{}{} open", l.host, l.path)
+                        } else {
+                            format!("{}{} open since {since}", l.host, l.path)
+                        };
+                        theme::status_pill(ui, p, &label, p.success)
+                    }
+                    None => theme::status_pill(ui, p, "No connection open", p.disabled),
+                };
+                ui.selectable_value(&mut app.ws_compose_binary, false, "Text");
+                ui.selectable_value(&mut app.ws_compose_binary, true, "Binary");
+                let mut send = false;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // in binary the box holds hex; anything else would be filtered away by
+                    // the decoder and go out as an empty frame, which reads as "it sent"
+                    let typed = app.ws_compose.trim();
+                    let usable = if app.ws_compose_binary { is_hex(typed) } else { !typed.is_empty() };
+                    let ready = on.is_some() && usable;
+                    if theme::action_button(ui, p, "Send", ready, egui::vec2(80.0, 24.0))
+                        .on_disabled_hover_text(if on.is_none() {
+                            "No upgraded connection is open to send on"
+                        } else if app.ws_compose_binary {
+                            "Binary takes hex: pairs of 0-9 and a-f, spaces allowed"
+                        } else {
+                            "Nothing to send yet"
+                        })
+                        .clicked()
+                    {
+                        send = true;
+                    }
+                    if !app.ws_compose_msg.is_empty() {
+                        ui.label(RichText::new(&app.ws_compose_msg).size(11.5).color(p.warning));
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.ws_compose)
+                            .desired_width(ui.available_width())
+                            .hint_text("A message to send on this connection"),
+                    );
+                });
+                if send {
+                    if let Some(l) = &on {
+                        let opcode = if app.ws_compose_binary {
+                            crate::websocket::Opcode::Binary
+                        } else {
+                            crate::websocket::Opcode::Text
+                        };
+                        // bytes when it is meant as bytes and reads as hex, else the text itself
+                        let payload = if app.ws_compose_binary {
+                            crate::codec::hex_decode(&app.ws_compose)
+                        } else {
+                            app.ws_compose.as_bytes().to_vec()
+                        };
+                        let frame = crate::websocket::encode(opcode, &payload, Some(crate::websocket::masking_key()));
+                        // a connection that has closed since the list was taken simply refuses
+                        if l.send.send(frame).is_ok() {
+                            app.ws_compose.clear();
+                            app.ws_compose_msg.clear();
+                        } else {
+                            // said here, where it happened: `proxy_msg` is drawn by other
+                            // sub-tabs and would never be seen from this one
+                            app.ws_compose_msg = "That connection has closed.".into();
+                        }
+                    }
+                }
+            });
+        });
+}
+
+/// Is this text a run of hex byte pairs, spaces allowed? The decoder drops anything else
+/// without a word, so what it would make of the text is not a fair test of what was meant.
+fn is_hex(s: &str) -> bool {
+    let digits: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    !digits.is_empty() && digits.len() % 2 == 0 && digits.iter().all(char::is_ascii_hexdigit)
+}
+
+/// Which way a message went, in the colours the methods use: out and back.
+fn direction_color(p: &Palette, d: crate::websocket::Direction) -> egui::Color32 {
+    match d {
+        crate::websocket::Direction::ClientToServer => p.post,
+        crate::websocket::Direction::ServerToClient => p.get,
+    }
 }
 
 fn history(app: &mut App, ui: &mut Ui, p: &Palette) {
@@ -790,6 +1011,122 @@ mod tests {
         let nodes = &update.as_ref()?.nodes;
         let r = nodes.iter().find(|(_, n)| n.label() == Some(label) || n.value() == Some(label)).and_then(|(_, n)| n.bounds())?;
         Some(egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32))
+    }
+
+    /// Put two messages on a captured connection, with the WebSockets view open.
+    fn ws_app() -> (egui::Context, App) {
+        let (ctx, mut app) = intercept_app();
+        app.proxy_sub = 2; // WebSockets
+        app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
+            id: 1, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: "/socket".into(),
+            status: "101 Switching Protocols".into(), length: 0, mime: String::new(),
+            request: "GET /socket HTTP/1.1\nHost: shop.test\n\n".into(), response: String::new(),
+            url: "http://shop.test/socket".into(), truncated: false, time: 1000, elapsed_ms: 1, graphql: String::new(),
+        }));
+        for (id, direction, payload) in [
+            (1usize, crate::websocket::Direction::ClientToServer, "{\"type\":\"subscribe\"}"),
+            (2, crate::websocket::Direction::ServerToClient, "{\"type\":\"data\"}"),
+        ] {
+            app.proxy.ws_messages.lock().unwrap().push(std::sync::Arc::new(crate::websocket::WsMessage {
+                id, entry_id: 1, host: "shop.test".into(), path: "/socket".into(), direction,
+                opcode: crate::websocket::Opcode::Text, frames: 1, compressed: false, truncated: false,
+                length: payload.len(), payload: payload.into(), time: 1000 + id as u64, 
+            }));
+        }
+        (ctx, app)
+    }
+
+    /// The frame stream needs a place of its own: a sub-tab under Proxy, listing what went
+    /// each way with the payload of whichever message is picked.
+    #[test]
+    fn the_websockets_view_lists_messages_and_shows_the_one_picked() {
+        let (ctx, mut app) = ws_app();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let nodes = &update.as_ref().expect("accesskit").nodes;
+        let has = |text: &str| nodes.iter().any(|(_, n)| n.label() == Some(text) || n.value() == Some(text));
+        assert!(has("WebSockets"), "the sub-tab is there");
+        // the table's headings are painted rather than laid out, as the site map's are, so
+        // what a reader can be shown to see is the rows: each says which way it went and what
+        // kind of frame carried it
+        assert!(has("Message #1 To server Text"), "the client's message is listed");
+        assert!(has("Message #2 To client Text"), "and so is the server's");
+
+        // picking a message shows its payload
+        click(&ctx, &mut app, "Message #2 To client Text");
+        assert_eq!(app.ws_sel, Some(2), "clicking a row selects that message");
+        let update = frame(&ctx, &mut app, vec![]);
+        let nodes = &update.as_ref().expect("accesskit").nodes;
+        assert!(
+            nodes.iter().any(|(_, n)| n.value().is_some_and(|v| v.contains("\"type\":\"data\""))),
+            "and its payload is shown",
+        );
+    }
+
+    /// A composer is only useful while there is something to send on. With a connection open
+    /// it sends what was typed; with none it says so rather than pretending.
+    #[test]
+    fn the_composer_sends_on_a_live_connection_and_is_disabled_without_one() {
+        let (ctx, mut app) = ws_app();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let nodes = &update.as_ref().expect("accesskit").nodes;
+        let send = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Send"))
+            .expect("the composer has a Send");
+        assert!(send.1.is_disabled(), "with nothing open there is nothing to send on");
+
+        // a connection opens
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.proxy.ws_live.lock().unwrap().push(crate::websocket::LiveLink {
+            entry_id: 1, host: "shop.test".into(), path: "/socket".into(), opened: 1000, send: tx,
+        });
+        app.ws_compose = "{\"type\":\"ping\"}".into();
+        click(&ctx, &mut app, "Send");
+
+        let sent = rx.try_recv().expect("the connection was given a frame");
+        let (parsed, _) = crate::websocket::next_frame(&sent).expect("it is a frame").expect("whole");
+        assert_eq!(parsed.payload, b"{\"type\":\"ping\"}".to_vec(), "with what was typed in it");
+        assert_eq!(parsed.opcode, crate::websocket::Opcode::Text);
+        assert!(sent[1] & 0x80 != 0, "and masked, as anything a client sends must be");
+        assert!(app.ws_compose.is_empty(), "the box is cleared once it has gone");
+    }
+
+    /// Binary mode takes hex. Text that is not hex would be silently thrown away by the
+    /// decoder and sent as an empty frame, which looks like the message went.
+    #[test]
+    fn the_composer_will_not_send_text_that_is_not_hex_as_binary() {
+        let (ctx, mut app) = ws_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.proxy.ws_live.lock().unwrap().push(crate::websocket::LiveLink {
+            entry_id: 1, host: "shop.test".into(), path: "/socket".into(), opened: 1000, send: tx,
+        });
+        app.ws_compose_binary = true;
+        app.ws_compose = "hello".into();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let send = update.as_ref().expect("accesskit").nodes.iter().find(|(_, n)| n.label() == Some("Send")).expect("a Send");
+        assert!(send.1.is_disabled(), "\"hello\" is not hex, so there is nothing to send");
+        assert!(rx.try_recv().is_err(), "and nothing went");
+
+        app.ws_compose = "48 65 6c 6c 6f".into();
+        click(&ctx, &mut app, "Send");
+        let sent = rx.try_recv().expect("hex does go");
+        let (parsed, _) = crate::websocket::next_frame(&sent).expect("a frame").expect("whole");
+        assert_eq!(parsed.payload, b"Hello".to_vec());
+        assert_eq!(parsed.opcode, crate::websocket::Opcode::Binary);
+    }
+
+    /// The other sub-tabs still answer to their names after one was added before them.
+    #[test]
+    fn the_proxy_sub_tabs_still_reach_what_they_name() {
+        let (ctx, mut app) = intercept_app();
+        for (label, want) in [("HTTP history", 1u8), ("WebSockets", 2), ("Match and replace", 3), ("Proxy settings", 4), ("Intercept", 0)] {
+            frame(&ctx, &mut app, vec![]);
+            click(&ctx, &mut app, label);
+            assert_eq!(app.proxy_sub, want, "{label}");
+        }
     }
 
     /// Every GraphQL request is the same method on the same path. The Operation column is what

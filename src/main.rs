@@ -51,6 +51,7 @@ mod ui_target;
 mod ui_tools;
 mod upstream;
 mod viewer;
+mod websocket;
 #[cfg(test)]
 pub mod test_utils;
 

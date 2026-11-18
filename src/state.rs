@@ -74,7 +74,7 @@ impl Tab {
     pub fn sub_views(&self) -> &'static [&'static str] {
         match self {
             Tab::Target => &["Site map", "Scope", "Issues"],
-            Tab::Proxy => &["Intercept", "HTTP history", "Match and replace", "Proxy settings"],
+            Tab::Proxy => &["Intercept", "HTTP history", "WebSockets", "Match and replace", "Proxy settings"],
             Tab::Sequencer => &["Capture", "Manual load", "Analysis"],
             Tab::Decoder => &["Transform", "JWT Inspector"],
             _ => &[],
@@ -492,6 +492,14 @@ pub struct App {
     pub held_loaded: Option<u64>,
     pub mr_sel: Option<usize>,
     pub proxy_sub: u8,
+    /// Proxy > WebSockets: the captured message the payload pane is showing, by its id. By id
+    /// and not by row, which filtering and sorting move about.
+    pub ws_sel: Option<usize>,
+    /// Proxy > WebSockets: the message being composed, and whether it goes as text or as bytes.
+    pub ws_compose: String,
+    pub ws_compose_binary: bool,
+    /// What the composer has to say about the last attempt, shown beside it.
+    pub ws_compose_msg: String,
     pub mr_rules: Vec<rewrite::Rule>,
 
     // target
@@ -780,6 +788,8 @@ impl App {
         let entry_limit = Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_entries));
         let pause_when_full = Arc::new(std::sync::atomic::AtomicBool::new(settings.pause_when_full));
         let events: crate::proxy::Events = Arc::new(Mutex::new(Default::default()));
+        let ws_messages: crate::websocket::MessageLog = Arc::new(Mutex::new(Vec::new()));
+        let ws_next_id = Arc::new(Mutex::new(0usize));
         let start_proxy = shot_path.is_none();
         let mut app = Self {
             settings_last_seen: settings.clone(),
@@ -807,6 +817,9 @@ impl App {
             proxy: crate::proxy::Shared {
                 history: history.clone(),
                 next_id: next_id.clone(),
+                ws_messages: ws_messages.clone(),
+                ws_next_id: ws_next_id.clone(),
+                ws_live: Arc::new(Mutex::new(Vec::new())),
                 capture_paused: capture_paused.clone(),
                 entry_limit: entry_limit.clone(),
                 pause_when_full: pause_when_full.clone(),
@@ -837,6 +850,10 @@ impl App {
             held_loaded: None,
             mr_sel: None,
             proxy_sub: 0,
+            ws_sel: None,
+            ws_compose: String::new(),
+            ws_compose_binary: false,
+            ws_compose_msg: String::new(),
             mr_rules: rewrite::defaults(),
             target_sub: 0,
             target_scope: crate::scope::TargetScope::default(),

@@ -82,6 +82,12 @@ pub struct Shared {
     pub tls: Arc<Mutex<Option<Arc<crate::ca::TlsConfigCache>>>>,
     /// How the proxy verifies real servers when it intercepts HTTPS.
     pub upstream_tls: Arc<rustls::ClientConfig>,
+    /// WebSocket messages captured so far, on the same storage budget as the history.
+    pub ws_messages: crate::websocket::MessageLog,
+    /// Hands out message ids, counting up for the life of the project.
+    pub ws_next_id: Arc<Mutex<usize>>,
+    /// The upgraded connections open right now, so the app can send a frame on one.
+    pub ws_live: crate::websocket::LiveLinks,
 }
 
 /// TLS client settings for connections to real servers: Mozilla's root certificates
@@ -252,10 +258,14 @@ impl Shared {
         rules: Vec<Rule>,
         settings: &crate::state::UserSettings,
         tls: Option<Arc<crate::ca::TlsConfigCache>>,
+        ws_messages: crate::websocket::MessageLog,
     ) -> Self {
         Shared {
             history,
             next_id,
+            ws_messages,
+            ws_next_id: Arc::new(Mutex::new(0)),
+            ws_live: Arc::new(Mutex::new(Vec::new())),
             capture_paused: Arc::new(AtomicBool::new(false)),
             entry_limit: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_entries.max(1))),
             pause_when_full: Arc::new(AtomicBool::new(settings.pause_when_full)),
@@ -558,6 +568,11 @@ fn mitm(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, target:
             Some(i) => raw_target[i + 3..].find('/').map_or("/".to_string(), |j| raw_target[i + 3 + j..].to_string()),
             None => raw_target,
         };
+        // an upgrade takes the connection over for good: there is no request after it
+        if wants_websocket(&head) {
+            websocket_exchange(&sh, &mut io, &head, &path, &at);
+            break;
+        }
         let wants_close = version == "HTTP/1.0" || header(&head, "connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
         if !exchange(&sh, &mut io, &head, latin1, method, path, &at, !wants_close) || wants_close {
             break;
@@ -762,7 +777,500 @@ fn plain(sh: Shared, mut io: BufReader<TcpStream>, head: String, latin1: bool, m
         let _ = io.get_mut().write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{msg}", msg.len()).as_bytes());
         return;
     };
-    exchange(&sh, &mut io, &head, latin1, method, path, &Target { https: false, host, port }, false);
+    let at = Target { https: false, host, port };
+    if wants_websocket(&head) {
+        websocket_exchange(&sh, &mut io, &head, &path, &at);
+        return;
+    }
+    exchange(&sh, &mut io, &head, latin1, method, path, &at, false);
+}
+
+/// How often the relay looks at each side of a connection while nothing is arriving. Short,
+/// because one thread watches both: a long wait on one side would hold up the other.
+const WS_POLL: Duration = Duration::from_millis(50);
+
+/// How long to wait on a quiet side while the connection is busy. One thread serves both
+/// directions, so whatever it spends waiting on the silent one is taken from the other; while
+/// anything is moving that wait is kept short, and it goes back to `WS_POLL` once both have
+/// been quiet for a turn.
+const WS_POLL_BUSY: Duration = Duration::from_millis(1);
+
+/// How many buffers one direction may take in a turn before the other gets a look in. At the
+/// 16 KiB buffer below that is a megabyte, which is plenty for a burst and still bounded.
+const MAX_DRAIN: usize = 64;
+
+/// A stream whose socket's read timeout the relay can set, so one thread can watch both ends
+/// of a connection without splitting either of them in two.
+///
+/// A connection cannot simply be cloned and handed to two threads the way an opaque tunnel is:
+/// a decrypted one is a TLS session, and its two directions share the keys and the sequence
+/// numbers, so only one thread may hold it. Short timeouts on both ends let one thread take
+/// turns instead.
+trait PollTimeout {
+    fn set_poll_timeout(&mut self, d: Duration);
+}
+
+impl PollTimeout for TcpStream {
+    fn set_poll_timeout(&mut self, d: Duration) {
+        let _ = self.set_read_timeout(Some(d));
+    }
+}
+
+impl<C, T> PollTimeout for rustls::StreamOwned<C, T>
+where
+    C: std::ops::DerefMut + std::ops::Deref,
+    T: Read + Write + PollTimeout,
+{
+    fn set_poll_timeout(&mut self, d: Duration) {
+        self.sock.set_poll_timeout(d);
+    }
+}
+
+/// Is this request asking to leave HTTP behind for the WebSocket protocol? RFC 6455 §4.1: a
+/// GET whose `Upgrade` names the protocol and whose `Connection` carries the `upgrade` token.
+fn wants_websocket(head: &str) -> bool {
+    let first = head.lines().next().unwrap_or("");
+    if !first.split_whitespace().next().is_some_and(|m| m.eq_ignore_ascii_case("GET")) {
+        return false;
+    }
+    let upgrade = header(head, "upgrade").is_some_and(|v| {
+        v.split(',').any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+    });
+    let connection = header(head, "connection").is_some_and(|v| {
+        v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    upgrade && connection
+}
+
+/// An error that only means "nothing arrived in the time allowed". A quiet connection is
+/// ordinary, so these are not a reason to end one.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted)
+}
+
+/// The handshake, and the frames that follow when the server agrees to it.
+///
+/// This is deliberately beside `exchange` rather than inside it. `exchange` rewrites the head
+/// it forwards -- dropping `Connection` and forcing `Connection: close` -- and then reads the
+/// answer to end of file, neither of which an upgrade survives. Nothing here changes what
+/// `exchange` does for every ordinary request.
+///
+/// Two things that apply to an ordinary request therefore do not apply here, and both are on
+/// purpose. Match and replace is not run, because rewriting `Sec-WebSocket-Key` would make
+/// the server's answer fail its own check. Intercept does not hold a handshake either: it
+/// holds requests, and a handshake is the start of a connection rather than one request to
+/// forward or drop. Somebody watching a queue that never fills is told so in the event log.
+fn websocket_exchange<S: Read + Write + PollTimeout>(sh: &Shared, io: &mut BufReader<S>, head: &str, path: &str, at: &Target) {
+    let url = at.url(path);
+    let started = crate::http::now_ms();
+    if sh.intercept.load(Ordering::SeqCst) {
+        log(&sh.events, format!("Upgrade to {url} was forwarded without being held: Intercept holds requests, not connections."));
+    }
+    // the handshake goes up as it came down, less the headers that are between browser and
+    // proxy alone. Match and replace is not applied: an edited key fails the answer check.
+    let mut wire = Vec::new();
+    for (i, line) in head.lines().enumerate() {
+        if i == 0 {
+            wire.extend_from_slice(format!("GET {path} HTTP/1.1\r\n").as_bytes());
+            continue;
+        }
+        let k = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        if k.starts_with("proxy-") {
+            continue;
+        }
+        wire.extend_from_slice(line.trim_end().as_bytes());
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"\r\n");
+
+    let upstream = match sh.connect_target(&at.host, at.port) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("Could not reach {}: {e}", at.host);
+            let _ = io.get_mut().write_all(
+                format!("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}", msg.len()).as_bytes(),
+            );
+            log_error(&sh.events, format!("WebSocket upgrade to {url} failed: {e}"));
+            return;
+        }
+    };
+    let _ = upstream.set_read_timeout(Some(sh.read_timeout()));
+    if at.https {
+        let Ok(name) = rustls_pki_types::ServerName::try_from(at.host.clone()) else { return };
+        let Ok(conn) = rustls::ClientConnection::new(sh.target_tls(), name) else { return };
+        relay_handshake(sh, io, &mut BufReader::new(rustls::StreamOwned::new(conn, upstream)), &wire, head, path, at, &url, started);
+    } else {
+        relay_handshake(sh, io, &mut BufReader::new(upstream), &wire, head, path, at, &url, started);
+    }
+}
+
+/// Send the handshake, read the answer's head alone, and -- when it is a 101 -- relay.
+#[allow(clippy::too_many_arguments)]
+fn relay_handshake<S, U>(
+    sh: &Shared,
+    io: &mut BufReader<S>,
+    up: &mut BufReader<U>,
+    wire: &[u8],
+    head: &str,
+    path: &str,
+    at: &Target,
+    url: &str,
+    started: u64,
+) where
+    S: Read + Write + PollTimeout,
+    U: Read + Write + PollTimeout,
+{
+    if up.get_mut().write_all(wire).is_err() {
+        return;
+    }
+    // only the head: a server that agrees never closes, so reading to end of file would wait
+    // for the read timeout and then throw the whole connection away
+    let answer = match read_head_bytes(up) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    // `read_head_bytes` stops at the blank line and does not keep it, so the head has to be
+    // closed again before it goes on: without it the browser reads the first frames as more
+    // headers and the handshake never finishes.
+    let mut answer = answer;
+    answer.extend_from_slice(b"\r\n");
+    let (answer_head, _) = crate::codec::decode_header_bytes(&answer);
+    let status_line = answer_head.lines().next().unwrap_or("").trim().to_string();
+    // recorded the way every other status is: the code and its reason, without the version
+    let status_text = status_line.split_once(' ').map_or(status_line.clone(), |(_, rest)| rest.to_string());
+    let code = crate::http::status_code(&status_text).unwrap_or(0);
+    if io.get_mut().write_all(&answer).is_err() {
+        return;
+    }
+
+    if code != 101 {
+        // The server would not switch protocols, so this is an ordinary response and the
+        // browser needs all of it: a head promising a body followed by nothing is a network
+        // error, and the reason it refused is the one thing worth reading. Only the head was
+        // read above, so the body is still coming.
+        let body = read_refusal_body(up, &answer_head);
+        let written = io.get_mut().write_all(&body).is_ok();
+        let shown = if written { String::from_utf8_lossy(&body).into_owned() } else { String::new() };
+        let full = if shown.is_empty() { answer_head.clone() } else { format!("{}\n\n{shown}", answer_head.replace("\r\n", "\n").trim_end()) };
+        record_handshake(sh, head, &full, path, at, url, &status_text, started, body.len());
+        return;
+    }
+    if let Some(key) = header(head, "sec-websocket-key") {
+        let expected = crate::websocket::accept_key(key);
+        let given = header(&answer_head, "sec-websocket-accept").unwrap_or("");
+        if given != expected {
+            log_warning(&sh.events, format!("{url} answered the WebSocket handshake with an accept key that does not match the one offered."));
+        }
+    }
+    let entry_id = record_handshake(sh, head, &answer_head, path, at, url, &status_text, started, 0);
+    log(&sh.events, format!("WebSocket open: {url}"));
+    let negotiated = crate::websocket::negotiated(&answer_head);
+    // the app may want to put a frame on this connection; only this thread may write to it,
+    // so it is reached through a channel and listed while it lasts
+    let (tx, outbox) = channel();
+    sh.ws_live.lock().unwrap_or_else(|e| e.into_inner()).push(crate::websocket::LiveLink {
+        entry_id,
+        host: at.host.clone(),
+        path: path.to_string(),
+        opened: started,
+        send: tx,
+    });
+    let listed = Listed { links: sh.ws_live.clone(), entry_id };
+    relay(sh, io, up, entry_id, at, path, &negotiated, &outbox);
+    drop(listed);
+    log(&sh.events, format!("WebSocket closed: {url}"));
+}
+
+/// The body of a response that refused an upgrade. Framed by `Content-Length` when it says
+/// one, and otherwise read until the connection closes, which is what a refusal does.
+/// Bounded by the same ceiling as any other response the proxy holds.
+fn read_refusal_body<U: Read + Write>(up: &mut BufReader<U>, answer_head: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    match header(answer_head, "content-length").and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) => {
+            let _ = up.take(n.min(MAX_BUFFERED)).read_to_end(&mut body);
+        }
+        None => {
+            let _ = up.take(MAX_BUFFERED).read_to_end(&mut body);
+        }
+    }
+    body
+}
+
+/// Record the handshake as a history entry, so the connection can be found among the traffic
+/// and the messages have something to point back at.
+#[allow(clippy::too_many_arguments)]
+fn record_handshake(sh: &Shared, head: &str, answer_head: &str, path: &str, at: &Target, url: &str, status: &str, started: u64, length: usize) -> usize {
+    let request = format!("{}\n\n", head.replace("\r\n", "\n").trim_end());
+    let response = if answer_head.contains("\n\n") {
+        answer_head.replace("\r\n", "\n")
+    } else {
+        format!("{}\n\n", answer_head.replace("\r\n", "\n").trim_end())
+    };
+    sh.recorder()
+        .record(|id| HttpEntry {
+            id,
+            tool: "Proxy".into(),
+            method: "GET".into(),
+            host: at.host.clone(),
+            path: path.to_string(),
+            status: status.to_string(),
+            length,
+            mime: String::new(),
+            request,
+            response,
+            url: url.to_string(),
+            truncated: false,
+            time: started,
+            elapsed_ms: crate::http::now_ms().saturating_sub(started),
+            graphql: String::new(),
+        })
+        .unwrap_or(0)
+}
+
+/// Carry frames both ways until one side goes away, reading a copy of each as it passes.
+///
+/// What goes on the wire is always the bytes that arrived, mask and all. The copy that is
+/// taken apart for reading is exactly that -- a copy -- so nothing here can change what the
+/// two ends of the connection say to each other.
+/// Takes a connection off the live list however the relay ends, including on a panic.
+struct Listed {
+    links: crate::websocket::LiveLinks,
+    entry_id: usize,
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).retain(|l| l.entry_id != self.entry_id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay<S, U>(sh: &Shared, io: &mut BufReader<S>, up: &mut BufReader<U>, entry_id: usize, at: &Target, path: &str, negotiated: &crate::websocket::Negotiated, outbox: &std::sync::mpsc::Receiver<Vec<u8>>)
+where
+    S: Read + Write + PollTimeout,
+    U: Read + Write + PollTimeout,
+{
+    io.get_mut().set_poll_timeout(WS_POLL);
+    up.get_mut().set_poll_timeout(WS_POLL);
+
+    // Whatever the buffered readers took along with the handshake heads is already off the
+    // sockets and is really the first frames. It has to be forwarded here: no later read will
+    // return it, and dropping it is the bug an opaque tunnel has.
+    let from_client = io.buffer().to_vec();
+    io.consume(from_client.len());
+    if !from_client.is_empty() && up.get_mut().write_all(&from_client).is_err() {
+        return;
+    }
+    let from_server = up.buffer().to_vec();
+    up.consume(from_server.len());
+    if !from_server.is_empty() && io.get_mut().write_all(&from_server).is_err() {
+        return;
+    }
+
+    // each direction compresses against a window of its own, kept for the connection unless
+    // the handshake said to start afresh each message
+    let mut client_side = Decoding {
+        bytes: from_client,
+        joiner: crate::websocket::Reassembler::new(negotiated.deflate, negotiated.client_no_context_takeover),
+        lost: false,
+    };
+    let mut server_side = Decoding {
+        bytes: from_server,
+        joiner: crate::websocket::Reassembler::new(negotiated.deflate, negotiated.server_no_context_takeover),
+        lost: false,
+    };
+    drain(sh, &mut client_side, crate::websocket::Direction::ClientToServer, entry_id, at, path);
+    drain(sh, &mut server_side, crate::websocket::Direction::ServerToClient, entry_id, at, path);
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut busy = false;
+
+    loop {
+        if sh.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let moved_before = busy;
+        busy = false;
+        // Each side is emptied while it still has something ready, rather than a buffer per
+        // turn: one thread watches both, so a side read only once per poll would hold a
+        // stream to a few hundred KB a second. The cap is what stops a busy direction
+        // starving the other one.
+        for _ in 0..MAX_DRAIN {
+            match io.get_mut().read(&mut buf) {
+                // the browser closed: nothing more will come, and the target is told by the
+                // connection going down with this thread
+                Ok(0) => return,
+                Ok(n) => {
+                    if up.get_mut().write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                    client_side.bytes.extend_from_slice(&buf[..n]);
+                    drain(sh, &mut client_side, crate::websocket::Direction::ClientToServer, entry_id, at, path);
+                    busy = true;
+                    // a read that did not fill the buffer has emptied the socket; asking
+                    // again would only wait out the poll
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if is_timeout(&e) => break,
+                Err(_) => return,
+            }
+        }
+        for _ in 0..MAX_DRAIN {
+            match up.get_mut().read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if io.get_mut().write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                    server_side.bytes.extend_from_slice(&buf[..n]);
+                    drain(sh, &mut server_side, crate::websocket::Direction::ServerToClient, entry_id, at, path);
+                    busy = true;
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if is_timeout(&e) => break,
+                Err(_) => return,
+            }
+        }
+        // Anything the app has composed goes out as if the browser had sent it, and is read
+        // back the same way so the stream shows it -- but only between frames. Whatever is
+        // left in `from_client` has already been forwarded, so it is a frame the browser is
+        // still part-way through: putting another frame out now would splice it into that
+        // payload and desync the connection for good. The channel holds it until the turn
+        // after the frame finishes.
+        while client_side.bytes.is_empty() {
+            let Ok(composed) = outbox.try_recv() else { break };
+            if up.get_mut().write_all(&composed).is_err() {
+                return;
+            }
+            client_side.bytes.extend_from_slice(&composed);
+            drain(sh, &mut client_side, crate::websocket::Direction::ClientToServer, entry_id, at, path);
+            busy = true;
+        }
+        // only when it changes, so a quiet connection costs nothing to keep open
+        if busy != moved_before {
+            let wait = if busy { WS_POLL_BUSY } else { WS_POLL };
+            io.get_mut().set_poll_timeout(wait);
+            up.get_mut().set_poll_timeout(wait);
+        }
+    }
+}
+
+/// One direction of a connection, as it is being read.
+struct Decoding {
+    /// Bytes seen but not yet made into a whole frame. Everything here has already been
+    /// forwarded; this is only the copy being taken apart.
+    bytes: Vec<u8>,
+    joiner: crate::websocket::Reassembler,
+    /// Set once the thread of this direction has been lost. The relay carries on either way;
+    /// what stops is reading a copy of it.
+    lost: bool,
+}
+
+/// The most a direction may be sitting on before it is given up as unreadable: one frame of
+/// the largest size followed, and room for the start of the next.
+const MAX_PENDING: usize = crate::websocket::MAX_FRAME as usize + 64 * 1024;
+
+/// Past this, a buffer that grew for one big frame gives the room back rather than holding it
+/// for the life of the connection.
+const KEEP_CAPACITY: usize = 256 * 1024;
+
+/// Take every whole frame out of `d.bytes`, keeping the tail of a frame still arriving.
+fn drain(
+    sh: &Shared,
+    d: &mut Decoding,
+    direction: crate::websocket::Direction,
+    entry_id: usize,
+    at: &Target,
+    path: &str,
+) {
+    if d.lost {
+        d.bytes.clear();
+        return;
+    }
+    // what a direction that cannot be followed any further does: say so once, and stop
+    let give_up = |d: &mut Decoding, why: String| {
+        log_warning(
+            &sh.events,
+            format!("WebSocket messages on {}{path} can no longer be followed ({why}); the connection carries on, but what it says is no longer recorded.", at.host),
+        );
+        d.lost = true;
+        d.bytes = Vec::new();
+    };
+    loop {
+        match crate::websocket::next_frame(&d.bytes) {
+            Ok(Some((frame, used))) => {
+                d.bytes.drain(..used);
+                if let Some(message) = d.joiner.push(frame) {
+                    record_message(sh, message, direction, entry_id, at, path);
+                }
+            }
+            Ok(None) => {
+                // a frame still arriving -- unless there is more waiting than any frame this
+                // build follows could be, in which case the reading is out of step
+                if d.bytes.len() > MAX_PENDING {
+                    give_up(d, format!("{} bytes with no whole frame in them", d.bytes.len()));
+                } else if d.bytes.is_empty() && d.bytes.capacity() > KEEP_CAPACITY {
+                    d.bytes.shrink_to(KEEP_CAPACITY);
+                }
+                return;
+            }
+            Err(e) => {
+                // The rest of this frame's payload is still coming and there is no way to
+                // tell it from the frames after it: carrying on would read that payload as
+                // headers and invent a message out of every few bytes of it.
+                give_up(d, format!("{e:?}"));
+                return;
+            }
+        }
+    }
+}
+
+fn record_message(sh: &Shared, m: crate::websocket::Message, direction: crate::websocket::Direction, entry_id: usize, at: &Target, path: &str) {
+    if sh.capture_paused.load(Ordering::SeqCst) {
+        return;
+    }
+    // Everything expensive happens before the lock: rendering a megabyte of binary as hex is
+    // an allocation per byte, and the window reads this store on every frame it draws.
+    let length = m.payload.len();
+    // text when it is text, and hex when it is not, so a reader always has something to see
+    let payload = match std::str::from_utf8(&m.payload) {
+        Ok(t) => t.to_string(),
+        Err(_) => crate::codec::hex_encode(&m.payload),
+    };
+    let message = crate::websocket::WsMessage {
+        id: 0,
+        entry_id,
+        host: at.host.clone(),
+        path: path.to_string(),
+        direction,
+        opcode: m.opcode,
+        frames: m.frames,
+        compressed: m.compressed,
+        truncated: m.truncated,
+        length,
+        payload,
+        time: crate::http::now_ms(),
+    };
+
+    let limit = sh.entry_limit.load(Ordering::Relaxed).max(1);
+    let mut kept = sh.ws_messages.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() >= limit {
+        if sh.pause_when_full.load(Ordering::Relaxed) {
+            return;
+        }
+        let over = kept.len() + 1 - limit;
+        kept.drain(..over);
+    }
+    let id = {
+        let mut next = sh.ws_next_id.lock().unwrap_or_else(|e| e.into_inner());
+        *next += 1;
+        *next
+    };
+    kept.push(Arc::new(crate::websocket::WsMessage { id, ..message }));
 }
 
 /// One request (its head already read from `io`): read the body, rebuild it without proxy
@@ -1043,6 +1551,9 @@ mod tests {
             verify_upstream_tls: Arc::new(AtomicBool::new(true)),
             tls: Arc::new(Mutex::new(None)),
             upstream_tls: upstream_client_config(),
+            ws_messages: Arc::new(Mutex::new(Vec::new())),
+            ws_next_id: Arc::new(Mutex::new(0)),
+            ws_live: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1771,6 +2282,94 @@ mod tests {
         (sh, pp)
     }
 
+    /// A WebSocket target that speaks TLS: the same mock, behind a certificate.
+    fn ws_target_https(ca: Arc<CertificateAuthority>) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let cfg = TlsConfigCache::new(ca).get_server_config("127.0.0.1").unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let Some(Ok(s)) = l.incoming().next() else { return };
+            let Ok(conn) = rustls::ServerConnection::new(cfg) else { return };
+            let mut io = BufReader::new(rustls::StreamOwned::new(conn, s));
+            let Some(head) = read_head(&mut io) else { return };
+            let _ = tx.send(head.clone().into_bytes());
+            let key = head
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key")))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let accept = crate::websocket::accept_key(&key);
+            let tls = io.get_mut();
+            let _ = tls.write_all(
+                format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes(),
+            );
+            let _ = tls.write_all(&ws_frame(0x1, b"over tls", None));
+            let _ = tls.flush();
+            let mut buf = [0u8; 1024];
+            loop {
+                match io.get_mut().read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// The same upgrade, inside a decrypted tunnel. A TLS connection cannot be split between
+    /// two threads, so this is the path the relay's one-thread design exists for.
+    #[test]
+    fn a_websocket_upgrade_inside_a_decrypted_tunnel_is_relayed_and_recorded() {
+        let proxy_ca = Arc::new(CertificateAuthority::generate().unwrap());
+        let server_ca = Arc::new(CertificateAuthority::generate().unwrap());
+        let (target, received) = ws_target_https(server_ca.clone());
+        let (sh, pp) = mitm_proxy(proxy_ca.clone(), Some(&server_ca));
+
+        let mut tls = https_client(pp, &format!("127.0.0.1:{target}"), "127.0.0.1", &proxy_ca).expect("tunnel");
+        tls.write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: 127.0.0.1:{target}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        tls.flush().unwrap();
+
+        let mut head = Vec::new();
+        let mut one = [0u8; 1];
+        while tls.read_exact(&mut one).is_ok() {
+            head.push(one[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"), "{:?}", String::from_utf8_lossy(&head));
+
+        let mut buf = [0u8; 64];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], ws_frame(0x1, b"over tls", None).as_slice(), "the target's frame came through the tunnel byte for byte");
+
+        let client_frame = ws_frame(0x1, b"browser inside tls", Some([4, 3, 2, 1]));
+        tls.write_all(&client_frame).unwrap();
+        tls.flush().unwrap();
+        let _handshake = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let got = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, client_frame, "and the browser's went the other way, mask and all");
+
+        wait_for(|| sh.ws_messages.lock().unwrap().len() >= 2);
+        let payloads: Vec<String> = sh.ws_messages.lock().unwrap().iter().map(|m| m.payload.clone()).collect();
+        assert!(payloads.contains(&"over tls".to_string()), "{payloads:?}");
+        assert!(payloads.contains(&"browser inside tls".to_string()), "{payloads:?}");
+        let hist = sh.history.lock().unwrap().clone();
+        assert!(hist.iter().any(|e| e.status.starts_with("101") && e.url.starts_with("https://")), "recorded as an https handshake");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
     #[test]
     fn https_is_decrypted_forwarded_and_recorded() {
         let proxy_ca = Arc::new(CertificateAuthority::generate().unwrap());
@@ -2187,6 +2786,555 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    /// Build one frame the way a peer would send it.
+    fn ws_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+        let mut out = vec![0x80 | opcode];
+        let masked = u8::from(mask.is_some()) << 7;
+        assert!(payload.len() <= 125, "the test frames are small on purpose");
+        out.push(masked | payload.len() as u8);
+        match mask {
+            Some(key) => {
+                out.extend_from_slice(&key);
+                out.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+            }
+            None => out.extend_from_slice(payload),
+        }
+        out
+    }
+
+    /// A target that accepts one upgrade, reports every byte it then receives, and sends one
+    /// frame of its own. Returns its port and the channel the received bytes arrive on.
+    fn ws_target() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        ws_target_with(false, true)
+    }
+
+    /// `pipelined`: send the answer and the first frame in one write, so the proxy's buffered
+    /// reader takes the frame along with the head. `upgrade`: answer 101, or refuse.
+    fn ws_target_with(pipelined: bool, upgrade: bool) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let Some(Ok(mut s)) = l.incoming().next() else { return };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            // the handshake head, read byte by byte so no frame bytes are swallowed with it
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            while s.read_exact(&mut one).is_ok() {
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head_text = String::from_utf8_lossy(&head).into_owned();
+            let _ = tx.send(head.clone());
+            let key = head_text
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key")))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let accept = crate::websocket::accept_key(&key);
+            if !upgrade {
+                let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno");
+                return;
+            }
+            let answer = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            let first = ws_frame(0x1, b"from the target", None);
+            if pipelined {
+                // one write, so the two land in the proxy's reader together
+                let mut both = answer.into_bytes();
+                both.extend_from_slice(&first);
+                let _ = s.write_all(&both);
+            } else {
+                let _ = s.write_all(answer.as_bytes());
+                let _ = s.write_all(&first);
+            }
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// The client half of an upgrade through the proxy: the handshake, then the 101 head read
+    /// one byte at a time so none of the frames behind it are consumed with it.
+    fn ws_through_proxy(pp: u16, target_port: u16) -> (TcpStream, String) {
+        let mut c = TcpStream::connect(("127.0.0.1", pp)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(
+            format!(
+                "GET http://127.0.0.1:{target_port}/socket HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n                 Upgrade: websocket\r\nConnection: Upgrade\r\n                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        let mut one = [0u8; 1];
+        while c.read_exact(&mut one).is_ok() {
+            head.push(one[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        (c, String::from_utf8_lossy(&head).into_owned())
+    }
+
+    /// An upgrade has to reach the target with its handshake headers intact, the answer has to
+    /// reach the browser, and the frames that follow have to go both ways byte for byte while
+    /// a readable copy of each is recorded.
+    #[test]
+    fn a_websocket_upgrade_is_relayed_and_its_messages_recorded() {
+        let sh = shared();
+        let (target, received) = ws_target();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"), "the browser was told the upgrade happened: {head:?}");
+        assert!(head.to_lowercase().contains("upgrade: websocket"), "{head:?}");
+
+        // what the target was sent: the handshake, with the headers that make it one
+        let sent_head = String::from_utf8_lossy(&received.recv_timeout(Duration::from_secs(5)).unwrap()).into_owned();
+        let low = sent_head.to_lowercase();
+        assert!(low.contains("upgrade: websocket"), "the upgrade header survived: {sent_head:?}");
+        assert!(low.contains("connection: upgrade"), "and so did the connection header: {sent_head:?}");
+        assert!(!low.contains("connection: close"), "the proxy did not force the connection shut: {sent_head:?}");
+        assert!(low.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq=="), "the key was passed through: {sent_head:?}");
+
+        // the target's own frame reaches the browser
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], ws_frame(0x1, b"from the target", None).as_slice(), "byte for byte");
+
+        // and the browser's frame reaches the target, mask and all
+        let client_frame = ws_frame(0x1, b"from the browser", Some([0x37, 0xfa, 0x21, 0x3d]));
+        c.write_all(&client_frame).unwrap();
+        let got = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, client_frame, "the frame was forwarded exactly, mask included");
+
+        // both directions were recorded, readable
+        wait_for(|| sh.ws_messages.lock().unwrap().len() >= 2);
+        let kept = sh.ws_messages.lock().unwrap().clone();
+        let payloads: Vec<(crate::websocket::Direction, String)> =
+            kept.iter().map(|m| (m.direction, m.payload.clone())).collect();
+        assert!(
+            payloads.contains(&(crate::websocket::Direction::ServerToClient, "from the target".to_string())),
+            "{payloads:?}"
+        );
+        assert!(
+            payloads.contains(&(crate::websocket::Direction::ClientToServer, "from the browser".to_string())),
+            "the client's payload was unmasked for reading: {payloads:?}"
+        );
+
+        // and the handshake itself is in history, so the connection can be found
+        let hist = sh.history.lock().unwrap().clone();
+        assert_eq!(hist.len(), 1, "one entry for the handshake");
+        assert!(hist[0].status.starts_with("101"), "{:?}", hist[0].status);
+        assert_eq!(kept[0].entry_id, hist[0].id, "the messages point back at it");
+
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A buffered reader takes whatever arrived with the head it was asked for, so the first
+    /// frames of a connection are routinely already off the socket by the time the handshake
+    /// is done with. They have to be forwarded from there: no later read will return them.
+    /// This is the bug an opaque tunnel has, and it is why this is its own test.
+    #[test]
+    fn frames_arriving_with_the_handshake_are_not_lost() {
+        let sh = shared();
+        let (target, received) = ws_target_with(true, true);
+        let pp = running_proxy(&sh);
+
+        // the browser's first frame goes out in the same write as its handshake
+        let mut c = TcpStream::connect(("127.0.0.1", pp)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = format!(
+            "GET http://127.0.0.1:{target}/socket HTTP/1.1\r\nHost: 127.0.0.1:{target}\r\n             Upgrade: websocket\r\nConnection: Upgrade\r\n             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .into_bytes();
+        let early = ws_frame(0x1, b"early", Some([9, 8, 7, 6]));
+        request.extend_from_slice(&early);
+        c.write_all(&request).unwrap();
+
+        // the head, then the target's frame, which came in the same write as the answer
+        let mut head = Vec::new();
+        let mut one = [0u8; 1];
+        while c.read_exact(&mut one).is_ok() {
+            head.push(one[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"));
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], ws_frame(0x1, b"from the target", None).as_slice(), "the target's first frame was not dropped");
+
+        // and the browser's first frame reached the target
+        let _handshake = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let got = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, early, "the browser's first frame was not dropped either");
+
+        wait_for(|| sh.ws_messages.lock().unwrap().len() >= 2);
+        let payloads: Vec<String> = sh.ws_messages.lock().unwrap().iter().map(|m| m.payload.clone()).collect();
+        assert!(payloads.contains(&"early".to_string()), "and both were read: {payloads:?}");
+        assert!(payloads.contains(&"from the target".to_string()), "{payloads:?}");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A WebSocket that says nothing for a while is ordinary -- that is what they are for.
+    /// The read timeout that bounds an HTTP exchange must not be allowed to end one.
+    #[test]
+    fn a_quiet_connection_outlives_the_read_timeout() {
+        let sh = shared();
+        // far shorter than the wait below, so a connection bounded by it would be gone
+        sh.read_timeout_secs.store(1, Ordering::SeqCst);
+        let (target, received) = ws_target();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"));
+        let mut buf = [0u8; 64];
+        let _ = c.read(&mut buf).unwrap();
+        let _handshake = received.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        std::thread::sleep(Duration::from_millis(2500));
+
+        let late = ws_frame(0x1, b"still here", Some([1, 1, 1, 1]));
+        c.write_all(&late).unwrap();
+        let got = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, late, "the connection was still carrying frames after the timeout had passed");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A server is free to refuse an upgrade. The browser has to be told what it said, and the
+    /// exchange belongs in the history like any other.
+    #[test]
+    fn a_refused_upgrade_is_passed_back_and_recorded() {
+        let sh = shared();
+        let (target, _received) = ws_target_with(false, false);
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 400"), "the browser was told: {head:?}");
+        // a head promising a body and then nothing is a network error to the browser, and
+        // the server's reason for refusing is exactly what the reader needs
+        let mut body = Vec::new();
+        let _ = c.read_to_end(&mut body);
+        assert_eq!(String::from_utf8_lossy(&body), "no", "the refusal's body reached the browser");
+
+        wait_for(|| !sh.history.lock().unwrap().is_empty());
+        let hist = sh.history.lock().unwrap().clone();
+        assert_eq!(hist[0].status, "400 Bad Request");
+        assert!(hist[0].response.ends_with("no"), "and was recorded with it: {:?}", hist[0].response);
+        assert_eq!(hist[0].length, 2, "with the length of what came back");
+        assert!(sh.ws_messages.lock().unwrap().is_empty(), "and nothing was captured for a connection that never opened");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A message composed in the app has to reach a connection that is still open, go out as
+    /// a client frame (masked, as the protocol requires of one), and be recorded like any
+    /// other so the stream shows what was sent.
+    #[test]
+    fn a_composed_message_is_sent_on_a_live_connection_and_recorded() {
+        let sh = shared();
+        let (target, received) = ws_target();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"));
+        let mut buf = [0u8; 64];
+        let _ = c.read(&mut buf).unwrap();
+        let _handshake = received.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // the open connection is listed, with the handshake it belongs to
+        wait_for(|| !sh.ws_live.lock().unwrap().is_empty());
+        let link = sh.ws_live.lock().unwrap().first().cloned().expect("a live connection");
+        assert_eq!((link.host.as_str(), link.path.as_str()), ("127.0.0.1", "/socket"));
+
+        let composed = crate::websocket::encode(
+            crate::websocket::Opcode::Text,
+            b"composed",
+            Some(crate::websocket::masking_key()),
+        );
+        link.send.send(composed.clone()).expect("the connection takes it");
+
+        let got = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, composed, "it went out exactly as built, masked");
+
+        wait_for(|| sh.ws_messages.lock().unwrap().iter().any(|m| m.payload == "composed"));
+        let sent = sh.ws_messages.lock().unwrap().iter().find(|m| m.payload == "composed").cloned().expect("recorded");
+        assert_eq!(sent.direction, crate::websocket::Direction::ClientToServer, "recorded as going out");
+
+        // and once the connection is gone it is no longer offered
+        drop(c);
+        wait_for(|| sh.ws_live.lock().unwrap().is_empty());
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A connection that agreed to compress its payloads: the relay has to read what the
+    /// handshake settled and inflate with it, or the stream is unreadable hex.
+    #[test]
+    fn a_compressed_connection_is_recorded_readable() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Some(Ok(mut s)) = l.incoming().next() else { return };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            while s.read_exact(&mut one).is_ok() {
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let key = text
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key")))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let accept = crate::websocket::accept_key(&key);
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n                     Sec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            // one compressed message, framed with RSV1 set
+            let mut deflater = flate2::Compress::new(flate2::Compression::default(), false);
+            let body = b"{\"ticks\":[1,2,3,4,5]}";
+            let mut squashed = Vec::with_capacity(body.len() + 64);
+            deflater.compress_vec(body, &mut squashed, flate2::FlushCompress::Sync).unwrap();
+            squashed.truncate(squashed.len() - 4);
+            let mut frame = vec![0xC1, squashed.len() as u8]; // FIN + RSV1 + text
+            frame.extend_from_slice(&squashed);
+            let _ = s.write_all(&frame);
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let sh = shared();
+        let pp = running_proxy(&sh);
+        let (_c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+
+        wait_for(|| !sh.ws_messages.lock().unwrap().is_empty());
+        let m = sh.ws_messages.lock().unwrap()[0].clone();
+        assert_eq!(m.payload, "{\"ticks\":[1,2,3,4,5]}", "the compressed payload was inflated for reading");
+        assert!(m.compressed, "and it still says it arrived compressed");
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A busy connection must not be rate-limited by the interval the relay polls a quiet
+    /// side at. Reading one buffer per poll would hold a stream to a few hundred KB a second,
+    /// which is no use for anything that actually sends data.
+    #[test]
+    fn a_one_way_stream_is_not_held_back_by_the_poll_interval() {
+        const FRAMES: usize = 40;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Some(Ok(mut s)) = l.incoming().next() else { return };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            while s.read_exact(&mut one).is_ok() {
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let key = text
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key")))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let accept = crate::websocket::accept_key(&key);
+            let _ = s.write_all(
+                format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes(),
+            );
+            // one burst, all at once
+            let payload = vec![b'x'; 8192];
+            let mut burst = Vec::new();
+            for _ in 0..FRAMES {
+                burst.extend_from_slice(&[0x82, 126]);
+                burst.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                burst.extend_from_slice(&payload);
+            }
+            let _ = s.write_all(&burst);
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        let sh = shared();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+
+        let want = FRAMES * (4 + 8192);
+        let started = std::time::Instant::now();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        while got < want {
+            match c.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        let took = started.elapsed();
+        assert_eq!(got, want, "all of it arrived");
+        // one read per poll would need FRAMES * WS_POLL, two seconds of it; draining a side
+        // that has more ready costs a fraction of that
+        assert!(
+            took < Duration::from_millis(600),
+            "{} KB took {took:?}: the relay is reading one buffer per poll instead of draining what is ready",
+            want / 1024,
+        );
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A frame the browser is still in the middle of sending has already had its first bytes
+    /// forwarded. Putting a composed frame out at that moment would splice it into the middle
+    /// of the browser's payload: the target would read the composed bytes as payload and the
+    /// rest of the browser's payload as frame headers, and never recover. Anything composed
+    /// has to wait for the boundary.
+    #[test]
+    fn a_composed_message_never_cuts_into_a_frame_still_arriving() {
+        let sh = shared();
+        let (target, received) = ws_target();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"));
+        let mut buf = [0u8; 64];
+        let _ = c.read(&mut buf).unwrap();
+        let handshake = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(handshake.starts_with(b"GET "), "the first thing through is the handshake");
+
+        wait_for(|| !sh.ws_live.lock().unwrap().is_empty());
+        let link = sh.ws_live.lock().unwrap().first().cloned().expect("a live connection");
+
+        // half a frame, so the relay has forwarded its start and is waiting for the rest
+        let partial = ws_frame(0x1, b"the browser is still talking", Some([5, 6, 7, 8]));
+        let (first, second) = partial.split_at(10);
+        c.write_all(first).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // composed while that frame is half-sent
+        let composed = crate::websocket::encode(
+            crate::websocket::Opcode::Text,
+            b"composed",
+            Some(crate::websocket::masking_key()),
+        );
+        link.send.send(composed.clone()).expect("taken");
+        std::thread::sleep(Duration::from_millis(150));
+
+        c.write_all(second).unwrap();
+
+        // everything the target was sent after the handshake, in order
+        let mut stream = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while stream.len() < partial.len() + composed.len() && std::time::Instant::now() < deadline {
+            if let Ok(chunk) = received.recv_timeout(Duration::from_millis(200)) {
+                stream.extend_from_slice(&chunk);
+            }
+        }
+        let mut want = partial.clone();
+        want.extend_from_slice(&composed);
+        assert_eq!(
+            stream, want,
+            "the browser's frame went out whole and the composed one followed it, rather than being cut into it",
+        );
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A frame too large to read leaves the rest of its payload in the stream. Carrying on
+    /// decoding would read that payload as frame headers: invented messages for the rest of
+    /// the connection, each one evicting a real one, and a buffer that grows to whatever a
+    /// length field happens to claim. Once a direction cannot be followed, it is left alone.
+    #[test]
+    fn a_direction_that_cannot_be_followed_stops_being_decoded() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Some(Ok(mut s)) = l.incoming().next() else { return };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut one = [0u8; 1];
+            while s.read_exact(&mut one).is_ok() {
+                head.push(one[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let key = text
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key")))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let accept = crate::websocket::accept_key(&key);
+            let _ = s.write_all(
+                format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes(),
+            );
+            // a frame declaring far more than this build will read, then a lot of payload
+            let mut header = vec![0x82u8, 127];
+            header.extend_from_slice(&(64u64 * 1024 * 1024).to_be_bytes());
+            let _ = s.write_all(&header);
+            let chunk = vec![0x81u8; 32 * 1024]; // bytes that look like frame headers
+            for _ in 0..8 {
+                if s.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let sh = shared();
+        let pp = running_proxy(&sh);
+        let (mut c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"), "{head:?}");
+
+        // let the payload flow through
+        let mut sink = vec![0u8; 64 * 1024];
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut seen = 0usize;
+        while std::time::Instant::now() < deadline {
+            match c.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen += n,
+            }
+        }
+        assert!(seen > 100_000, "the connection kept carrying traffic ({seen} bytes)");
+        assert!(
+            sh.ws_messages.lock().unwrap().is_empty(),
+            "nothing was invented out of a payload that could not be followed: {:?}",
+            sh.ws_messages.lock().unwrap().iter().map(|m| m.length).collect::<Vec<_>>(),
+        );
+        sh.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Intercept holds requests; a handshake is not one of them, and is forwarded whatever
+    /// Intercept says. Somebody watching a held queue that never fills needs to be told why.
+    #[test]
+    fn an_upgrade_forwarded_past_intercept_says_so_in_the_event_log() {
+        let sh = shared();
+        sh.intercept.store(true, Ordering::SeqCst);
+        let (target, _received) = ws_target();
+        let pp = running_proxy(&sh);
+        let (_c, head) = ws_through_proxy(pp, target);
+        assert!(head.starts_with("HTTP/1.1 101"), "it was forwarded rather than held: {head:?}");
+        assert!(sh.held.lock().unwrap().is_empty(), "and nothing is waiting to be let through");
+
+        wait_for(|| {
+            sh.events.lock().unwrap().iter().any(|e| e.message.contains("without being held"))
+        });
+        sh.stop.store(true, Ordering::SeqCst);
     }
 
     fn running_proxy(sh: &Shared) -> u16 {

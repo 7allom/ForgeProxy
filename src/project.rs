@@ -77,6 +77,10 @@ pub struct ProjectFile {
     /// they are kept here rather than inside one. Absent in older files.
     #[serde(default)]
     pub imported_findings: Vec<crate::scan::Finding>,
+    /// WebSocket messages captured by the proxy. Absent from projects saved before they were
+    /// captured, which open with none.
+    #[serde(default)]
+    pub websocket_messages: Vec<crate::websocket::WsMessage>,
 }
 
 pub fn snapshot(app: &App) -> ProjectFile {
@@ -89,6 +93,7 @@ pub fn snapshot(app: &App) -> ProjectFile {
         scope_advanced: false,
         match_replace: app.mr_rules.clone(),
         history: app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| (**e).clone()).collect(),
+        websocket_messages: app.proxy.ws_messages.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| (**m).clone()).collect(),
         tasks: app.tasks.iter().cloned().map(|mut t| { t.running = false; t }).collect(),
         organizer: app.organizer.clone(),
         org_collections: app.org_collections.clone(),
@@ -198,6 +203,12 @@ pub fn reset(app: &mut App) {
     use crate::state::*;
     app.history.lock().unwrap_or_else(|e| e.into_inner()).clear();
     *app.next_id.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    // without this a new project opens holding the last one's captured messages
+    app.proxy.ws_messages.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *app.proxy.ws_next_id.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    app.ws_sel = None;
+    app.ws_compose.clear();
+    app.ws_compose_msg.clear();
     app.history_sel = None;
     app.sitemap_path = None;
     app.target_scope = TargetScope::default();
@@ -261,6 +272,13 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     *app.history.lock().unwrap_or_else(|e| e.into_inner()) = history.collect();
     let max_id = app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.id).max().unwrap_or(0);
     *app.next_id.lock().unwrap_or_else(|e| e.into_inner()) = max_id;
+    // the messages, and the watermark their numbering carries on from
+    let ws_max = f.websocket_messages.iter().map(|m| m.id).max().unwrap_or(0);
+    *app.proxy.ws_messages.lock().unwrap_or_else(|e| e.into_inner()) =
+        f.websocket_messages.into_iter().map(std::sync::Arc::new).collect();
+    *app.proxy.ws_next_id.lock().unwrap_or_else(|e| e.into_inner()) = ws_max;
+    // a selection carried over would point at whatever message the new project gave that id to
+    app.ws_sel = None;
     if !f.tasks.is_empty() {
         app.tasks = f.tasks;
     }
@@ -639,8 +657,7 @@ mod tests {
         let mut app = crate::state::App::new(&cc, Some("/dev/null".into()), None, false);
         app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "h".into(), path: "/".into(), status: "200 OK".into(),
-            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: String::new(), truncated: false, time: 0, elapsed_ms: 0,
-            graphql: String::new(),
+            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: String::new(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new(),
         }));
         *app.next_id.lock().unwrap() = 1;
         app.target_scope.add("https://shop.test");
@@ -741,6 +758,53 @@ mod tests {
         assert_eq!((e.id, e.tool.as_str(), e.host.as_str()), (9, "Proxy", "h.test"));
         assert!(e.url.is_empty(), "with no address recorded");
         assert_eq!((e.truncated, e.time, e.elapsed_ms), (false, 0, 0));
+    }
+
+    /// Captured WebSocket messages belong in the project beside the traffic, and a project
+    /// saved before any were captured has to open with none rather than refusing to open.
+    #[test]
+    fn websocket_messages_survive_a_save_and_a_project_without_them_still_opens() {
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let app = App::new(&cc, Some("/dev/null".into()), None, false);
+        app.proxy.ws_messages.lock().unwrap().push(std::sync::Arc::new(crate::websocket::WsMessage {
+            id: 1,
+            entry_id: 7,
+            host: "shop.test".into(),
+            path: "/socket".into(),
+            direction: crate::websocket::Direction::ServerToClient,
+            opcode: crate::websocket::Opcode::Text,
+            frames: 2,
+            compressed: false,
+            truncated: false,
+            length: 5,
+            payload: "hello".into(),
+            time: 1234,
+        }));
+        let saved = serde_json::to_string(&snapshot(&app)).expect("it saves");
+        let read_back: ProjectFile = serde_json::from_str(&saved).expect("and reads back");
+        assert_eq!(read_back.websocket_messages.len(), 1);
+
+        let ctx2 = eframe::egui::Context::default();
+        let cc2 = eframe::CreationContext::_new_kittest(ctx2);
+        let mut fresh = App::new(&cc2, Some("/dev/null".into()), None, false);
+        fresh.ws_sel = Some(1);
+        apply_all(&mut fresh, read_back);
+        let kept = fresh.proxy.ws_messages.lock().unwrap().clone();
+        assert_eq!(kept.len(), 1, "and the messages come back with the project");
+        assert_eq!((kept[0].entry_id, kept[0].payload.as_str()), (7, "hello"));
+        assert_eq!(kept[0].direction, crate::websocket::Direction::ServerToClient);
+        assert_eq!(*fresh.proxy.ws_next_id.lock().unwrap(), 1, "and numbering carries on from what was kept");
+
+        // a project saved before any of this opens with none, and nothing else is disturbed
+        let old = r#"{"version":1,"name":"o","match_replace":[],"history":[],"tasks":[],"organizer":[],
+            "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
+            "intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}"#;
+        let f: ProjectFile = serde_json::from_str(old).expect("an older project file still reads");
+        assert!(f.websocket_messages.is_empty());
+        apply_all(&mut fresh, f);
+        assert!(fresh.proxy.ws_messages.lock().unwrap().is_empty(), "and opening it clears what the last project had");
+        assert_eq!(fresh.ws_sel, None, "and the selection does not point into the project that was closed");
     }
 
     /// A project captured before operations were worked out holds the requests but not the

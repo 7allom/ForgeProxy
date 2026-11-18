@@ -566,8 +566,9 @@ mod layout_tests {
         let scenes = [
             Scene("Proxy > Intercept", |a| { a.tab = Tab::Proxy; a.proxy_sub = 0; }),
             Scene("Proxy > HTTP history", |a| { a.tab = Tab::Proxy; a.proxy_sub = 1; }),
-            Scene("Proxy > Match and replace", |a| { a.tab = Tab::Proxy; a.proxy_sub = 2; }),
-            Scene("Proxy > Proxy settings", |a| { a.tab = Tab::Proxy; a.proxy_sub = 3; }),
+            Scene("Proxy > WebSockets", |a| { a.tab = Tab::Proxy; a.proxy_sub = 2; }),
+            Scene("Proxy > Match and replace", |a| { a.tab = Tab::Proxy; a.proxy_sub = 3; }),
+            Scene("Proxy > Proxy settings", |a| { a.tab = Tab::Proxy; a.proxy_sub = 4; }),
             Scene("Target > Scope", |a| { a.tab = Tab::Target; a.target_sub = 1; }),
             Scene("Target > Scope, advanced", |a| {
                 a.tab = Tab::Target;
