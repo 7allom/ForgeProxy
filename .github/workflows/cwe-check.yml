@@ -31,11 +31,20 @@ jobs:
         run: python3 tools/update_cwe.py
 
       - name: Compare with the built-in copy
+        id: compare
         run: |
           if git diff --quiet -- assets/cwe/catalog.json; then
             echo "The built-in CWE text matches MITRE's API."
           else
             git diff --stat -- assets/cwe/catalog.json
             git diff -- assets/cwe/catalog.json | head -40
-            echo "::warning::MITRE's CWE text differs from assets/cwe/catalog.json. Run python3 tools/update_cwe.py and commit the result."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::MITRE's CWE text differs from assets/cwe/catalog.json. Download the cwe-catalog artifact (or run python3 tools/update_cwe.py) and commit the result."
           fi
+
+      - name: Keep the fresh catalogue
+        if: steps.compare.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwe-catalog
+          path: assets/cwe/catalog.json
