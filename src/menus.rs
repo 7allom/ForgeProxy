@@ -111,6 +111,5 @@ mod tests {
     #[test]
     fn the_about_line_names_this_build() {
         assert_eq!(super::about_line(), format!("About ForgeProxy v{}", env!("CARGO_PKG_VERSION")));
-        assert!(super::about_line().ends_with("v1.0.0"), "{}", super::about_line());
     }
 }

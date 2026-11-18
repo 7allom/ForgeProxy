@@ -1,237 +1,80 @@
-//! Issue definitions: type index, name and typical severity of the original's issue catalogue
-//! (resources/KnowledgeBase/Issues/*.json, 190 entries). Descriptions are not copied.
+//! Issue definitions: the issues ForgeProxy's scanner can actually report, each classified by
+//! its CWE number (https://cwe.mitre.org). The listing is the scanner's own table, so a new
+//! check shows up here as soon as it is added to `scan::ALL_CHECKS`.
 
-pub const ISSUE_DEFS: &[(u32, &str, &str)] = &[
-    (0x00100100, "OS command injection", "High"),
-    (0x00100200, "SQL injection", "High"),
-    (0x00100210, "SQL injection (second order)", "High"),
-    (0x00100280, "ASP.NET tracing enabled", "High"),
-    (0x00100300, "File path traversal", "High"),
-    (0x00100400, "XML external entity injection", "High"),
-    (0x00100500, "LDAP injection", "High"),
-    (0x00100600, "XPath injection", "High"),
-    (0x00100700, "XML injection", "Medium"),
-    (0x00100800, "ASP.NET debugging enabled", "Medium"),
-    (0x00100850, "Broken access control", "Information"),
-    (0x00100900, "HTTP PUT method is enabled", "High"),
-    (0x00100a00, "Out-of-band resource load (HTTP)", "High"),
-    (0x00100b00, "File path manipulation", "High"),
-    (0x00100c00, "PHP code injection", "High"),
-    (0x00100d00, "Server-side JavaScript code injection", "High"),
-    (0x00100e00, "Perl code injection", "High"),
-    (0x00100e00, "React Server Components remote code execution (React2Shell)", "High"),
-    (0x00100f00, "Ruby code injection", "High"),
-    (0x00100f10, "Python code injection", "High"),
-    (0x00100f20, "Expression Language injection", "High"),
-    (0x00101000, "Unidentified code injection", "High"),
-    (0x00101080, "Server-side template injection", "High"),
-    (0x00101100, "SSI injection", "High"),
-    (0x00101300, "PHP remote code execution (PHP2Shell)", "High"),
-    (0x00101301, "Vulnerable PHP version (PHP2Shell)", "High"),
-    (0x00200100, "Cross-site scripting (stored)", "High"),
-    (0x00200140, "HTTP request smuggling", "High"),
-    (0x00200141, "Client-side desync", "High"),
-    (0x00200180, "Web cache poisoning", "High"),
-    (0x00200200, "HTTP response header injection", "High"),
-    (0x00200201, "HTTP request header injection", "High"),
-    (0x00200300, "Cross-site scripting (reflected)", "High"),
-    (0x00200308, "Client-side template injection", "High"),
-    (0x00200310, "Cross-site scripting (DOM-based)", "High"),
-    (0x00200311, "Cross-site scripting (reflected DOM-based)", "High"),
-    (0x00200312, "Cross-site scripting (stored DOM-based)", "High"),
-    (0x00200316, "Client-side prototype pollution", "Information"),
-    (0x00200320, "JavaScript injection (DOM-based)", "High"),
-    (0x00200321, "JavaScript injection (reflected DOM-based)", "High"),
-    (0x00200322, "JavaScript injection (stored DOM-based)", "High"),
-    (0x00200328, "Path-relative style sheet import", "Information"),
-    (0x00200330, "Client-side SQL injection (DOM-based)", "High"),
-    (0x00200331, "Client-side SQL injection (reflected DOM-based)", "High"),
-    (0x00200332, "Client-side SQL injection (stored DOM-based)", "High"),
-    (0x00200340, "WebSocket URL poisoning (DOM-based)", "High"),
-    (0x00200341, "WebSocket URL poisoning (reflected DOM-based)", "High"),
-    (0x00200342, "WebSocket URL poisoning (stored DOM-based)", "High"),
-    (0x00200350, "Local file path manipulation (DOM-based)", "High"),
-    (0x00200351, "Local file path manipulation (reflected DOM-based)", "High"),
-    (0x00200352, "Local file path manipulation (stored DOM-based)", "High"),
-    (0x00200360, "Client-side XPath injection (DOM-based)", "Low"),
-    (0x00200361, "Client-side XPath injection (reflected DOM-based)", "Low"),
-    (0x00200362, "Client-side XPath injection (stored DOM-based)", "Low"),
-    (0x00200370, "Client-side JSON injection (DOM-based)", "Low"),
-    (0x00200371, "Client-side JSON injection (reflected DOM-based)", "Low"),
-    (0x00200372, "Client-side JSON injection (stored DOM-based)", "Low"),
-    (0x00200400, "Flash cross-domain policy", "High"),
-    (0x00200500, "Silverlight cross-domain policy", "High"),
-    (0x00200503, "Content security policy: allowlisted script resources", "Information"),
-    (0x00200504, "Content security policy: allows untrusted script execution", "Information"),
-    (0x00200505, "Content security policy: allows untrusted style execution", "Information"),
-    (0x00200506, "Content security policy: malformed syntax", "Information"),
-    (0x00200507, "Content security policy: allows clickjacking", "Information"),
-    (0x00200508, "Content security policy: allows form hijacking", "Information"),
-    (0x00200509, "Content security policy: not enforced", "Information"),
-    (0x00200510, "GraphQL endpoint found", "Information"),
-    (0x00200511, "GraphQL endpoint discovered", "Information"),
-    (0x00200512, "GraphQL introspection enabled", "Low"),
-    (0x00200513, "GraphQL suggestions enabled", "Low"),
-    (0x00200514, "GraphQL content type not validated", "Low"),
-    (0x00200600, "Cross-origin resource sharing", "Information"),
-    (0x00200601, "Cross-origin resource sharing: arbitrary origin trusted", "High"),
-    (0x00200602, "Cross-origin resource sharing: unencrypted origin trusted", "Low"),
-    (0x00200603, "Cross-origin resource sharing: all subdomains trusted", "Low"),
-    (0x00200650, "Web cache deception", "Medium"),
-    (0x00200700, "Cross-site request forgery", "Medium"),
-    (0x00200800, "SMTP header injection", "Medium"),
-    (0x00200900, "JWT signature not verified", "High"),
-    (0x00200901, "JWT none algorithm supported", "High"),
-    (0x00200902, "JWT self-signed JWK header supported", "High"),
-    (0x00200903, "JWT weak HMAC secret", "High"),
-    (0x00200904, "JWT arbitrary jku header supported", "High"),
-    (0x00200905, "JWT arbitrary x5u header supported", "High"),
-    (0x00300100, "Cleartext submission of password", "High"),
-    (0x00300200, "External service interaction (DNS)", "Information"),
-    (0x00300210, "External service interaction (HTTP)", "High"),
-    (0x00300220, "External service interaction (SMTP)", "Information"),
-    (0x00400100, "Referer-dependent response", "Information"),
-    (0x00400110, "Spoofable client IP address", "Information"),
-    (0x00400120, "User agent-dependent response", "Information"),
-    (0x00400200, "Password returned in later response", "Medium"),
-    (0x00400300, "Password submitted using GET method", "Low"),
-    (0x00400400, "Password returned in URL query string", "Low"),
-    (0x00400480, "SQL statement in request parameter", "Medium"),
-    (0x00400500, "Cross-domain POST", "Information"),
-    (0x00400600, "ASP.NET ViewState without MAC enabled", "High"),
-    (0x00400700, "XML entity expansion", "Medium"),
-    (0x00400800, "Long redirection response", "Information"),
-    (0x00400900, "Serialized object in HTTP message", "High"),
-    (0x00400a00, "Duplicate cookies set", "Information"),
-    (0x00400b00, "Input returned in response (stored)", "Information"),
-    (0x00400c00, "Input returned in response (reflected)", "Information"),
-    (0x00400d00, "Suspicious input transformation (reflected)", "Information"),
-    (0x00400e00, "Suspicious input transformation (stored)", "Information"),
-    (0x00400f00, "Request URL override", "Information"),
-    (0x00500080, "Vulnerable JavaScript dependency", "Low"),
-    (0x00500100, "Open redirection (reflected)", "Low"),
-    (0x00500101, "Open redirection (stored)", "Medium"),
-    (0x00500110, "Open redirection (DOM-based)", "Low"),
-    (0x00500111, "Open redirection (reflected DOM-based)", "Low"),
-    (0x00500112, "Open redirection (stored DOM-based)", "Medium"),
-    (0x00500200, "TLS cookie without secure flag set", "Medium"),
-    (0x00500300, "Cookie scoped to parent domain", "Low"),
-    (0x00500400, "Cross-domain Referer leakage", "Information"),
-    (0x00500500, "Cross-domain script include", "Information"),
-    (0x00500600, "Cookie without HttpOnly flag set", "Low"),
-    (0x00500700, "Session token in URL", "Medium"),
-    (0x00500800, "Password field with autocomplete enabled", "Low"),
-    (0x00500900, "Password value set in cookie", "Medium"),
-    (0x00500980, "File upload functionality", "Information"),
-    (0x005009a0, "Frameable response (potential Clickjacking)", "Information"),
-    (0x005009b0, "Browser cross-site scripting filter disabled", "Information"),
-    (0x00500a00, "HTTP TRACE method is enabled", "Information"),
-    (0x00500b00, "Cookie manipulation (DOM-based)", "Low"),
-    (0x00500b01, "Cookie manipulation (reflected DOM-based)", "Low"),
-    (0x00500b02, "Cookie manipulation (stored DOM-based)", "Low"),
-    (0x00500c00, "Ajax request header manipulation (DOM-based)", "Low"),
-    (0x00500c01, "Ajax request header manipulation (reflected DOM-based)", "Low"),
-    (0x00500c02, "Ajax request header manipulation (stored DOM-based)", "Low"),
-    (0x00500d00, "Denial of service (DOM-based)", "Information"),
-    (0x00500d01, "Denial of service (reflected DOM-based)", "Information"),
-    (0x00500d02, "Denial of service (stored DOM-based)", "Low"),
-    (0x00500e00, "HTML5 web message manipulation (DOM-based)", "Information"),
-    (0x00500e01, "HTML5 web message manipulation (reflected DOM-based)", "Information"),
-    (0x00500e02, "HTML5 web message manipulation (stored DOM-based)", "Information"),
-    (0x00500f00, "HTML5 storage manipulation (DOM-based)", "Information"),
-    (0x00500f01, "HTML5 storage manipulation (reflected DOM-based)", "Information"),
-    (0x00500f02, "HTML5 storage manipulation (stored DOM-based)", "Information"),
-    (0x00501000, "Link manipulation (DOM-based)", "Low"),
-    (0x00501001, "Link manipulation (reflected DOM-based)", "Low"),
-    (0x00501002, "Link manipulation (stored DOM-based)", "Low"),
-    (0x00501003, "Link manipulation (reflected)", "Information"),
-    (0x00501004, "Link manipulation (stored)", "Information"),
-    (0x00501100, "Document domain manipulation (DOM-based)", "Medium"),
-    (0x00501101, "Document domain manipulation (reflected DOM-based)", "Medium"),
-    (0x00501102, "Document domain manipulation (stored DOM-based)", "Medium"),
-    (0x00501200, "DOM data manipulation (DOM-based)", "Information"),
-    (0x00501201, "DOM data manipulation (reflected DOM-based)", "Information"),
-    (0x00501202, "DOM data manipulation (stored DOM-based)", "Information"),
-    (0x00501300, "CSS injection (reflected)", "Medium"),
-    (0x00501301, "CSS injection (stored)", "Medium"),
-    (0x00501400, "Client-side HTTP parameter pollution (reflected)", "Low"),
-    (0x00501401, "Client-side HTTP parameter pollution (stored)", "Low"),
-    (0x00501500, "Form action hijacking (reflected)", "Medium"),
-    (0x00501501, "Form action hijacking (stored)", "Medium"),
-    (0x00501600, "Request manipulation (DOM-based)", "Information"),
-    (0x00501601, "Request manipulation (reflected DOM-based)", "Information"),
-    (0x00501602, "Request manipulation (stored DOM-based)", "Information"),
-    (0x00600080, "Database connection string disclosed", "Medium"),
-    (0x006000b0, "Source code disclosure", "Low"),
-    (0x006000d8, "Backup file", "Information"),
-    (0x00600100, "Directory listing", "Information"),
-    (0x00600200, "Email addresses disclosed", "Information"),
-    (0x00600300, "Private IP addresses disclosed", "Information"),
-    (0x00600400, "Social security numbers disclosed", "Information"),
-    (0x00600500, "Credit card numbers disclosed", "Information"),
-    (0x00600550, "Private key disclosed", "Information"),
-    (0x00600600, "Robots.txt file", "Information"),
-    (0x00600700, "Json Web Key Set disclosed", "Information"),
-    (0x00600800, "JWT private key disclosed", "High"),
-    (0x00600900, "OpenAPI definition found (active scan check)", "Information"),
-    (0x00600901, "OpenAPI definition found (passive scan check)", "Information"),
-    (0x00700100, "Cacheable HTTPS response", "Information"),
-    (0x00700200, "Base64-encoded data in parameter", "Information"),
-    (0x00800100, "Multiple content types specified", "Information"),
-    (0x00800200, "HTML does not specify charset", "Information"),
-    (0x00800300, "HTML uses unrecognized charset", "Information"),
-    (0x00800400, "Content type incorrectly stated", "Low"),
-    (0x00800500, "Content type is not specified", "Information"),
-    (0x01000100, "TLS certificate", "Medium"),
-    (0x01000200, "Unencrypted communications", "Low"),
-    (0x01000300, "Strict transport security not enforced", "Low"),
-    (0x01000400, "Mixed content", "Information"),
-    (0x01000500, "Hidden HTTP 2", "Information"),
-    (0x08000000, "Extension generated issue", "Information"),
-    (0x08008000, "Manually generated issue", "Information"),
-    (0x09000000, "BCheck generated issue", "Information"),
-    (0x09000000, "Bambda generated issue", "Information"),
-    (0x0a000000, "Automated test generated issue", "Information"),
-];
+use crate::scan::{self, IssueDef, Severity};
+
+pub const ISSUE_DEFS: &[IssueDef] = scan::ALL_CHECKS;
+
+/// The severity a finding of this kind is normally reported at, for undoing "false positive".
+/// A finding the scanner did not raise (one a program reported, say) has no definition here and
+/// goes back to informational.
+pub fn typical_severity(cwe: u32, name: &str) -> Severity {
+    ISSUE_DEFS
+        .iter()
+        .find(|d| d.0 == cwe && d.1 == name)
+        .map_or(Severity::Info, |d| d.2)
+}
+
+/// The public MITRE page for a CWE number.
+pub fn cwe_url(cwe: u32) -> Option<String> {
+    (cwe != scan::NO_CWE).then(|| format!("https://cwe.mitre.org/data/definitions/{cwe}.html"))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan;
     use crate::test_utils::assert_table;
 
     #[test]
     fn issue_catalogue_integrity_matrix() {
-        assert_eq!(ISSUE_DEFS.len(), 190);
-        assert_table!(ISSUE_DEFS, |(type_index, name, severity)| {
-            assert!(*type_index > 0, "issue '{name}' must have non-zero type_index");
-            assert!(!name.trim().is_empty(), "issue 0x{type_index:08x} must have a name");
-            assert!(
-                matches!(*severity, "High" | "Medium" | "Low" | "Information"),
-                "issue '{name}' has unexpected severity '{severity}'"
-            );
+        assert!(!ISSUE_DEFS.is_empty());
+        assert_table!(ISSUE_DEFS, |(cwe, name, severity)| {
+            assert!(*cwe != scan::NO_CWE && *cwe < 0x1_0000, "issue '{name}' must carry a real CWE number, not {cwe}");
+            assert!(!name.trim().is_empty(), "CWE-{cwe} issue must have a name");
+            assert_ne!(*severity, Severity::FalsePositive, "'{name}' cannot be a false positive by default");
         });
+        // a CWE may be shared, but (CWE, name) is how findings are keyed, so it must be unique
+        let mut seen = std::collections::HashSet::new();
+        for (cwe, name, _) in ISSUE_DEFS {
+            assert!(seen.insert((cwe, name)), "CWE-{cwe} '{name}' is listed twice");
+        }
+    }
 
-        let scanner_defs = [
-            scan::SQL_INJECTION,
-            scan::CSP_NOT_ENFORCED,
-            scan::CLEARTEXT_PASSWORD,
-            scan::INPUT_REFLECTED,
-            scan::TLS_COOKIE_NO_SECURE,
-            scan::COOKIE_NO_HTTPONLY,
-            scan::PASSWORD_AUTOCOMPLETE,
-            scan::FRAMEABLE,
-            scan::DIRECTORY_LISTING,
-            scan::EMAIL_DISCLOSED,
-            scan::PRIVATE_IP_DISCLOSED,
-            scan::CACHEABLE_HTTPS,
-            scan::HSTS_NOT_ENFORCED,
-        ];
+    #[test]
+    fn every_old_type_index_maps_to_its_cwe() {
+        assert_table!(
+            [
+                (0x0010_0200, scan::SQL_INJECTION),
+                (0x0050_0600, scan::COOKIE_NO_HTTPONLY),
+                (0x0100_0300, scan::HSTS_NOT_ENFORCED),
+                (0x0010_0300, scan::BLIND_SSRF),
+                (0x0010_0120, scan::OOB_COMMAND_INJECTION),
+            ],
+            |(old, def)| {
+                assert_eq!(scan::cwe_from_legacy(old), def.0, "{old:#x} should become CWE-{}", def.0);
+            }
+        );
+        assert_eq!(scan::cwe_from_legacy(0x0080_0000), scan::NO_CWE, "the old imported default has no CWE");
+        assert_eq!(scan::cwe_from_legacy(79), 79, "a CWE number is kept as it is");
+    }
 
-        assert_table!(scanner_defs, |(idx, name, sev)| {
-            let found = ISSUE_DEFS.iter().find(|(i, n, _)| *i == idx && *n == name);
-            assert!(found.is_some(), "scanner constant ({idx:#x}, {name}) missing from ISSUE_DEFS");
-            assert_eq!(found.unwrap().2, sev.label(), "severity mismatch for '{name}'");
-        });
+    #[test]
+    fn a_finding_saved_with_an_old_type_index_loads_with_its_cwe() {
+        let old = r#"{"type_index":5244416,"name":"Cookie without HttpOnly flag set","severity":"Low",
+                      "confidence":"Firm","host":"shop.test","path":"/","detail":""}"#;
+        let f: scan::Finding = serde_json::from_str(old).expect("an old finding still loads");
+        assert_eq!(f.cwe, 1004);
+        let saved = serde_json::to_string(&f).expect("it saves");
+        assert!(saved.contains("\"cwe\":1004") && !saved.contains("type_index"), "{saved}");
+    }
+
+    #[test]
+    fn undoing_a_false_positive_restores_the_checks_own_severity() {
+        assert_eq!(typical_severity(scan::TLS_COOKIE_NO_SECURE.0, scan::TLS_COOKIE_NO_SECURE.1), Severity::Medium);
+        // same CWE, different check
+        assert_eq!(typical_severity(319, scan::HSTS_NOT_ENFORCED.1), Severity::Low);
+        assert_eq!(typical_severity(319, scan::CLEARTEXT_PASSWORD.1), Severity::High);
+        assert_eq!(typical_severity(scan::NO_CWE, "Something a program reported"), Severity::Info);
     }
 }

@@ -1139,7 +1139,7 @@ fn findings_json(findings: &[crate::scan::Finding]) -> String {
                 "name": f.name,
                 "host": f.host,
                 "path": f.path,
-                "type_index": f.type_index,
+                "cwe": f.cwe,
                 "detail": f.detail,
             })
         })

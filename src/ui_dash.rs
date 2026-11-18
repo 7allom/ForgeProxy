@@ -304,11 +304,13 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
             ui.label(RichText::new(format!("Confidence: {}", f.confidence.label())).color(p.text));
         });
         ui.label(RichText::new(format!("{}{}", f.host, f.path)).monospace().color(p.disabled));
-        ui.label(RichText::new(format!("Type index 0x{:08x}", f.type_index)).size(11.0).color(p.disabled));
+        match crate::issue_defs::cwe_url(f.cwe) {
+            Some(url) => { ui.hyperlink_to(RichText::new(crate::cwe_catalog::title(f.cwe)).size(11.0), url); }
+            None => { ui.label(RichText::new(crate::scan::cwe_label(f.cwe)).size(11.0).color(p.disabled)); }
+        }
         let fp = f.severity == Severity::FalsePositive;
         if theme::plain_button(ui, p, if fp { "Undo false positive" } else { "Mark as false positive" }, true).clicked() {
-            let typical = crate::issue_defs::ISSUE_DEFS.iter().find(|d| d.0 == f.type_index).map(|d| d.2).unwrap_or("Information");
-            let restored = match typical { "High" => Severity::High, "Medium" => Severity::Medium, "Low" => Severity::Low, _ => Severity::Info };
+            let restored = crate::issue_defs::typical_severity(f.cwe, &f.name);
             let next = if fp { restored } else { Severity::FalsePositive };
             // written back where the issue actually lives, which is not always a scan task
             let slot = match home {
@@ -322,10 +324,21 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         ui.separator();
         ui.label(bold("Issue detail", 13.0).color(p.strong));
         ui.add(egui::Label::new(RichText::new(&f.detail).color(p.text)).wrap());
-        if !f.remediation.trim().is_empty() {
+        // whatever the finding does not say for itself, MITRE's entry for its CWE says
+        if let Some(w) = crate::cwe_catalog::lookup(f.cwe) {
+            ui.add_space(4.0);
+            ui.label(bold("Issue background", 13.0).color(p.strong));
+            ui.add(egui::Label::new(RichText::new(&w.description).color(p.text)).wrap());
+        }
+        let remediation = if f.remediation.trim().is_empty() {
+            crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
+        } else {
+            f.remediation.clone()
+        };
+        if !remediation.trim().is_empty() {
             ui.add_space(4.0);
             ui.label(bold("Remediation", 13.0).color(p.strong));
-            ui.add(egui::Label::new(RichText::new(&f.remediation).color(p.text)).wrap());
+            ui.add(egui::Label::new(RichText::new(remediation).color(p.text)).wrap());
         }
     });
 }

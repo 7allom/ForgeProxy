@@ -1,9 +1,8 @@
 //! Audit engine behind Dashboard > New scan.
-//! Issue names, type numbers and typical severities come from the original's shipped
-//! catalogue (resources/KnowledgeBase/Issues/*, 380 types); severity/confidence levels from
-//! Standard vulnerability audit issue taxonomy and scanner definitions.
+//! Every issue the scanner can report is classified by its CWE number
+//! (https://cwe.mitre.org), the public weakness taxonomy most scanners and reports share.
 
-/// AuditIssueSeverity: HIGH, MEDIUM, LOW, INFORMATION, FALSE_POSITIVE.
+/// How serious a finding is, from false positive up to high.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     FalsePositive,
@@ -35,7 +34,7 @@ impl Severity {
         }
     }
 
-    /// Colors from LightTheme.json ui.issue.* (see MECHANICS.md).
+    /// The color each severity is drawn in.
     pub fn rgb(&self) -> (u8, u8, u8) {
         match self {
             Severity::High => (0xD6, 0x21, 0x3F),   // @red[0]
@@ -47,7 +46,7 @@ impl Severity {
     }
 }
 
-/// AuditIssueConfidence: CERTAIN, FIRM, TENTATIVE.
+/// How sure the scanner is that a finding is real: certain, firm or tentative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Confidence {
     Certain,
@@ -75,41 +74,98 @@ impl Confidence {
     }
 }
 
-/// Catalogue entries this build can report: (type index, name, typical severity).
-pub const SQL_INJECTION: (u32, &str, Severity) = (0x0010_0200, "SQL injection", Severity::High);
-pub const CSP_NOT_ENFORCED: (u32, &str, Severity) =
-    (0x0020_0509, "Content security policy: not enforced", Severity::Info);
-pub const CLEARTEXT_PASSWORD: (u32, &str, Severity) =
-    (0x0030_0100, "Cleartext submission of password", Severity::High);
-pub const INPUT_REFLECTED: (u32, &str, Severity) =
-    (0x0040_0c00, "Input returned in response (reflected)", Severity::Info);
-pub const TLS_COOKIE_NO_SECURE: (u32, &str, Severity) =
-    (0x0050_0200, "TLS cookie without secure flag set", Severity::Medium);
-pub const COOKIE_NO_HTTPONLY: (u32, &str, Severity) =
-    (0x0050_0600, "Cookie without HttpOnly flag set", Severity::Low);
-pub const PASSWORD_AUTOCOMPLETE: (u32, &str, Severity) =
-    (0x0050_0800, "Password field with autocomplete enabled", Severity::Low);
-pub const FRAMEABLE: (u32, &str, Severity) =
-    (0x0050_09a0, "Frameable response (potential Clickjacking)", Severity::Info);
-pub const DIRECTORY_LISTING: (u32, &str, Severity) = (0x0060_0100, "Directory listing", Severity::Info);
-pub const EMAIL_DISCLOSED: (u32, &str, Severity) =
-    (0x0060_0200, "Email addresses disclosed", Severity::Info);
-pub const PRIVATE_IP_DISCLOSED: (u32, &str, Severity) =
-    (0x0060_0300, "Private IP addresses disclosed", Severity::Info);
-pub const CACHEABLE_HTTPS: (u32, &str, Severity) = (0x0070_0100, "Cacheable HTTPS response", Severity::Info);
-pub const HSTS_NOT_ENFORCED: (u32, &str, Severity) =
-    (0x0100_0300, "Strict transport security not enforced", Severity::Low);
+/// An issue this build can report: (CWE number, name, typical severity).
+///
+/// A CWE number names a class of weakness, not one check, so two checks may share one
+/// (cleartext passwords and a missing HSTS header are both cleartext transmission). That is
+/// why a finding is told apart by its CWE *and* its name everywhere it is keyed.
+pub type IssueDef = (u32, &'static str, Severity);
+
+/// The CWE number a finding carries when it names none: CWE numbering starts at 1.
+pub const NO_CWE: u32 = 0;
+
+pub const SQL_INJECTION: IssueDef = (89, "SQL injection", Severity::High);
+pub const CSP_NOT_ENFORCED: IssueDef = (693, "Content security policy: not enforced", Severity::Info);
+pub const CLEARTEXT_PASSWORD: IssueDef = (319, "Cleartext submission of password", Severity::High);
+pub const INPUT_REFLECTED: IssueDef = (20, "Input returned in response (reflected)", Severity::Info);
+pub const TLS_COOKIE_NO_SECURE: IssueDef = (614, "TLS cookie without secure flag set", Severity::Medium);
+pub const COOKIE_NO_HTTPONLY: IssueDef = (1004, "Cookie without HttpOnly flag set", Severity::Low);
+pub const PASSWORD_AUTOCOMPLETE: IssueDef = (525, "Password field with autocomplete enabled", Severity::Low);
+pub const FRAMEABLE: IssueDef = (1021, "Frameable response (potential Clickjacking)", Severity::Info);
+pub const DIRECTORY_LISTING: IssueDef = (548, "Directory listing", Severity::Info);
+pub const EMAIL_DISCLOSED: IssueDef = (200, "Email addresses disclosed", Severity::Info);
+pub const PRIVATE_IP_DISCLOSED: IssueDef = (497, "Private IP addresses disclosed", Severity::Info);
+pub const CACHEABLE_HTTPS: IssueDef = (524, "Cacheable HTTPS response", Severity::Info);
+pub const HSTS_NOT_ENFORCED: IssueDef = (319, "Strict transport security not enforced", Severity::Low);
 /// Out-of-band findings confirmed by an Interactor relay callback.
-pub const BLIND_SSRF: (u32, &str, Severity) =
-    (0x0010_0300, "Out-of-band resource load (potential SSRF)", Severity::High);
-pub const BLIND_XXE: (u32, &str, Severity) =
-    (0x0010_0b00, "XML external entity injection (out-of-band)", Severity::High);
-pub const OOB_COMMAND_INJECTION: (u32, &str, Severity) =
-    (0x0010_0120, "OS command injection (out-of-band)", Severity::High);
+pub const BLIND_SSRF: IssueDef = (918, "Out-of-band resource load (potential SSRF)", Severity::High);
+pub const BLIND_XXE: IssueDef = (611, "XML external entity injection (out-of-band)", Severity::High);
+pub const OOB_COMMAND_INJECTION: IssueDef = (78, "OS command injection (out-of-band)", Severity::High);
+
+/// Every issue the scanner can raise, in the order the Issue definitions listing shows them.
+pub const ALL_CHECKS: &[IssueDef] = &[
+    SQL_INJECTION,
+    OOB_COMMAND_INJECTION,
+    BLIND_SSRF,
+    BLIND_XXE,
+    CLEARTEXT_PASSWORD,
+    TLS_COOKIE_NO_SECURE,
+    COOKIE_NO_HTTPONLY,
+    PASSWORD_AUTOCOMPLETE,
+    HSTS_NOT_ENFORCED,
+    CSP_NOT_ENFORCED,
+    FRAMEABLE,
+    INPUT_REFLECTED,
+    DIRECTORY_LISTING,
+    EMAIL_DISCLOSED,
+    PRIVATE_IP_DISCLOSED,
+    CACHEABLE_HTTPS,
+];
+
+/// "CWE-89", or "No CWE" for a finding that names none.
+pub fn cwe_label(cwe: u32) -> String {
+    if cwe == NO_CWE { "No CWE".into() } else { format!("CWE-{cwe}") }
+}
+
+/// Project files saved before 1.0.2 numbered issues with large type indexes rather than CWE
+/// numbers. Every CWE number is far below 0x1_0000, so anything at or above it is an old
+/// index: the scanner's own map to their CWE, and anything else (an imported finding's old
+/// default, a number some program made up) becomes "no CWE".
+pub fn cwe_from_legacy(n: u32) -> u32 {
+    if n < 0x1_0000 {
+        return n;
+    }
+    match n {
+        0x0010_0200 => SQL_INJECTION.0,
+        0x0020_0509 => CSP_NOT_ENFORCED.0,
+        0x0030_0100 => CLEARTEXT_PASSWORD.0,
+        0x0040_0c00 => INPUT_REFLECTED.0,
+        0x0050_0200 => TLS_COOKIE_NO_SECURE.0,
+        0x0050_0600 => COOKIE_NO_HTTPONLY.0,
+        0x0050_0800 => PASSWORD_AUTOCOMPLETE.0,
+        0x0050_09a0 => FRAMEABLE.0,
+        0x0060_0100 => DIRECTORY_LISTING.0,
+        0x0060_0200 => EMAIL_DISCLOSED.0,
+        0x0060_0300 => PRIVATE_IP_DISCLOSED.0,
+        0x0070_0100 => CACHEABLE_HTTPS.0,
+        0x0100_0300 => HSTS_NOT_ENFORCED.0,
+        0x0010_0300 => BLIND_SSRF.0,
+        0x0010_0b00 => BLIND_XXE.0,
+        0x0010_0120 => OOB_COMMAND_INJECTION.0,
+        _ => NO_CWE,
+    }
+}
+
+fn de_cwe<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    <u32 as serde::Deserialize>::deserialize(d).map(cwe_from_legacy)
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
-    pub type_index: u32,
+    /// The weakness class, as a CWE number ([`NO_CWE`] when unknown). Project files saved
+    /// before 1.0.2 call this `type_index` and hold the old numbering, translated on load.
+    #[serde(alias = "type_index", deserialize_with = "de_cwe")]
+    pub cwe: u32,
     pub name: String,
     pub severity: Severity,
     pub confidence: Confidence,
@@ -135,7 +191,7 @@ pub struct Finding {
 impl Default for Finding {
     fn default() -> Self {
         Finding {
-            type_index: 0,
+            cwe: 0,
             name: String::new(),
             severity: Severity::Info,
             confidence: Confidence::Firm,
@@ -158,7 +214,7 @@ impl Finding {
         detail: &str,
     ) -> Self {
         Finding {
-            type_index: def.0,
+            cwe: def.0,
             name: def.1.into(),
             severity: def.2,
             confidence,
@@ -170,15 +226,15 @@ impl Finding {
     }
 }
 
-/// One issue per (type, name, host, path), highest severity first.
+/// One issue per (CWE, name, host, path), highest severity first.
 ///
-/// The name is part of the key as well as the type number. Every check in this module gives
-/// one name to one type number, so for them the name adds nothing -- but findings reported by
-/// a program share a default type number while naming different things, and keying on the
+/// The name is part of the key as well as the CWE number. A CWE names a class of weakness, so
+/// two different checks can share one, and findings reported by a program often carry no CWE
+/// at all while naming different things -- keying on the
 /// number alone would merge two unrelated issues into one.
 pub fn consolidate(mut fs: Vec<Finding>) -> Vec<Finding> {
     let mut seen = std::collections::HashSet::new();
-    fs.retain(|f| seen.insert((f.type_index, f.name.clone(), f.host.clone(), f.path.clone())));
+    fs.retain(|f| seen.insert((f.cwe, f.name.clone(), f.host.clone(), f.path.clone())));
     fs.sort_by(|a, b| b.severity.cmp(&a.severity));
     fs
 }
@@ -815,7 +871,7 @@ mod tests {
             }
         });
 
-        // Consolidation deduplicates identical (type_index, host, path) and sorts High -> Info
+        // Consolidation deduplicates identical (cwe, host, path) and sorts High -> Info
         let one = passive_checks("a.test", "/", true, "", "");
         let mut twice = one.clone();
         twice.extend(one.clone());
@@ -866,9 +922,9 @@ mod tests {
         assert!(names.contains(&OOB_COMMAND_INJECTION.1), "command injection callback reported: {names:?}");
 
         // the two SSRF vectors share a title, host and path, so consolidation leaves one
-        assert_eq!(outcome.findings.iter().filter(|f| f.type_index == BLIND_SSRF.0).count(), 1, "SSRF is not reported twice");
+        assert_eq!(outcome.findings.iter().filter(|f| f.cwe == BLIND_SSRF.0).count(), 1, "SSRF is not reported twice");
 
-        for f in outcome.findings.iter().filter(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.type_index)) {
+        for f in outcome.findings.iter().filter(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.cwe)) {
             assert_eq!(f.severity, Severity::High, "{} is high", f.name);
             assert_eq!(f.confidence, Confidence::Firm, "{} is firm", f.name);
             assert!(f.detail.contains("DNS"), "the protocol is named: {}", f.detail);
@@ -879,7 +935,7 @@ mod tests {
         }
 
         // the planting request is kept on the finding, headers and all
-        let ssrf = outcome.findings.iter().find(|f| f.type_index == BLIND_SSRF.0).expect("an SSRF finding");
+        let ssrf = outcome.findings.iter().find(|f| f.cwe == BLIND_SSRF.0).expect("an SSRF finding");
         assert!(ssrf.request.contains("X-Forwarded-Host"), "the probe request is kept on the finding: {}", ssrf.request);
         // and every probe exchange is recorded in the scan's history alongside the crawl, the
         // XXE one as the POST it was sent as
@@ -900,7 +956,7 @@ mod tests {
 
         assert!(mocks.seen.lock().unwrap().is_empty(), "no canary is sent when no relay is set");
         assert!(
-            !outcome.findings.iter().any(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.type_index)),
+            !outcome.findings.iter().any(|f| [BLIND_SSRF.0, BLIND_XXE.0, OOB_COMMAND_INJECTION.0].contains(&f.cwe)),
             "no out-of-band findings without a relay"
         );
     }
