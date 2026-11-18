@@ -296,7 +296,7 @@ pub fn passive_checks(host: &str, path: &str, secure: bool, headers: &str, body:
                  set, so sensitive content could be left on disk.");
         }
     }
-    if body.contains("Index of /") {
+    if lbody.contains("index of /") || lbody.contains("directory listing for /") {
         push(DIRECTORY_LISTING, Confidence::Firm,
             "The response looks like an automatic directory listing, which can reveal files that \
              were not meant to be public.");
