@@ -74,9 +74,26 @@ def from_dir(folder, ids):
 
 
 def clean(text):
-    """MITRE's text without its bibliography markers ([REF-1482]) and with whitespace collapsed."""
+    """MITRE's text without its bibliography markers ([REF-1482]) and with whitespace collapsed.
+
+    Since CWE 4.21 the API also leaves the roles of the entry's alternate terms at the end of
+    some descriptions -- "(Roles: Attack-Focused, Common-Name)" -- which mean nothing on their own.
+    """
     text = re.sub(r"\s*\[REF-\d+\]", "", text or "")
+    text = re.sub(r"\s*\(Roles:[^)]*\)", "", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def common_name(w):
+    """The name people actually use ("SQL Injection", "SSRF"), from the alternate terms MITRE
+    marks Common-Name. Releases before 4.21 put it in the title instead and have none here."""
+    for t in w.get("AlternateTerms") or []:
+        roles = t.get("Roles") or []
+        if isinstance(roles, str):
+            roles = [r.strip() for r in roles.split(",")]
+        if "Common-Name" in roles and "Discouraged" not in roles and t.get("Term"):
+            return clean(t["Term"])
+    return None
 
 
 def entry(w):
@@ -85,9 +102,13 @@ def entry(w):
         desc = clean(m.get("Description"))
         if desc and desc not in mitigations:
             mitigations.append(desc)
+    name = clean(w.get("Name"))
+    common = common_name(w)
+    if common and common.lower() not in name.lower():
+        name = f"{name} ('{common}')"
     return {
         "id": int(w["ID"]),
-        "name": clean(w.get("Name")),
+        "name": name,
         "description": clean(w.get("Description")),
         "mitigations": mitigations[:MAX_MITIGATIONS],
     }
