@@ -177,7 +177,7 @@ fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) 
         });
 }
 
-/// "Search or run a command   Ctrl+K": opens the command palette.
+/// "Search or run a command   Ctrl+K" ("Cmd+K" on macOS): opens the command palette.
 fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
     let width = (ui.available_width() - 8.0).clamp(0.0, 300.0);
     if width < 60.0 {
@@ -198,7 +198,8 @@ fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
     let label_w = galley.size().x;
     ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(rect.left() + 26.0, mid), galley.size()).min, galley, p.disabled);
     // the shortcut as a key badge, 8px in from the right edge and on the pill's centreline
-    let keys = ui.painter().layout_no_wrap("Ctrl+K".into(), FontId::proportional(theme::FONT_CAPTION), p.text);
+    let chord = crate::hotkeys::command_chord("K");
+    let keys = ui.painter().layout_no_wrap(chord.clone(), FontId::proportional(theme::FONT_CAPTION), p.text);
     let badge_w = keys.size().x + 10.0;
     if rect.width() > 26.0 + label_w + badge_w + 16.0 {
         let badge = egui::Rect::from_min_max(
@@ -208,7 +209,7 @@ fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
         ui.painter().rect_filled(badge, egui::CornerRadius::same(3), p.header);
         ui.painter().galley(egui::Align2::CENTER_CENTER.anchor_size(badge.center(), keys.size()).min, keys, p.text);
     }
-    if resp.on_hover_text("Search or run a command (Ctrl+K)").clicked() {
+    if resp.on_hover_text(format!("Search or run a command ({chord})")).clicked() {
         app.show_palette = true;
         app.palette_query.clear();
     }
@@ -1935,9 +1936,18 @@ mod chrome_tests {
         click_at(&ctx, &mut app, anchor);
         let open = labels(&frame(&ctx, &mut app));
         // items of every group, without hovering anything
-        for want in ["Start attack", "Follow redirections", "Keyboard shortcuts", "Exit"] {
+        let inspector = format!("Inspector panel   {}", crate::hotkeys::command_chord("Shift+N"));
+        let about = crate::menus::about_line();
+        for want in ["Light theme", inspector.as_str(), "Keyboard shortcuts", about.as_str(), "Exit"] {
             assert!(open.iter().any(|l| l == want), "{want:?} shows as soon as the menu opens: {open:?}");
         }
+        // it is global: nothing that belongs to one tool, and nothing the rail or the status
+        // bar already offers
+        for gone in ["Start attack", "Follow redirections", "Collapse navigation rail", "Expand navigation rail"] {
+            assert!(!open.iter().any(|l| l == gone), "the overflow still offers {gone:?}");
+        }
+        let event_log = |seen: &[String]| seen.iter().filter(|l| *l == "Event log").count();
+        assert_eq!(event_log(&open), event_log(&closed), "the overflow repeats the Event log");
         // the bar's own controls each appear once, open or not
         for bar_control in ["Settings", "Open browser", "Search or run a command"] {
             let count = |seen: &[String]| seen.iter().filter(|l| *l == bar_control).count();

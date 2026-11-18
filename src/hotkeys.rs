@@ -41,6 +41,15 @@ pub struct Binding {
     pub key: Key,
 }
 
+/// The command modifier as this platform names it: `Cmd` on macOS, `Ctrl` elsewhere.
+pub const COMMAND_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+
+/// A chord on the command modifier as shown to the user, as "Ctrl+K" or, on macOS, "Cmd+K".
+/// `rest` is what follows the modifier ("K", "Shift+N").
+pub fn command_chord(rest: &str) -> String {
+    format!("{COMMAND_KEY}+{rest}")
+}
+
 impl Binding {
     pub const fn ctrl(key: Key) -> Self {
         Binding { ctrl: true, alt: false, shift: false, key }
@@ -449,5 +458,15 @@ mod tests {
         assert_ne!(plain, shifted);
         assert_ne!(plain.label(), shifted.label());
         assert!(clashes(&BTreeMap::new()).is_empty(), "both ship by default and do not clash");
+    }
+
+    /// The command chord is named the way this platform names its command key.
+    #[test]
+    fn the_command_chord_follows_the_platform() {
+        let want = if cfg!(target_os = "macos") { "Cmd+K" } else { "Ctrl+K" };
+        assert_eq!(command_chord("K"), want);
+        assert_eq!(command_chord("Shift+N"), format!("{COMMAND_KEY}+Shift+N"));
+        // and a label written either way reads back as the same binding
+        assert_eq!(Binding::parse(&command_chord("K")), Some(Binding::ctrl(Key::K)));
     }
 }

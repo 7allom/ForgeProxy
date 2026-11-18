@@ -8,8 +8,11 @@
 //! groups are flat sections under a caption, never submenus that open on hover. Nothing here
 //! repeats a control the command bar already shows -- Settings, the browser, the project and
 //! the command palette each have their own place on the bar.
+//!
+//! The overflow holds global workspace actions only. What belongs to one tool lives in that
+//! tool, and what the rail or the status bar already offers (collapsing the rail, the Event
+//! log) is not offered twice.
 
-use crate::actions;
 use crate::state::{App, Tab};
 use crate::theme::{self, ThemeMode};
 use eframe::egui;
@@ -20,20 +23,16 @@ fn close(ui: &Ui) {
     theme::close_bar_popup(ui);
 }
 
-/// Everything the shell's `...` overflow holds, as flat sections, one level deep.
+/// Everything the shell's `...` overflow holds, as flat sections, one level deep: View, Help
+/// and Session.
 pub fn overflow(app: &mut App, ui: &mut Ui) {
     let look = if ui.visuals().dark_mode { ThemeMode::DarkWorkstation } else { ThemeMode::LightWorkstation };
     let p = &theme::palette(look);
-    theme::menu_section(ui, p, "Intruder", true);
-    intruder_items(app, ui);
-    theme::menu_section(ui, p, "Repeater", false);
-    repeater_items(app, ui);
-    theme::menu_section(ui, p, "View", false);
+    theme::menu_section(ui, p, "View", true);
     view_items(app, ui);
     theme::menu_section(ui, p, "Help", false);
-    help_items(app, ui);
-    ui.add_space(4.0);
-    ui.separator();
+    help_items(app, ui, p);
+    theme::menu_section(ui, p, "Session", false);
     if ui.button("Exit").clicked() {
         close(ui);
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -73,53 +72,13 @@ pub fn project_items(app: &mut App, ui: &mut Ui) {
     }
 }
 
-pub fn intruder_items(app: &mut App, ui: &mut Ui) {
-    {
-        if ui.add_enabled(!app.int_running, egui::Button::new("Start attack")).clicked() {
-            actions::start_attack(app);
-            app.tab = Tab::Intruder;
-            close(ui);
-        }
-        if ui.button("Send to Repeater").clicked() {
-            let request = app.int_template.replace('§', "");
-            let target = app.int_target.clone();
-            actions::send_to_repeater(app, "GET", &target, &request);
-            close(ui);
-        }
-        if ui.button("Automatic payload positions").clicked() {
-            app.int_template = crate::intruder::auto_positions(&app.int_template);
-            app.tab = Tab::Intruder;
-            close(ui);
-        }
-        if ui.button("Clear payload positions").clicked() {
-            app.int_template = app.int_template.replace('§', "");
-            close(ui);
-        }
-    }
-}
-
-pub fn repeater_items(app: &mut App, ui: &mut Ui) {
-    {
-        ui.checkbox(&mut app.rep_follow, "Follow redirections");
-        ui.separator();
-        if ui.add_enabled(app.rep().can_send(), egui::Button::new("Send request   Ctrl+Space")).clicked() {
-            actions::send_repeater(app);
-            close(ui);
-        }
-    }
-}
-
 /// The View menu. The twelve tools are not listed: the rail shows every one of them, and the
 /// command palette finds them by name.
 pub fn view_items(app: &mut App, ui: &mut Ui) {
     {
-        ui.checkbox(&mut app.inspector.show_inspector, "Inspector panel   Ctrl+Shift+N")
+        let label = format!("Inspector panel   {}", crate::hotkeys::command_chord("Shift+N"));
+        ui.checkbox(&mut app.inspector.show_inspector, label)
             .on_hover_text("The request/response Inspector in Repeater, Intercept and HTTP history");
-        let collapsed = app.rail_collapsed;
-        if ui.button(if collapsed { "Expand navigation rail" } else { "Collapse navigation rail" }).clicked() {
-            app.rail_collapsed = !collapsed;
-            close(ui);
-        }
         let current = app.eff().theme;
         let other = if current == ThemeMode::DarkWorkstation { "Light theme" } else { "Dark theme" };
         if ui.button(other).clicked() {
@@ -130,16 +89,28 @@ pub fn view_items(app: &mut App, ui: &mut Ui) {
     }
 }
 
-pub fn help_items(app: &mut App, ui: &mut Ui) {
+pub fn help_items(app: &mut App, ui: &mut Ui, p: &theme::Palette) {
     {
         if ui.button("Keyboard shortcuts").clicked() {
             app.show_settings = true;
             app.settings_page = crate::state::SettingsPage::Hotkeys;
             close(ui);
         }
-        if ui.button("Event log").clicked() {
-            app.drawer = Some(crate::state::DrawerTab::EventLog);
-            close(ui);
-        }
+        // the build this is, stated rather than linked: there is no page of its own to open
+        ui.label(egui::RichText::new(about_line()).size(theme::FONT_CAPTION).color(p.text));
+    }
+}
+
+/// "About ForgeProxy v1.0.0": the name and version this binary was built as.
+pub fn about_line() -> String {
+    format!("About ForgeProxy v{}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_about_line_names_this_build() {
+        assert_eq!(super::about_line(), format!("About ForgeProxy v{}", env!("CARGO_PKG_VERSION")));
+        assert!(super::about_line().ends_with("v1.0.0"), "{}", super::about_line());
     }
 }

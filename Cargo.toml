@@ -1,6 +1,6 @@
 [package]
 name = "forgeproxy"
-version = "0.2.1-alpha"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -20,7 +20,7 @@ rcgen = { version = "0.14.10", features = ["x509-parser"] }
 # TLS for the MITM pipeline; the same ring provider and features ureq already uses
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
-# trust anchors for verifying real servers when HTTPS is intercepted (Mozilla's set, as ureq uses)
+# trust anchors for verifying real servers when HTTPS is intercepted (the same public set ureq uses)
 webpki-roots = "1"
 # read the root CA certificate (SubjectPublicKeyInfo for the browser's SPKI pin)
 x509-parser = "0.18"
@@ -39,4 +39,9 @@ opt-level = 1
 debug = "line-tables-only"
 
 [profile.release]
-opt-level = 2
+# one compact production binary: full optimisation, whole-crate code generation, thin
+# link-time optimisation across the dependency graph, and no symbol table
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
