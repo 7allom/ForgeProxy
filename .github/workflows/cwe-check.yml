@@ -42,6 +42,13 @@ jobs:
             echo "::warning::MITRE's CWE text differs from assets/cwe/catalog.json. Download the cwe-catalog artifact (or run python3 tools/update_cwe.py) and commit the result."
           fi
 
+      - name: Print the fresh catalogue
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          echo "----- BEGIN catalog.json -----"
+          cat assets/cwe/catalog.json
+          echo "----- END catalog.json -----"
+
       - name: Keep the fresh catalogue
         if: steps.compare.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
