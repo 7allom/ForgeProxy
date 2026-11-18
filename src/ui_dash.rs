@@ -297,49 +297,59 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
             });
         });
         let (home, fi, f) = list[sel].clone();
-        let ui = &mut cols[1];
-        ui.label(bold(&f.name, 15.0).color(p.strong));
-        ui.horizontal(|ui| {
-            ui.colored_label(sev_color(p, f.severity), format!("Severity: {}", f.severity.label()));
-            ui.label(RichText::new(format!("Confidence: {}", f.confidence.label())).color(p.text));
+        // A column of `theme::columns` is laid out top-down *justified*, so a widget put
+        // straight into one is stretched to the column's full width: that is what turned
+        // the action below into a slab across the whole panel, hard against the lines above
+        // it. The detail stacks at its own width instead, inside a scroll area of its own --
+        // MITRE's background and remediation text runs well past the bottom of the panel.
+        egui::ScrollArea::vertical().id_salt(("issue_detail", task)).auto_shrink([false, false]).show(&mut cols[1], |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.label(bold(&f.name, 15.0).color(p.strong));
+                ui.horizontal(|ui| {
+                    ui.colored_label(sev_color(p, f.severity), format!("Severity: {}", f.severity.label()));
+                    ui.label(RichText::new(format!("Confidence: {}", f.confidence.label())).color(p.text));
+                });
+                ui.label(RichText::new(format!("{}{}", f.host, f.path)).monospace().color(p.disabled));
+                match crate::issue_defs::cwe_url(f.cwe) {
+                    Some(url) => { ui.hyperlink_to(RichText::new(crate::cwe_catalog::title(f.cwe)).size(11.0), url); }
+                    None => { ui.label(RichText::new(crate::scan::cwe_label(f.cwe)).size(11.0).color(p.disabled)); }
+                }
+                ui.add_space(8.0);
+                let fp = f.severity == Severity::FalsePositive;
+                if theme::plain_button(ui, p, if fp { "Undo false positive" } else { "Mark as false positive" }, true).clicked() {
+                    let restored = crate::issue_defs::typical_severity(f.cwe, &f.name);
+                    let next = if fp { restored } else { Severity::FalsePositive };
+                    // written back where the issue actually lives, which is not always a scan task
+                    let slot = match home {
+                        IssueHome::Task(ti) => app.tasks.get_mut(ti).and_then(|t| t.findings.get_mut(fi)),
+                        IssueHome::Imported => app.findings.get_mut(fi),
+                    };
+                    if let Some(found) = slot {
+                        found.severity = next;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.label(bold("Issue detail", 13.0).color(p.strong));
+                ui.add(egui::Label::new(RichText::new(&f.detail).color(p.text)).wrap());
+                // whatever the finding does not say for itself, MITRE's entry for its CWE says
+                if let Some(w) = crate::cwe_catalog::lookup(f.cwe) {
+                    ui.add_space(4.0);
+                    ui.label(bold("Issue background", 13.0).color(p.strong));
+                    ui.add(egui::Label::new(RichText::new(&w.description).color(p.text)).wrap());
+                }
+                let remediation = if f.remediation.trim().is_empty() {
+                    crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
+                } else {
+                    f.remediation.clone()
+                };
+                if !remediation.trim().is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(bold("Remediation", 13.0).color(p.strong));
+                    ui.add(egui::Label::new(RichText::new(remediation).color(p.text)).wrap());
+                }
+            });
         });
-        ui.label(RichText::new(format!("{}{}", f.host, f.path)).monospace().color(p.disabled));
-        match crate::issue_defs::cwe_url(f.cwe) {
-            Some(url) => { ui.hyperlink_to(RichText::new(crate::cwe_catalog::title(f.cwe)).size(11.0), url); }
-            None => { ui.label(RichText::new(crate::scan::cwe_label(f.cwe)).size(11.0).color(p.disabled)); }
-        }
-        let fp = f.severity == Severity::FalsePositive;
-        if theme::plain_button(ui, p, if fp { "Undo false positive" } else { "Mark as false positive" }, true).clicked() {
-            let restored = crate::issue_defs::typical_severity(f.cwe, &f.name);
-            let next = if fp { restored } else { Severity::FalsePositive };
-            // written back where the issue actually lives, which is not always a scan task
-            let slot = match home {
-                IssueHome::Task(ti) => app.tasks.get_mut(ti).and_then(|t| t.findings.get_mut(fi)),
-                IssueHome::Imported => app.findings.get_mut(fi),
-            };
-            if let Some(found) = slot {
-                found.severity = next;
-            }
-        }
-        ui.separator();
-        ui.label(bold("Issue detail", 13.0).color(p.strong));
-        ui.add(egui::Label::new(RichText::new(&f.detail).color(p.text)).wrap());
-        // whatever the finding does not say for itself, MITRE's entry for its CWE says
-        if let Some(w) = crate::cwe_catalog::lookup(f.cwe) {
-            ui.add_space(4.0);
-            ui.label(bold("Issue background", 13.0).color(p.strong));
-            ui.add(egui::Label::new(RichText::new(&w.description).color(p.text)).wrap());
-        }
-        let remediation = if f.remediation.trim().is_empty() {
-            crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
-        } else {
-            f.remediation.clone()
-        };
-        if !remediation.trim().is_empty() {
-            ui.add_space(4.0);
-            ui.label(bold("Remediation", 13.0).color(p.strong));
-            ui.add(egui::Label::new(RichText::new(remediation).color(p.text)).wrap());
-        }
     });
 }
 
@@ -481,5 +491,118 @@ mod tests {
         app.show_new_scan = true;
         frame(&ctx, &mut app, vec![]);
         assert!(app.new_scan_urls.is_empty(), "opening New scan keeps URL buffer empty");
+    }
+
+    /// The bounds of the first widget whose label begins with `prefix`. For the wrapped
+    /// paragraphs, whose whole text is their label.
+    fn find_rect_starting_with(update: &Option<egui::accesskit::TreeUpdate>, prefix: &str) -> egui::accesskit::Rect {
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        nodes
+            .iter()
+            .filter(|(_, n)| n.role() != egui::accesskit::Role::TextRun)
+            .filter(|(_, n)| n.label().or_else(|| n.value()).is_some_and(|l| l.starts_with(prefix)))
+            .find_map(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("no widget whose label starts with {prefix:?}"))
+    }
+
+    /// A finished audit holding one issue, with the Issues tab open on it. Its remediation
+    /// runs long on purpose: the detail panel has to stay reachable to the end of it.
+    fn issues_app() -> (egui::Context, App) {
+        let (ctx, mut app) = dash_app();
+        app.tasks.push(Task {
+            kind: TaskKind::Scan { crawl: false },
+            url: "http://127.0.0.1:8731/".into(),
+            capturing: false,
+            running: false,
+            requests: 2,
+            findings: vec![Finding {
+                cwe: 548,
+                name: "Directory listing".into(),
+                severity: Severity::Info,
+                confidence: crate::scan::Confidence::Firm,
+                host: "127.0.0.1:8731".into(),
+                path: "/".into(),
+                detail: "The response looks like an automatic directory listing.".into(),
+                remediation: "Restrict access to the directories this server publishes. ".repeat(40),
+                ..Default::default()
+            }],
+            log: Vec::new(),
+        });
+        app.task_sel = 1;
+        app.task_sub = 1;
+        (ctx, app)
+    }
+
+    /// `theme::columns` hands out columns laid out top-down *justified*, so a widget added
+    /// straight to one is stretched to the column's full width. The detail panel's button
+    /// has to keep the width of its own label, and stay clear of the line above it.
+    #[test]
+    fn issue_detail_button_keeps_its_own_width_and_clears_the_line_above() {
+        let (ctx, mut app) = issues_app();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+
+        let button = find_rect(&update, "Mark as false positive", Some(egui::accesskit::Role::Button));
+        // the remediation runs long enough to wrap, so it measures how wide the panel is
+        let paragraph = find_rect_starting_with(&update, "Restrict access to the directories");
+        let panel_w = paragraph.x1 - paragraph.x0;
+        let button_w = button.x1 - button.x0;
+        assert!(
+            button_w < panel_w / 2.0,
+            "the button is {button_w:.0}px wide in a {panel_w:.0}px panel: it has been stretched across the whole detail panel instead of keeping the width of its label",
+        );
+
+        let cwe = find_rect(&update, &crate::cwe_catalog::title(548), None);
+        let host = find_rect(&update, "127.0.0.1:8731/", None);
+        for (what, above) in [("the CWE line", cwe), ("the host line", host)] {
+            assert!(
+                button.y0 >= above.y1,
+                "the button's box (y {:.0}..{:.0}) runs into {what} (y {:.0}..{:.0})",
+                button.y0, button.y1, above.y0, above.y1,
+            );
+        }
+    }
+
+    /// The action still acts: it sits two closures deep now, inside the scroll area.
+    #[test]
+    fn marking_an_issue_a_false_positive_writes_back_to_its_task() {
+        let (ctx, mut app) = issues_app();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let button = center(find_rect(&update, "Mark as false positive", Some(egui::accesskit::Role::Button)));
+
+        click_at(&ctx, &mut app, button);
+        assert_eq!(app.tasks[1].findings[0].severity, Severity::FalsePositive, "the button marks the issue");
+
+        let update = frame(&ctx, &mut app, vec![]);
+        let undo = center(find_rect(&update, "Undo false positive", Some(egui::accesskit::Role::Button)));
+        click_at(&ctx, &mut app, undo);
+        assert_eq!(app.tasks[1].findings[0].severity, Severity::Info, "undoing restores the check's own severity");
+    }
+
+    /// MITRE's background and remediation text runs past the bottom of the panel, so the
+    /// panel scrolls; without that the end of it cannot be read.
+    #[test]
+    fn issue_detail_scrolls_to_reach_text_past_the_bottom() {
+        let (ctx, mut app) = issues_app();
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let before = find_rect(&update, "Remediation", None);
+
+        let at = center(before);
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -200.0),
+            modifiers: Default::default(),
+        };
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at), wheel]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let after = find_rect(&update, "Remediation", None);
+
+        assert!(
+            after.y0 < before.y0 - 10.0,
+            "the wheel moved the 'Remediation' heading from y {:.0} to y {:.0}: the detail panel does not scroll, so text past its bottom cannot be reached",
+            before.y0, after.y0,
+        );
     }
 }
