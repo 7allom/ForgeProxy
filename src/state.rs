@@ -46,18 +46,18 @@ impl Tab {
     pub fn icon(&self) -> theme::ToolIcon {
         use theme::ToolIcon as I;
         match self {
-            Tab::Dashboard => I::Gauge,
-            Tab::Target => I::Crosshair,
-            Tab::Proxy => I::Relay,
-            Tab::Intruder => I::Grid,
-            Tab::Repeater => I::Loop,
-            Tab::Interactor => I::Waves,
-            Tab::Sequencer => I::Bars,
-            Tab::Decoder => I::Braces,
-            Tab::Comparer => I::Columns,
-            Tab::Logger => I::Lines,
-            Tab::Organizer => I::Tray,
-            Tab::Automation => I::Cogs,
+            Tab::Dashboard => I::Dashboard,
+            Tab::Target => I::Target,
+            Tab::Proxy => I::Proxy,
+            Tab::Intruder => I::Intruder,
+            Tab::Repeater => I::Repeater,
+            Tab::Interactor => I::Interactor,
+            Tab::Sequencer => I::Sequencer,
+            Tab::Decoder => I::Decoder,
+            Tab::Comparer => I::Comparer,
+            Tab::Logger => I::Logger,
+            Tab::Organizer => I::Organizer,
+            Tab::Automation => I::Automation,
         }
     }
 

@@ -400,7 +400,7 @@ pub fn action_button(ui: &mut Ui, p: &Palette, label: &str, enabled: bool, min_s
 /// Grey button with bold label, as "Add", "Edit".
 pub fn plain_button(ui: &mut Ui, p: &Palette, label: &str, enabled: bool) -> egui::Response {
     let txt = bold(label, 13.0).color(if enabled { p.text } else { p.disabled });
-    ui.add_enabled(enabled, egui::Button::new(txt).fill(p.header).corner_radius(egui::CornerRadius::same(p.corner)).min_size(egui::vec2(0.0, 22.0)))
+    ui.add_enabled(enabled, egui::Button::new(txt).fill(p.header).corner_radius(egui::CornerRadius::same(p.corner)).min_size(egui::vec2(0.0, TOOLBAR_H)))
 }
 
 /// Fixed-width stacked button for the left-of-table button columns.
@@ -1430,6 +1430,41 @@ mod tests {
             assert_eq!(v.widgets.inactive.corner_radius, egui::CornerRadius::same(p.corner), "{mode:?}: widgets round to the palette corner");
         }
     }
+
+    /// Every rail glyph draws something, and all of it inside its 16x16 box, whatever
+    /// fraction of a pixel the centre it is handed falls on.
+    #[test]
+    fn every_tool_icon_draws_inside_its_box_matrix() {
+        assert_table!(ToolIcon::ALL, |idx, icon| {
+            for centre in [egui::pos2(40.0, 40.0), egui::pos2(40.3, 39.6), egui::pos2(40.5, 40.5)] {
+                let ctx = egui::Context::default();
+                let out = ctx.run(egui::RawInput::default(), |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::background());
+                    paint_tool_icon(&painter, centre, icon, Color32::WHITE);
+                });
+                let shapes: Vec<egui::Shape> = out.shapes.into_iter().map(|c| c.shape).collect();
+                assert!(!shapes.is_empty(), "case #{idx} ({icon:?}): drew nothing");
+                let origin = (centre - egui::vec2(TOOL_ICON / 2.0, TOOL_ICON / 2.0)).round();
+                // a stroke's antialiased fringe may reach half a pixel past the grid
+                let room = egui::Rect::from_min_size(origin, egui::vec2(TOOL_ICON, TOOL_ICON)).expand(0.8);
+                for shape in &shapes {
+                    let b = shape.visual_bounding_rect();
+                    assert!(room.contains_rect(b), "case #{idx} ({icon:?} at {centre:?}): {b:?} leaves {room:?}");
+                }
+            }
+        });
+    }
+
+    /// No two tools share a glyph: once the rail is collapsed, the glyph is all there is.
+    #[test]
+    fn every_tool_has_a_glyph_of_its_own() {
+        let glyphs: Vec<ToolIcon> = crate::state::Tab::ALL.iter().map(|t| t.icon()).collect();
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(!glyphs[i + 1..].contains(g), "{g:?} is used twice");
+        }
+        assert_eq!(glyphs.len(), ToolIcon::ALL.len(), "every glyph belongs to a tool");
+    }
+
 }
 
 // ---- the outer shell -----------------------------------------------------------------------
@@ -1452,154 +1487,187 @@ pub const RAIL_ROW_H: f32 = 28.0;
 pub const CARD_GUTTER: i8 = 10;
 /// The command bar's height, which is the whole of the chrome above the work.
 pub const COMMAND_BAR_H: f32 = 34.0;
+/// Every control that sits in a bar -- the command bar's chips and buttons, a tool's
+/// segmented sub-views, a toolbar row such as Intercept's -- is this tall, so a row of them
+/// shares one top, one bottom and one centreline.
+pub const TOOLBAR_H: f32 = 24.0;
+/// A rail group caption's room above the text and below it.
+const RAIL_CAPTION_TOP: f32 = 10.0;
+const RAIL_CAPTION_BOTTOM: f32 = 4.0;
+/// The collapse control at the foot of the rail.
+const RAIL_FOOTER_H: f32 = 32.0;
 
 /// The glyph a tool is known by in the rail. Drawn in code rather than set as text: the
 /// interface font is not guaranteed to carry any particular symbol, and a missing glyph in
 /// the only label a collapsed rail has would leave a tool unreachable by eye.
+///
+/// Every glyph is laid out on a 16x16 grid whose origin is snapped to a whole pixel. Strokes
+/// are 1.5px and sit on half-pixel centres (`n + 0.5`); straight bars and solid marks are
+/// filled whole-pixel rectangles. Both rules keep the edges from smearing across two pixel
+/// columns, which is what made the earlier set read as grey smudges at rail size.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolIcon {
-    /// Dashboard: a dial with its needle.
-    Gauge,
-    /// Target: a crosshair over a ring.
-    Crosshair,
-    /// Proxy: traffic passing through a point in the middle.
-    Relay,
-    /// Intruder: a grid of positions to substitute at.
-    Grid,
-    /// Repeater: one request going round again.
-    Loop,
-    /// Interactor: a signal arriving from outside.
-    Waves,
-    /// Sequencer: sampled tokens as columns of differing height.
-    Bars,
-    /// Decoder: a transformation, written as brackets.
-    Braces,
-    /// Comparer: two panes side by side.
-    Columns,
-    /// Logger: a page of recorded lines.
-    Lines,
-    /// Organizer: a tray things are filed into.
-    Tray,
-    /// Automation: two cogs, one driving the other.
-    Cogs,
+    /// Four tiles of a bento layout, two short and two tall.
+    Dashboard,
+    /// Two opposing traffic arrows.
+    Proxy,
+    /// A reticle: ring, four cardinal ticks and a centre dot.
+    Target,
+    /// Three stream lines with a status dot on the first.
+    Logger,
+    /// A three-quarter replay arrow turning clockwise.
+    Repeater,
+    /// A target diamond with an impact bolt inside.
+    Intruder,
+    /// A beacon: a node with two signal arcs either side.
+    Interactor,
+    /// Four equal bars of stepped height.
+    Sequencer,
+    /// Code brackets around a slash.
+    Decoder,
+    /// One frame split into two panes, each with its own diff ticks.
+    Comparer,
+    /// A folder with its tab at the top left.
+    Organizer,
+    /// A lightning bolt, so it can never be mistaken for the Settings gear.
+    Automation,
 }
+
+#[cfg(test)]
+impl ToolIcon {
+    /// Every glyph, for the tests that check each one is drawn and fits its box.
+    pub const ALL: [ToolIcon; 12] = [
+        ToolIcon::Dashboard,
+        ToolIcon::Proxy,
+        ToolIcon::Target,
+        ToolIcon::Logger,
+        ToolIcon::Repeater,
+        ToolIcon::Intruder,
+        ToolIcon::Interactor,
+        ToolIcon::Sequencer,
+        ToolIcon::Decoder,
+        ToolIcon::Comparer,
+        ToolIcon::Organizer,
+        ToolIcon::Automation,
+    ];
+}
+
+/// The side of the square every [`ToolIcon`] is drawn inside.
+pub const TOOL_ICON: f32 = 16.0;
 
 /// Draw `icon` centred on `centre`, inside a 16x16 box, in `col`.
 pub fn paint_tool_icon(painter: &egui::Painter, centre: egui::Pos2, icon: ToolIcon, col: Color32) {
-    let s = Stroke::new(1.4_f32, col);
-    let thin = Stroke::new(1.0_f32, col);
-    let at = |dx: f32, dy: f32| centre + egui::vec2(dx, dy);
-    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], s);
-    let box_of = |a: egui::Pos2, b: egui::Pos2, stroke: Stroke| {
-        painter.rect_stroke(egui::Rect::from_min_max(a, b), egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+    use std::f32::consts::PI;
+    // the grid's top-left corner, on a whole pixel, so the half-pixel and whole-pixel rules
+    // below land where they say
+    let origin = (centre - egui::vec2(TOOL_ICON / 2.0, TOOL_ICON / 2.0)).round();
+    let at = |x: f32, y: f32| origin + egui::vec2(x, y);
+    let s = Stroke::new(1.5_f32, col);
+    let line = |pts: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), s));
+    };
+    let closed = |pts: &[(f32, f32)]| {
+        painter.add(egui::Shape::closed_line(pts.iter().map(|&(x, y)| at(x, y)).collect(), s));
+    };
+    // a solid whole-pixel rectangle
+    let bar = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        painter.rect_filled(egui::Rect::from_min_max(at(x0, y0), at(x1, y1)), 0.0, col);
+    };
+    // a stroked box whose edges run along half-pixel centres
+    let frame = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        painter.rect_stroke(
+            egui::Rect::from_min_max(at(x0, y0), at(x1, y1)),
+            egui::CornerRadius::same(1),
+            s,
+            egui::StrokeKind::Middle,
+        );
+    };
+    let solid = |pts: &[(f32, f32)]| {
+        painter.add(egui::Shape::convex_polygon(pts.iter().map(|&(x, y)| at(x, y)).collect(), col, Stroke::NONE));
+    };
+    let arc = |cx: f32, cy: f32, r: f32, from: f32, to: f32| {
+        let steps = ((to - from).abs() * r / 1.5).ceil().max(4.0) as usize;
+        let pts = (0..=steps)
+            .map(|k| {
+                let t = from + (to - from) * k as f32 / steps as f32;
+                at(cx + r * t.cos(), cy + r * t.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, s));
     };
     match icon {
-        ToolIcon::Gauge => {
-            painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                points: (0..=12).map(|k| {
-                    let t = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
-                    at(6.5 * t.cos(), 6.5 * t.sin())
-                }).collect(),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: s.into(),
-            }));
-            line(centre, at(4.0, -4.5));
+        ToolIcon::Dashboard => {
+            frame(1.5, 1.5, 6.5, 8.5);
+            frame(1.5, 11.5, 6.5, 14.5);
+            frame(9.5, 1.5, 14.5, 4.5);
+            frame(9.5, 7.5, 14.5, 14.5);
         }
-        ToolIcon::Crosshair => {
-            painter.circle_stroke(centre, 5.5, s);
-            for (dx, dy) in [(0.0, -8.0), (0.0, 8.0), (-8.0, 0.0), (8.0, 0.0)] {
-                line(at(dx * 0.7, dy * 0.7), at(dx, dy));
+        ToolIcon::Proxy => {
+            line(&[(1.5, 4.5), (14.0, 4.5)]);
+            line(&[(11.5, 1.5), (14.5, 4.5), (11.5, 7.5)]);
+            line(&[(2.0, 11.5), (14.5, 11.5)]);
+            line(&[(4.5, 8.5), (1.5, 11.5), (4.5, 14.5)]);
+        }
+        ToolIcon::Target => {
+            painter.circle_stroke(at(8.0, 8.0), 4.75, s);
+            bar(7.0, 0.0, 9.0, 4.0);
+            bar(7.0, 12.0, 9.0, 16.0);
+            bar(0.0, 7.0, 4.0, 9.0);
+            bar(12.0, 7.0, 16.0, 9.0);
+            painter.circle_filled(at(8.0, 8.0), 1.5, col);
+        }
+        ToolIcon::Logger => {
+            painter.circle_filled(at(3.0, 4.0), 2.0, col);
+            bar(7.0, 3.0, 15.0, 5.0);
+            bar(1.0, 7.0, 15.0, 9.0);
+            bar(1.0, 11.0, 11.0, 13.0);
+        }
+        ToolIcon::Repeater => {
+            // three quarters of a turn, clockwise from three o'clock round to twelve, with the
+            // head at twelve pointing on round
+            arc(8.0, 8.5, 5.0, 0.0, 1.5 * PI);
+            solid(&[(11.5, 3.5), (7.5, 0.5), (7.5, 6.5)]);
+        }
+        ToolIcon::Intruder => {
+            closed(&[(8.0, 1.0), (15.0, 8.0), (8.0, 15.0), (1.0, 8.0)]);
+            // the bolt is two overlapping wedges, each convex, so each fills cleanly
+            solid(&[(9.5, 4.0), (5.5, 9.0), (9.0, 9.0)]);
+            solid(&[(7.0, 7.0), (10.5, 7.0), (6.5, 12.0)]);
+        }
+        ToolIcon::Interactor => {
+            painter.circle_filled(at(8.0, 8.0), 1.75, col);
+            for r in [4.0_f32, 6.75] {
+                arc(8.0, 8.0, r, -0.28 * PI, 0.28 * PI);
+                arc(8.0, 8.0, r, 0.72 * PI, 1.28 * PI);
             }
         }
-        ToolIcon::Relay => {
-            line(at(-8.0, -4.0), at(-2.5, -4.0));
-            line(at(2.5, -4.0), at(8.0, -4.0));
-            line(at(-8.0, 4.0), at(-2.5, 4.0));
-            line(at(2.5, 4.0), at(8.0, 4.0));
-            painter.circle_stroke(centre, 2.5, s);
-        }
-        ToolIcon::Grid => {
-            box_of(at(-7.0, -7.0), at(7.0, 7.0), s);
-            line(at(-7.0, -2.0), at(7.0, -2.0));
-            line(at(-7.0, 3.0), at(7.0, 3.0));
-            line(at(-2.0, -7.0), at(-2.0, 7.0));
-        }
-        ToolIcon::Loop => {
-            painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                points: (0..=16).map(|k| {
-                    let t = std::f32::consts::PI * (0.35 + 1.5 * k as f32 / 16.0);
-                    at(6.5 * t.cos(), 6.5 * t.sin())
-                }).collect(),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: s.into(),
-            }));
-            // the arrow head that says which way round it goes
-            line(at(2.0, -7.5), at(6.0, -4.5));
-            line(at(1.5, -1.5), at(6.0, -4.5));
-        }
-        ToolIcon::Waves => {
-            for r in [2.5_f32, 5.5, 8.0] {
-                painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                    points: (0..=10).map(|k| {
-                        let t = std::f32::consts::PI * (-0.4 + 0.8 * k as f32 / 10.0);
-                        at(-5.0 + r * t.cos(), r * t.sin())
-                    }).collect(),
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: thin.into(),
-                }));
-            }
-            painter.circle_filled(at(-6.5, 0.0), 1.8, col);
-        }
-        ToolIcon::Bars => {
-            for (dx, h) in [(-5.5_f32, 4.0_f32), (-1.8, 7.5), (1.8, 2.5), (5.5, 6.0)] {
-                line(at(dx, 7.0), at(dx, 7.0 - h * 2.0));
+        ToolIcon::Sequencer => {
+            for (k, top) in [10.0_f32, 7.0, 4.0, 1.0].into_iter().enumerate() {
+                let x = 1.0 + 4.0 * k as f32;
+                bar(x, top, x + 2.0, 15.0);
             }
         }
-        ToolIcon::Braces => {
-            for dir in [-1.0_f32, 1.0] {
-                painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                    points: vec![
-                        at(dir * 3.0, -7.0), at(dir * 6.5, -7.0), at(dir * 6.5, -2.0),
-                        at(dir * 8.5, 0.0), at(dir * 6.5, 2.0), at(dir * 6.5, 7.0),
-                        at(dir * 3.0, 7.0),
-                    ],
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: thin.into(),
-                }));
-            }
+        ToolIcon::Decoder => {
+            line(&[(5.0, 3.5), (1.0, 8.0), (5.0, 12.5)]);
+            line(&[(11.0, 3.5), (15.0, 8.0), (11.0, 12.5)]);
+            line(&[(9.5, 2.5), (6.5, 13.5)]);
         }
-        ToolIcon::Columns => {
-            box_of(at(-8.0, -6.5), at(-1.0, 6.5), s);
-            box_of(at(1.0, -6.5), at(8.0, 6.5), s);
-            line(at(-6.0, -3.0), at(-3.0, -3.0));
-            line(at(3.0, 1.0), at(6.0, 1.0));
+        ToolIcon::Comparer => {
+            frame(1.5, 2.5, 14.5, 13.5);
+            bar(7.0, 3.0, 9.0, 13.0);
+            // the panes agree on the first line and differ on the second
+            bar(3.0, 6.0, 6.0, 7.0);
+            bar(3.0, 9.0, 6.0, 10.0);
+            bar(10.0, 6.0, 13.0, 7.0);
+            bar(10.0, 9.0, 12.0, 10.0);
         }
-        ToolIcon::Lines => {
-            box_of(at(-6.5, -8.0), at(6.5, 8.0), thin);
-            for dy in [-4.0, 0.0, 4.0] {
-                line(at(-3.5, dy), at(3.5, dy));
-            }
+        ToolIcon::Organizer => {
+            closed(&[(1.5, 2.5), (6.0, 2.5), (7.5, 4.5), (14.5, 4.5), (14.5, 13.5), (1.5, 13.5)]);
+            line(&[(1.5, 6.5), (14.5, 6.5)]);
         }
-        ToolIcon::Tray => {
-            line(at(-7.0, -6.5), at(-1.0, -6.5));
-            box_of(at(-8.0, -3.0), at(8.0, 7.5), s);
-            line(at(-8.0, 1.5), at(8.0, 1.5));
-        }
-        ToolIcon::Cogs => {
-            painter.circle_stroke(at(-2.5, -2.0), 4.5, s);
-            painter.circle_stroke(at(4.0, 4.5), 3.0, thin);
-            for k in 0..6 {
-                let t = std::f32::consts::TAU * k as f32 / 6.0;
-                let (cs, sn) = (t.cos(), t.sin());
-                painter.line_segment(
-                    [at(-2.5 + 4.5 * cs, -2.0 + 4.5 * sn), at(-2.5 + 7.0 * cs, -2.0 + 7.0 * sn)],
-                    thin,
-                );
-            }
+        ToolIcon::Automation => {
+            solid(&[(10.5, 0.5), (3.0, 9.0), (8.5, 9.0)]);
+            solid(&[(7.5, 7.0), (13.0, 7.0), (5.5, 15.5)]);
         }
     }
 }
@@ -1696,27 +1764,60 @@ pub fn rail_item(
         );
         ui.painter().rect_filled(bar, egui::CornerRadius::same(1), p.accent);
     }
-    let ink = if selected { p.strong } else if resp.hovered() { p.strong } else { p.text };
-    paint_tool_icon(ui.painter(), egui::pos2(body.left() + 18.0, body.center().y), icon, ink);
+    let ink = if selected || resp.hovered() { p.strong } else { p.text };
+    // the icon and the label share the row's centreline: the icon's box is centred on it and
+    // the label's line box is anchored to it by its left middle
+    let mid = rect.center().y;
+    let icon_x = if collapsed { rect.center().x } else { body.left() + 8.0 + TOOL_ICON / 2.0 };
+    paint_tool_icon(ui.painter(), egui::pos2(icon_x, mid), icon, ink);
     if collapsed {
         return resp.on_hover_text(format!("{label}   {shortcut}"));
     }
     let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(FONT_UI), ink);
-    let pos = egui::pos2(body.left() + 34.0, body.center().y - galley.size().y / 2.0);
+    let anchor = egui::pos2(body.left() + 8.0 + TOOL_ICON + 10.0, mid);
+    let pos = egui::Align2::LEFT_CENTER.anchor_size(anchor, galley.size()).min;
     ui.painter().galley(pos, galley, ink);
     resp.on_hover_text(format!("{label}   {shortcut}"))
 }
 
 /// A group caption in the rail: small, dimmed and letter-spaced by the eye rather than the
 /// font, because it is a divider that happens to have a name and not something to read.
+///
+/// It keeps [`RAIL_CAPTION_TOP`] above its text and [`RAIL_CAPTION_BOTTOM`] below, so every
+/// group opens with the same gap whatever the font's line box happens to be.
 pub fn rail_caption(ui: &mut Ui, p: &Palette, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(FONT_CAPTION), p.disabled);
-    ui.painter().galley(
-        egui::pos2(rect.left() + 11.0, rect.bottom() - galley.size().y - 4.0),
-        galley,
-        p.disabled,
-    );
+    let h = RAIL_CAPTION_TOP + galley.size().y + RAIL_CAPTION_BOTTOM;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    // lined up with the rail rows' icons, so a caption reads as heading the column below it
+    ui.painter().galley(egui::pos2(rect.left() + 11.0, rect.top() + RAIL_CAPTION_TOP), galley, p.disabled);
+}
+
+/// The control at the foot of the rail that collapses it to icons or opens it out again: the
+/// full width of the rail, under one hairline, with its chevrons and (when there is room) its
+/// word on the footer's centreline.
+pub fn rail_footer_button(ui: &mut Ui, p: &Palette, collapsed: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), RAIL_FOOTER_H), egui::Sense::click());
+    let hint = if collapsed { "Expand the rail" } else { "Collapse the rail to icons" };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
+    let y = rect.top() + 0.5;
+    ui.painter().line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], Stroke::new(1.0_f32, p.border_subtle));
+    let body = egui::Rect::from_min_max(rect.min + egui::vec2(4.0, 4.0), rect.max - egui::vec2(4.0, 3.0));
+    if resp.hovered() {
+        ui.painter().rect_filled(body, egui::CornerRadius::same(CORNER), p.hover);
+    }
+    let ink = if resp.hovered() { p.strong } else { p.disabled };
+    let mid = body.center().y;
+    if collapsed {
+        paint_chevrons(ui.painter(), egui::pos2(body.center().x, mid), false, ink);
+    } else {
+        // the chevrons sit in the icon column, and the word where the rows' labels start
+        paint_chevrons(ui.painter(), egui::pos2(body.left() + 4.0 + TOOL_ICON / 2.0, mid), true, ink);
+        let galley = ui.painter().layout_no_wrap("Collapse".to_string(), FontId::proportional(FONT_UI), ink);
+        let anchor = egui::pos2(body.left() + 4.0 + TOOL_ICON + 10.0, mid);
+        ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(anchor, galley.size()).min, galley, ink);
+    }
+    resp.on_hover_text(hint)
 }
 
 /// A hairline across the rail, standing in for a caption there is no room to write.
@@ -1740,7 +1841,8 @@ pub fn segmented(ui: &mut Ui, p: &Palette, labels: &[&str], sel: &mut u8) {
         return;
     }
     const PAD: f32 = 13.0;
-    const H: f32 = 23.0;
+    // the track is the control's whole height; each segment is inset 2px inside it
+    const H: f32 = TOOLBAR_H - 4.0;
     let widths: Vec<f32> = labels
         .iter()
         .map(|l| ui.painter().layout_no_wrap((*l).to_string(), FontId::proportional(FONT_UI), p.text).size().x + PAD * 2.0)
@@ -1774,31 +1876,112 @@ pub fn segmented(ui: &mut Ui, p: &Palette, labels: &[&str], sel: &mut u8) {
         }
         let ink = if is_sel { p.strong } else { p.text };
         let galley = ui.painter().layout_no_wrap((*label).to_string(), FontId::proportional(FONT_UI), ink);
-        ui.painter().galley(
-            egui::pos2(seg.center().x - galley.size().x / 2.0, seg.center().y - galley.size().y / 2.0),
-            galley,
-            ink,
-        );
+        let pos = egui::Align2::CENTER_CENTER.anchor_size(seg.center(), galley.size()).min;
+        ui.painter().galley(pos, galley, ink);
         if resp.clicked() {
             *sel = i as u8;
         }
     }
 }
 
-/// A read-only chip in the command bar -- the project, the listener -- as a dot of `colour`,
-/// a label, and the raised surface behind both. Clickable, so every chip can lead somewhere.
-pub fn bar_chip(ui: &mut Ui, p: &Palette, text: &str, colour: Option<Color32>) -> egui::Response {
+/// A chip in the command bar -- the project, the listener -- as a dot of `colour`, a label,
+/// and the raised surface behind both. Clickable, so every chip can lead somewhere; `menu`
+/// adds a small downward chevron after the label for a chip that opens a menu, and `open`
+/// keeps it lit while that menu is showing.
+pub fn bar_chip(ui: &mut Ui, p: &Palette, text: &str, colour: Option<Color32>, menu: bool, open: bool) -> egui::Response {
+    const INSET: f32 = 9.0;
+    const DOT: f32 = 14.0;
+    const CHEVRON: f32 = 14.0;
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(FONT_UI), p.text);
-    let dot = if colour.is_some() { 14.0 } else { 0.0 };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 18.0 + dot, 22.0), egui::Sense::click());
+    let dot = if colour.is_some() { DOT } else { 0.0 };
+    let chevron = if menu { CHEVRON } else { 0.0 };
+    let w = INSET + dot + galley.size().x + chevron + INSET;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, TOOLBAR_H), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
-    let fill = if resp.hovered() { p.hover } else { p.header };
+    let fill = if resp.hovered() || open { p.hover } else { p.header };
     ui.painter().rect_filled(rect, egui::CornerRadius::same(CORNER), fill);
-    let mut x = rect.left() + 9.0;
+    let mid = rect.center().y;
+    let mut x = rect.left() + INSET;
     if let Some(c0) = colour {
-        ui.painter().circle_filled(egui::pos2(x + 2.0, rect.center().y), 3.5, c0);
+        ui.painter().circle_filled(egui::pos2(x + 3.5, mid), 3.5, c0);
         x += dot;
     }
-    ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, p.text);
+    let gw = galley.size().x;
+    ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(x, mid), galley.size()).min, galley, p.text);
+    if menu {
+        paint_chevron_down(ui.painter(), egui::pos2(x + gw + CHEVRON / 2.0 + 1.0, mid), p.disabled);
+    }
     resp
+}
+
+/// A small downward chevron, saying a control opens a menu below it.
+pub fn paint_chevron_down(painter: &egui::Painter, centre: egui::Pos2, col: Color32) {
+    let c0 = centre.round() + egui::vec2(0.5, 0.0);
+    painter.add(egui::Shape::line(
+        vec![c0 + egui::vec2(-3.5, -1.75), c0 + egui::vec2(0.0, 1.75), c0 + egui::vec2(3.5, -1.75)],
+        Stroke::new(1.5_f32, col),
+    ));
+}
+
+/// Which edge of its anchor a [`bar_popup`] lines up with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PopupEdge {
+    /// Hangs down from the anchor's left edge, for a control near the left of the window.
+    Left,
+    /// Hangs down from the anchor's right edge, so a control at the right of the window opens
+    /// inward instead of off the screen.
+    Right,
+}
+
+/// A single-level menu dropped from a command-bar control.
+///
+/// Click the anchor to open it and click it again to close it; a click anywhere outside the
+/// anchor and the menu, or Escape, closes it too. There is no hover behaviour at all, which is
+/// the point: a menu that opens on hover can be left open over the work by a pointer that
+/// wandered off it, and this one cannot. Items close it with [`close_bar_popup`].
+pub fn bar_popup(ui: &Ui, id: egui::Id, anchor: &egui::Response, edge: PopupEdge, add: impl FnOnce(&mut Ui)) {
+    if anchor.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(id));
+    }
+    if !ui.memory(|m| m.is_popup_open(id)) {
+        return;
+    }
+    let (pos, pivot) = match edge {
+        PopupEdge::Left => (anchor.rect.left_bottom(), egui::Align2::LEFT_TOP),
+        PopupEdge::Right => (anchor.rect.right_bottom(), egui::Align2::RIGHT_TOP),
+    };
+    let area = egui::Area::new(id)
+        .kind(egui::UiKind::Popup)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos + egui::vec2(0.0, 4.0))
+        .pivot(pivot)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    ui.set_min_width(220.0);
+                    add(ui);
+                });
+            });
+        });
+    let outside = anchor.clicked_elsewhere() && area.response.clicked_elsewhere();
+    if outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.memory_mut(|m| m.close_popup());
+    }
+}
+
+/// Close whichever [`bar_popup`] is showing, for an item that has done what it was chosen for.
+pub fn close_bar_popup(ui: &Ui) {
+    ui.memory_mut(|m| m.close_popup());
+}
+
+/// A flat section header inside a [`bar_popup`]: a small dimmed caption, with room above it
+/// unless it opens the menu. It stands in for what used to be a submenu.
+pub fn menu_section(ui: &mut Ui, p: &Palette, title: &str, first: bool) {
+    if !first {
+        ui.add_space(4.0);
+        ui.separator();
+    }
+    ui.add_space(2.0);
+    ui.label(RichText::new(title).size(FONT_CAPTION).color(p.disabled));
 }

@@ -120,7 +120,7 @@ fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) 
                 ui.spacing_mut().item_spacing.x = 6.0;
                 // on a window too narrow for a rail of its own, this is the way to the tools
                 if mode == RailMode::Overlay {
-                    let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(theme::TOOLBAR_H, theme::TOOLBAR_H), egui::Sense::click());
                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Tools"));
                     if resp.hovered() {
                         ui.painter().rect_filled(r, egui::CornerRadius::same(theme::CORNER), p.hover);
@@ -132,7 +132,11 @@ fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) 
                 }
                 let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
                 theme::paint_app_mark(ui.painter(), mark, p);
-                ui.label(theme::bold("ForgeProxy", theme::FONT_UI).color(p.strong));
+                // the wordmark is painted on the bar's centreline, like every chip after it,
+                // rather than left to a label's line box
+                let word = ui.painter().layout_no_wrap("ForgeProxy".into(), FontId::new(theme::FONT_UI, egui::FontFamily::Name("bold".into())), p.strong);
+                let (wr, _) = ui.allocate_exact_size(egui::vec2(word.size().x, theme::TOOLBAR_H), egui::Sense::hover());
+                ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(wr.left_center(), word.size()).min, word, p.strong);
 
                 // the open project, as the chip that also opens the Project menu
                 ui.add_space(2.0);
@@ -145,7 +149,7 @@ fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) 
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let icon = |ui: &mut Ui, name: &str| -> (egui::Rect, egui::Response) {
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(theme::TOOLBAR_H, theme::TOOLBAR_H), egui::Sense::click());
                         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
                         if resp.hovered() {
                             ui.painter().rect_filled(r, egui::CornerRadius::same(theme::CORNER), p.hover);
@@ -179,7 +183,7 @@ fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
     if width < 60.0 {
         return;
     }
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, theme::TOOLBAR_H), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Search or run a command"));
     ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::CORNER), p.bg_input);
     ui.painter().rect_stroke(
@@ -188,14 +192,21 @@ fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
         egui::Stroke::new(1.0_f32, if resp.hovered() { p.border_focus } else { p.border_subtle }),
         egui::StrokeKind::Inside,
     );
-    theme::paint_search(ui.painter(), egui::pos2(rect.left() + 13.0, rect.center().y), 5.5, p.disabled);
+    let mid = rect.center().y;
+    theme::paint_search(ui.painter(), egui::pos2(rect.left() + 13.0, mid), 5.5, p.disabled);
     let galley = ui.painter().layout_no_wrap("Search or run a command".into(), FontId::proportional(theme::FONT_UI), p.disabled);
     let label_w = galley.size().x;
-    ui.painter().galley(egui::pos2(rect.left() + 26.0, rect.center().y - galley.size().y / 2.0), galley, p.disabled);
-    let keys = ui.painter().layout_no_wrap("Ctrl+K".into(), FontId::proportional(theme::FONT_CAPTION), p.disabled);
-    let kw = keys.size().x;
-    if rect.width() > 26.0 + label_w + kw + 20.0 {
-        ui.painter().galley(egui::pos2(rect.right() - kw - 9.0, rect.center().y - keys.size().y / 2.0), keys, p.disabled);
+    ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(rect.left() + 26.0, mid), galley.size()).min, galley, p.disabled);
+    // the shortcut as a key badge, 8px in from the right edge and on the pill's centreline
+    let keys = ui.painter().layout_no_wrap("Ctrl+K".into(), FontId::proportional(theme::FONT_CAPTION), p.text);
+    let badge_w = keys.size().x + 10.0;
+    if rect.width() > 26.0 + label_w + badge_w + 16.0 {
+        let badge = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 8.0 - badge_w, mid - 8.0),
+            egui::pos2(rect.right() - 8.0, mid + 8.0),
+        );
+        ui.painter().rect_filled(badge, egui::CornerRadius::same(3), p.header);
+        ui.painter().galley(egui::Align2::CENTER_CENTER.anchor_size(badge.center(), keys.size()).min, keys, p.text);
     }
     if resp.on_hover_text("Search or run a command (Ctrl+K)").clicked() {
         app.show_palette = true;
@@ -212,53 +223,28 @@ fn project_chip(app: &mut App, ui: &mut Ui, p: &Palette, project: &str) {
     } else {
         "Nothing is being saved to disk. Click for the Project menu."
     };
-    // a menu that opens from a chip of our own drawing: the menu's own button is invisible and
-    // laid exactly over the chip, so the chip is what is seen and the menu is what happens
-    let resp = theme::bar_chip(ui, p, project, Some(colour)).on_hover_text(hint);
-    let rect = resp.rect;
-    let mut builder = egui::UiBuilder::new()
-        .max_rect(rect)
-        .layout(egui::Layout::left_to_right(egui::Align::Center));
-    builder.sense = Some(egui::Sense::click());
-    let mut over = ui.new_child(builder);
-    {
-        let widgets = &mut over.visuals_mut().widgets;
-        for w in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
-            w.weak_bg_fill = Color32::TRANSPARENT;
-            w.bg_fill = Color32::TRANSPARENT;
-            w.bg_stroke = egui::Stroke::NONE;
-        }
-    }
-    over.menu_button(RichText::new(" ").size(1.0), |ui| crate::menus::project_items(app, ui));
+    let id = ui.make_persistent_id("project_menu");
+    let open = ui.memory(|m| m.is_popup_open(id));
+    let resp = theme::bar_chip(ui, p, project, Some(colour), true, open).on_hover_text(hint);
+    theme::bar_popup(ui, id, &resp, theme::PopupEdge::Left, |ui| crate::menus::project_items(app, ui));
 }
 
-/// The `...` overflow: every menu the old strip of titles used to hold.
+/// The `...` overflow: every menu the old strip of titles used to hold, as one flat popup.
 ///
 /// The dots are drawn rather than set as text. The interface font is not guaranteed to carry
 /// an ellipsis glyph, and the one control that reaches every menu must not depend on a font
 /// fallback to be visible at all.
 fn overflow_menu(app: &mut App, ui: &mut Ui, p: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-    let mut builder = egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center));
-    builder.sense = Some(egui::Sense::click());
-    let mut over = ui.new_child(builder);
-    {
-        let widgets = &mut over.visuals_mut().widgets;
-        for w in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
-            w.weak_bg_fill = Color32::TRANSPARENT;
-            w.bg_fill = Color32::TRANSPARENT;
-            w.bg_stroke = egui::Stroke::NONE;
-        }
-    }
-    let resp = over
-        .menu_button(RichText::new(" ").size(1.0), |ui| crate::menus::overflow(app, ui))
-        .response;
+    let id = ui.make_persistent_id("overflow_menu");
+    let open = ui.memory(|m| m.is_popup_open(id));
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(theme::TOOLBAR_H, theme::TOOLBAR_H), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Menus"));
-    if resp.hovered() {
+    if resp.hovered() || open {
         ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::CORNER), p.hover);
     }
     theme::paint_overflow(ui.painter(), rect.center(), p.text);
-    resp.on_hover_text("Menus");
+    let resp = resp.on_hover_text("Menus");
+    theme::bar_popup(ui, id, &resp, theme::PopupEdge::Right, |ui| crate::menus::overflow(app, ui));
 }
 
 /// The last component of a path, for naming a project that has no name of its own.
@@ -318,17 +304,8 @@ fn rail_contents(app: &mut App, ui: &mut Ui, p: &Palette, collapsed: bool) {
     }
     // the collapse control sits at the foot of the rail, out of the way of the tools
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
-        let now = app.rail_collapsed;
-        let hint = if now { "Expand the rail" } else { "Collapse the rail to icons" };
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
-        if resp.hovered() {
-            ui.painter().rect_filled(r.shrink2(egui::vec2(3.0, 2.0)), egui::CornerRadius::same(theme::CORNER), p.hover);
-        }
-        let x = if collapsed { r.center().x } else { r.left() + 16.0 };
-        theme::paint_chevrons(ui.painter(), egui::pos2(x, r.center().y), !now, p.disabled);
-        if resp.on_hover_text(hint).clicked() {
-            app.rail_collapsed = !now;
+        if theme::rail_footer_button(ui, p, collapsed).clicked() {
+            app.rail_collapsed = !app.rail_collapsed;
         }
     });
     if let Some(tab) = go {
@@ -1867,4 +1844,148 @@ mod chrome_tests {
             }
         });
     }
+
+    /// Press and release the primary button at `at`, a frame each, with the pointer moved
+    /// there first.
+    fn click_at(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        events(ctx, app, vec![egui::Event::PointerMoved(at)]);
+        events(ctx, app, vec![button(true)]);
+        events(ctx, app, vec![button(false)]);
+    }
+
+    /// Where the widget labelled `want` is drawn inside the command bar (the status bar names
+    /// the project too).
+    fn find_on_bar(ctx: &egui::Context, update: &Option<egui::accesskit::TreeUpdate>, want: &str) -> egui::Rect {
+        let bar = panel_rect(ctx, "command_bar");
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        nodes
+            .iter()
+            .filter(|(_, n)| n.label().as_deref() == Some(want))
+            .filter_map(|(_, n)| n.bounds())
+            .map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32)))
+            .find(|r| bar.contains(r.center()))
+            .unwrap_or_else(|| panic!("no widget labelled {want:?} on the command bar"))
+    }
+
+    fn has(update: &Option<egui::accesskit::TreeUpdate>, want: &str) -> bool {
+        labels(update).iter().any(|l| l == want)
+    }
+
+    /// Both command-bar menus open on a click and only on a click, and close again on a second
+    /// click, a click outside, or Escape. The overflow used to hold its groups as submenus
+    /// that opened on hover, and one could be left open over the work; nothing in either menu
+    /// opens on hover now.
+    #[test]
+    fn the_command_bar_menus_open_on_click_and_close_outside_or_on_escape_matrix() {
+        struct Case {
+            name: &'static str,
+            anchor: &'static str,
+            item: &'static str,
+        }
+        let cases = [
+            Case { name: "overflow", anchor: "Menus", item: "Exit" },
+            Case { name: "project chip", anchor: "Temporary project", item: "Save project" },
+        ];
+        assert_table!(cases, |idx, case| {
+            let what = format!("case #{idx} ({})", case.name);
+            let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+            ctx.enable_accesskit();
+            frame(&ctx, &mut app);
+            let update = frame(&ctx, &mut app);
+            let anchor = find_on_bar(&ctx, &update, case.anchor).center();
+
+            // hovering alone opens nothing
+            events(&ctx, &mut app, vec![egui::Event::PointerMoved(anchor)]);
+            for _ in 0..3 {
+                events(&ctx, &mut app, vec![]);
+            }
+            assert!(!has(&frame(&ctx, &mut app), case.item), "{what}: hovering opened the menu");
+
+            // a click opens it, and a second click on the anchor closes it
+            click_at(&ctx, &mut app, anchor);
+            assert!(has(&frame(&ctx, &mut app), case.item), "{what}: a click opened it");
+            click_at(&ctx, &mut app, anchor);
+            assert!(!has(&frame(&ctx, &mut app), case.item), "{what}: a second click closed it");
+
+            // a click on the work closes it
+            click_at(&ctx, &mut app, anchor);
+            assert!(has(&frame(&ctx, &mut app), case.item), "{what}: reopened");
+            click_at(&ctx, &mut app, egui::pos2(900.0, 700.0));
+            assert!(!has(&frame(&ctx, &mut app), case.item), "{what}: a click outside closed it");
+
+            // and so does Escape
+            click_at(&ctx, &mut app, anchor);
+            assert!(has(&frame(&ctx, &mut app), case.item), "{what}: reopened again");
+            let esc = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+            events(&ctx, &mut app, vec![esc(true), esc(false)]);
+            assert!(!has(&frame(&ctx, &mut app), case.item), "{what}: Escape closed it");
+        });
+    }
+
+    /// The overflow is one level deep: its groups are captions over their items, so every item
+    /// is on show the moment it opens. It repeats nothing the bar already has a control for.
+    #[test]
+    fn the_overflow_is_flat_and_repeats_nothing_on_the_bar() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+        ctx.enable_accesskit();
+        frame(&ctx, &mut app);
+        let closed = labels(&frame(&ctx, &mut app));
+        let anchor = find(&frame(&ctx, &mut app), "Menus").center();
+        click_at(&ctx, &mut app, anchor);
+        let open = labels(&frame(&ctx, &mut app));
+        // items of every group, without hovering anything
+        for want in ["Start attack", "Follow redirections", "Keyboard shortcuts", "Exit"] {
+            assert!(open.iter().any(|l| l == want), "{want:?} shows as soon as the menu opens: {open:?}");
+        }
+        // the bar's own controls each appear once, open or not
+        for bar_control in ["Settings", "Open browser", "Search or run a command"] {
+            let count = |seen: &[String]| seen.iter().filter(|l| *l == bar_control).count();
+            assert_eq!(count(&open), count(&closed), "the overflow repeats {bar_control:?}");
+        }
+        // and the project's items belong to the project chip alone
+        assert!(!open.iter().any(|l| l == "Save project"), "the overflow repeats the Project menu");
+    }
+
+    /// The command bar's controls share its centreline: the project chip, the search pill and
+    /// the buttons at the right are each one toolbar height, centred on the bar.
+    #[test]
+    fn the_command_bar_controls_share_one_centreline() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+        ctx.enable_accesskit();
+        frame(&ctx, &mut app);
+        let update = frame(&ctx, &mut app);
+        let bar = panel_rect(&ctx, "command_bar");
+        for want in ["Temporary project", "Search or run a command", "Open browser", "Settings", "Menus"] {
+            let r = find_on_bar(&ctx, &update, want);
+            assert!(
+                (r.center().y - bar.center().y).abs() < 0.75,
+                "{want:?} is centred on the bar ({:.1} against {:.1})",
+                r.center().y,
+                bar.center().y
+            );
+            assert!(
+                (r.height() - crate::theme::TOOLBAR_H).abs() < 0.5,
+                "{want:?} is one toolbar height: {:.1}",
+                r.height()
+            );
+        }
+    }
+
+    /// The control at the foot of the rail spans the rail's width, so the whole footer is a
+    /// target and not just the chevrons in it.
+    #[test]
+    fn the_rail_footer_spans_the_rail() {
+        let (ctx, mut app) = MockAppBuilder::new().with_tab(Tab::Proxy).build_with_ctx();
+        ctx.enable_accesskit();
+        frame(&ctx, &mut app);
+        let update = frame(&ctx, &mut app);
+        let rail = panel_rect(&ctx, "rail");
+        let footer = find(&update, "Collapse the rail to icons");
+        assert!((footer.width() - rail.width()).abs() < 0.5, "footer {footer:?} against rail {rail:?}");
+        assert!(rail.bottom() - footer.bottom() < 8.0, "and it sits at the foot: {footer:?} in {rail:?}");
+        click_at(&ctx, &mut app, footer.center());
+        assert!(app.rail_collapsed, "clicking it collapses the rail");
+    }
+
 }

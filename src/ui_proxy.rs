@@ -110,9 +110,18 @@ fn intercept(app: &mut App, ui: &mut Ui, p: &Palette) {
     sync_held(app);
     egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
         ui.horizontal(|ui| {
+            // every control in the row -- buttons, the checkbox, the Inspector toggle -- is one
+            // toolbar height, so they share a top, a bottom and a centreline
+            ui.spacing_mut().interact_size.y = theme::TOOLBAR_H;
+            // the bold labels' line box plus the default padding would come to a pixel over
+            ui.spacing_mut().button_padding.y = 3.0;
             let on = app.proxy.intercept.load(Ordering::SeqCst);
             let (txt, col, tc) = if on { ("Intercept on", p.accent, p.accent_text) } else { ("Intercept off", p.header, p.text) };
-            if ui.add(egui::Button::new(bold(txt, 12.5).color(tc)).fill(col).min_size(egui::vec2(0.0, 22.0))).clicked() {
+            let toggle = egui::Button::new(bold(txt, theme::FONT_UI).color(tc))
+                .fill(col)
+                .corner_radius(egui::CornerRadius::same(p.corner))
+                .min_size(egui::vec2(0.0, theme::TOOLBAR_H));
+            if ui.add(toggle).clicked() {
                 toggle_intercept(app);
             }
             if theme::plain_button(ui, p, "Forward", held_count > 0).clicked() { forward(app); }
@@ -137,7 +146,7 @@ fn intercept(app: &mut App, ui: &mut Ui, p: &Palette) {
                     // so it can never run over Forward, Drop or Only in scope
                     let room = (ui.available_width() - 8.0).clamp(0.0, 320.0);
                     if room > 40.0 {
-                        ui.allocate_ui_with_layout(egui::vec2(room, 22.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(room, theme::TOOLBAR_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add(egui::Label::new(RichText::new(&app.proxy_msg).size(12.0).color(p.disabled)).truncate())
                                 .on_hover_text(&app.proxy_msg);
                         });
@@ -796,4 +805,27 @@ mod tests {
         assert!(app.history_filter.is_default_filter());
         assert_eq!(app.history_filter.sort_column, Some(crate::history::HistorySortColumn::Length), "Reset keeps the sort");
     }
+
+    /// The Intercept toolbar's controls are one toolbar height and share a centreline, so the
+    /// buttons and the checkbox line up along the top and the bottom alike.
+    #[test]
+    fn the_intercept_toolbar_controls_share_one_height_and_centreline() {
+        let (ctx, mut app) = intercept_app();
+        let _rx = hold(&app, "/cart");
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let nodes = &update.as_ref().expect("accesskit output").nodes;
+        let rect = |label: &str| {
+            let r = nodes.iter().find(|(_, n)| n.label() == Some(label)).and_then(|(_, n)| n.bounds())
+                .unwrap_or_else(|| panic!("no widget labelled {label:?}"));
+            egui::Rect::from_min_max(egui::pos2(r.x0 as f32, r.y0 as f32), egui::pos2(r.x1 as f32, r.y1 as f32))
+        };
+        let first = rect("Intercept on");
+        for label in ["Intercept on", "Forward", "Drop", "Only in scope"] {
+            let r = rect(label);
+            assert!((r.height() - theme::TOOLBAR_H).abs() < 0.5, "{label:?} is one toolbar height: {:.1}", r.height());
+            assert!((r.center().y - first.center().y).abs() < 0.5, "{label:?} shares the row's centreline");
+        }
+    }
+
 }
