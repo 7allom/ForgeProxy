@@ -201,6 +201,14 @@ pub fn inspector_panel(ui: &mut Ui, p: &Palette, state: &mut InspectorState, id:
                 if let Some(body) = &req.body {
                     rows.section(ui, "Body Parameters", "Body", body, true);
                 }
+                // a GraphQL request's whole document arrives as one escaped string in a body
+                // parameter called "query": listed on its own, it can be read as what it is
+                // capped like everything else parsed here: this runs every frame, and a
+                // recorded request can be tens of megabytes
+                let graphql = crate::graphql::inspector_rows(crate::editor::capped(request, crate::editor::DISPLAY_LIMIT));
+                if !graphql.is_empty() {
+                    rows.section(ui, "GraphQL", "GraphQL", &graphql, true);
+                }
                 let set_cookies: Vec<SetCookie> = res.as_ref().map(|r| r.headers.iter()
                     .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
                     .filter_map(|(_, v)| parse_set_cookie_full(v)).collect()).unwrap_or_default();
@@ -537,7 +545,7 @@ mod ui_tests {
         app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: "/".into(),
             status: "200 OK".into(), length: response.len(), mime: "application/octet-stream".into(),
-            request: request.into(), response: response.into(), url: "http://shop.test/".into(), truncated: false, time: 0, elapsed_ms: 0,
+            request: request.into(), response: response.into(), url: "http://shop.test/".into(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new(),
         }));
         app.history_sel = Some(1);
         (ctx, app)
@@ -579,6 +587,23 @@ mod ui_tests {
             assert_eq!(app.inspector.show_inspector, shown);
             all_modes(&ctx, &mut app);
         }
+    }
+
+    /// A GraphQL request's envelope is one JSON body parameter called "query" holding the
+    /// whole document as an escaped string. The Inspector lists the operation and the
+    /// variables separately, so they can be read and picked up without unescaping anything.
+    #[test]
+    fn the_inspector_lists_a_graphql_operation_and_its_variables() {
+        let request = "POST /graphql HTTP/1.1\nHost: shop.test\nContent-Type: application/json\n\n                       {\"query\":\"mutation Pay($amount: Int!) { pay }\",\"variables\":{\"amount\":500}}";
+        let (ctx, mut app) = app_on_history(request, "HTTP/1.1 200 OK\n\nok");
+        app.inspector.show_inspector = true;
+        frame(&ctx, &mut app, vec![]);
+        let update = frame(&ctx, &mut app, vec![]);
+        let nodes = &update.expect("accesskit").nodes;
+        let has = |text: &str| nodes.iter().any(|(_, n)| n.label() == Some(text) || n.value() == Some(text));
+        assert!(has("GraphQL (2)"), "the section is there, with the operation and the one variable");
+        assert!(has("mutation Pay"), "the operation reads as itself");
+        assert!(has("500"), "and so does the variable");
     }
 
     #[test]

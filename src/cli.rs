@@ -983,6 +983,7 @@ fn append_history(file: &mut crate::project::ProjectFile, entries: Vec<crate::ht
 /// One exchange as a history entry, for keeping in a project.
 fn entry_of(tool: &str, method: &str, url: &str, request: String, r: &crate::http::SendResult) -> crate::http::HttpEntry {
     let (host, path) = crate::http::split_url(url);
+    let graphql = crate::graphql::operation_label(&request);
     crate::http::HttpEntry {
         id: 0,
         tool: tool.into(),
@@ -998,6 +999,7 @@ fn entry_of(tool: &str, method: &str, url: &str, request: String, r: &crate::htt
         truncated: false,
         time: crate::http::now_ms(),
         elapsed_ms: 0,
+        graphql,
     }
 }
 

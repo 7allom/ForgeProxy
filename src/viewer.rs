@@ -3,6 +3,7 @@
 //! text; the message itself is never changed.
 
 use crate::theme::Palette;
+use serde::Deserialize;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId};
 
@@ -13,13 +14,37 @@ pub enum MessageViewMode {
     Raw,
     Pretty,
     Hex,
+    /// A GraphQL request as it reads: the document re-indented, the variables under it.
+    GraphQl,
 }
 
 impl MessageViewMode {
-    pub const ALL: [MessageViewMode; 3] = [MessageViewMode::Raw, MessageViewMode::Pretty, MessageViewMode::Hex];
+    pub const ALL: [MessageViewMode; 4] =
+        [MessageViewMode::Raw, MessageViewMode::Pretty, MessageViewMode::Hex, MessageViewMode::GraphQl];
     pub fn label(self) -> &'static str {
-        match self { MessageViewMode::Raw => "Raw", MessageViewMode::Pretty => "Pretty", MessageViewMode::Hex => "Hex" }
+        match self {
+            MessageViewMode::Raw => "Raw",
+            MessageViewMode::Pretty => "Pretty",
+            MessageViewMode::Hex => "Hex",
+            MessageViewMode::GraphQl => "GraphQL",
+        }
     }
+}
+
+/// A view mode from a settings or project file, falling back to the default rather than
+/// failing the whole file when it names one this build does not have.
+///
+/// This guards the direction that matters, which is a newer file opened here. The other way
+/// round is not guarded and is not meant to be: a build older than the GraphQL view refuses
+/// the whole file rather than the one field, so a settings file or project saved after that
+/// view has been chosen will not open in one. Writing a value back that the pane was not set
+/// to would hide the choice instead of the file, which is the worse of the two.
+///
+/// Settings and projects both carry a mode, and a file written by a later build may name a
+/// view that was added after this one. Refusing it would cost the reader every other setting
+/// in the file; opening on the default costs them the one pane's choice.
+pub fn de_view_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<MessageViewMode, D::Error> {
+    Ok(MessageViewMode::deserialize(d).unwrap_or_default())
 }
 
 /// What a message's body was recognised as by `pretty_message`.
@@ -354,6 +379,24 @@ mod tests {
                 assert_eq!(out, raw.replace("\r\n", "\n"), "case #{idx} ({what}): left as it came");
             }
         });
+    }
+
+    /// A settings or project file written by a later build may name a view this one has not
+    /// got. Opening on the default costs the reader one pane's choice; refusing the file would
+    /// cost them everything else in it.
+    #[test]
+    fn a_view_mode_this_build_does_not_know_opens_on_the_default() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            #[serde(default, deserialize_with = "super::de_view_mode")]
+            view_mode: MessageViewMode,
+        }
+        let later: Holder = serde_json::from_str(r#"{"view_mode":"SomethingLater"}"#)
+            .expect("a view this build has not got is not a reason to refuse the file");
+        assert_eq!(later.view_mode, MessageViewMode::default());
+
+        let known: Holder = serde_json::from_str(r#"{"view_mode":"GraphQl"}"#).expect("and a known one still reads");
+        assert_eq!(known.view_mode, MessageViewMode::GraphQl);
     }
 
     #[test]

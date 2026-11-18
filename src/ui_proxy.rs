@@ -529,7 +529,7 @@ mod filter_tests {
     fn entry(url: &str, status: &str) -> HttpEntry {
         let (host, path) = crate::http::split_url(url);
         HttpEntry { id: 0, tool: "Proxy".into(), method: "GET".into(), host, path, status: status.into(), length: 0,
-            mime: "text/html".into(), request: String::new(), response: String::new(), url: url.into(), truncated: false, time: 0, elapsed_ms: 0 }
+            mime: "text/html".into(), request: String::new(), response: String::new(), url: url.into(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new() }
     }
 
     #[test]
@@ -792,6 +792,30 @@ mod tests {
         Some(egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32))
     }
 
+    /// Every GraphQL request is the same method on the same path. The Operation column is what
+    /// tells them apart, so it has to be in the header and has to sort like the rest.
+    #[test]
+    fn the_history_table_sorts_by_operation() {
+        let (ctx, mut app) = intercept_app();
+        app.proxy_sub = 1; // HTTP history
+        for (id, op) in [(1, "query Me"), (2, "mutation SignIn")] {
+            app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
+                id, tool: "Proxy".into(), method: "POST".into(), url: "http://shop.test/graphql".into(),
+                host: "shop.test".into(), path: "/graphql".into(), status: "200 OK".into(), length: 0,
+                mime: "application/json".into(), request: String::new(), response: String::new(),
+                truncated: false, time: id as u64 * 1000, elapsed_ms: 0, graphql: op.into(),
+            }));
+        }
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+
+        click(&ctx, &mut app, "Operation");
+        assert_eq!(
+            (app.history_filter.sort_column, app.history_filter.sort_ascending),
+            (Some(crate::history::HistorySortColumn::Operation), true),
+        );
+    }
+
     #[test]
     fn ribbon_and_sortable_headers() {
         let (ctx, mut app) = intercept_app();
@@ -800,7 +824,7 @@ mod tests {
             let (host, path) = ("shop.test".to_string(), path.to_string());
             app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
                 id, tool: "Proxy".into(), method: "GET".into(), url: format!("http://{host}{path}"), host, path, status: status.into(), length,
-                mime: "HTML".into(), request: String::new(), response: String::new(), truncated: false, time: id as u64 * 1000, elapsed_ms: 0,
+                mime: "HTML".into(), request: String::new(), response: String::new(), truncated: false, time: id as u64 * 1000, elapsed_ms: 0, graphql: String::new(),
             }));
         }
         frame(&ctx, &mut app, vec![]);

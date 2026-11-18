@@ -258,6 +258,7 @@ impl HttpFixture {
         let req = self.raw_request();
         let resp = self.raw_response();
         let host = self.authority();
+        let graphql = crate::graphql::operation_label(&req);
         HttpEntry {
             id,
             tool: tool.into(),
@@ -273,6 +274,7 @@ impl HttpFixture {
             truncated: false,
             time: 0,
             elapsed_ms: 0,
+            graphql,
         }
     }
 }

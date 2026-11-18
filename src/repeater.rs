@@ -18,7 +18,7 @@ pub struct RepeaterTab {
     pub response_status: Option<u16>,
     pub response_time_ms: Option<u128>,
     pub response_bytes: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::viewer::de_view_mode")]
     pub view_mode: MessageViewMode,
     /// Status line text shown above the response ("200 OK", "Sending...", an error).
     #[serde(default)]
@@ -301,7 +301,7 @@ mod tests {
         let e = crate::http::HttpEntry {
             id: 7, tool: "Proxy".into(), method: "GET".into(), host: "a.test".into(), path: "/x".into(), status: "200 OK".into(),
             length: 0, mime: String::new(), request: "GET /x HTTP/1.1\nHost: a.test\n\n".into(), response: String::new(),
-            url: "http://a.test/x".into(), truncated: false, time: 0, elapsed_ms: 0,
+            url: "http://a.test/x".into(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new(),
         };
         crate::actions::send_to(&mut app, &e, crate::actions::SendTo::Repeater);
         assert_eq!((titles(&app), app.active_repeater_tab), (vec!["1", "2", "3"], 2));

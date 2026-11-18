@@ -712,6 +712,7 @@ pub fn run_scan(
             truncated: false,
             time: crate::http::now_ms(),
             elapsed_ms: 0,
+            graphql: String::new(),
         });
     };
 

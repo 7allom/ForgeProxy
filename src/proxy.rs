@@ -693,6 +693,7 @@ fn tunnel(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, targe
                 time: crate::http::now_ms(),
                 // the connection failed: there was nothing to time
                 elapsed_ms: 0,
+                graphql: String::new(),
             });
             return;
         }
@@ -715,6 +716,7 @@ fn tunnel(sh: Shared, reader: BufReader<TcpStream>, mut client: TcpStream, targe
         time: crate::http::now_ms(),
         // the tunnel stays open after this: what it carries is not one exchange to time
         elapsed_ms: 0,
+        graphql: String::new(),
     });
     let (Ok(mut up_r), Ok(mut up_w)) = (upstream.try_clone(), upstream.try_clone()) else { return };
     let mut client_r = reader.into_inner();
@@ -984,6 +986,9 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
     };
     // the whole exchange with the target, up to the last byte of the response the proxy read
     let elapsed_ms = sent_at.elapsed().as_millis() as u64;
+    // worked out here, with the request as it was finally sent, so the table can filter and
+    // sort on it without re-reading every body each frame
+    let graphql = crate::graphql::operation_label(&raw);
     sh.recorder().record(|id| HttpEntry {
         id,
         tool: "Proxy".into(),
@@ -1001,6 +1006,7 @@ fn exchange<S: Read + Write>(sh: &Shared, io: &mut BufReader<S>, head: &str, lat
         truncated,
         time: crate::http::now_ms(),
         elapsed_ms,
+        graphql,
     });
     // a streamed response ended the connection (it had no length to frame it by)
     written && !truncated

@@ -250,7 +250,15 @@ pub fn reset(app: &mut App) {
 pub fn apply_all(app: &mut App, f: ProjectFile) {
     apply_settings(app, &f);
     app.project_name = f.name;
-    *app.history.lock().unwrap_or_else(|e| e.into_inner()) = f.history.into_iter().map(std::sync::Arc::new).collect();
+    // a project saved before operations were kept holds the requests but not the operations;
+    // reading them back off the requests here is what stops the column opening blank
+    let history = f.history.into_iter().map(|mut e| {
+        if e.graphql.is_empty() {
+            e.graphql = crate::graphql::operation_label(&e.request);
+        }
+        std::sync::Arc::new(e)
+    });
+    *app.history.lock().unwrap_or_else(|e| e.into_inner()) = history.collect();
     let max_id = app.history.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.id).max().unwrap_or(0);
     *app.next_id.lock().unwrap_or_else(|e| e.into_inner()) = max_id;
     if !f.tasks.is_empty() {
@@ -632,6 +640,7 @@ mod tests {
         app.history.lock().unwrap().push(std::sync::Arc::new(crate::http::HttpEntry {
             id: 1, tool: "Proxy".into(), method: "GET".into(), host: "h".into(), path: "/".into(), status: "200 OK".into(),
             length: 0, mime: String::new(), request: String::new(), response: String::new(), url: String::new(), truncated: false, time: 0, elapsed_ms: 0,
+            graphql: String::new(),
         }));
         *app.next_id.lock().unwrap() = 1;
         app.target_scope.add("https://shop.test");
@@ -679,6 +688,7 @@ mod tests {
             truncated: false,
             time: 1_700_000_000,
             elapsed_ms: 12,
+            graphql: String::new(),
         };
 
         // the store is behind a lock, so filling it needs no mutable borrow of the app
@@ -731,6 +741,33 @@ mod tests {
         assert_eq!((e.id, e.tool.as_str(), e.host.as_str()), (9, "Proxy", "h.test"));
         assert!(e.url.is_empty(), "with no address recorded");
         assert_eq!((e.truncated, e.time, e.elapsed_ms), (false, 0, 0));
+    }
+
+    /// A project captured before operations were worked out holds the requests but not the
+    /// operations. Reading them back off the requests on load is what stops an old project
+    /// opening with an Operation column that is blank all the way down.
+    #[test]
+    fn an_older_projects_graphql_operations_are_filled_in_on_load() {
+        let request = "POST /graphql HTTP/1.1\nHost: shop.test\nContent-Type: application/json\n\n                       {\"query\":\"mutation SignIn { signIn { token } }\"}";
+        let old = format!(
+            r#"{{"version":1,"name":"o","match_replace":[],"tasks":[],"organizer":[],
+               "history":[{{"id":4,"tool":"Proxy","method":"POST","host":"shop.test","path":"/graphql",
+                           "status":"200 OK","length":2,"mime":"application/json",
+                           "request":{request},"response":"HTTP/1.1 200 OK\n\nok"}}],
+               "repeater_url":"","repeater_request":"","intruder_target":"","intruder_template":"",
+               "intruder_payloads":"","intruder_payloads_b":"","interactor_server":""}}"#,
+            request = serde_json::to_string(request).expect("the request encodes"),
+        );
+        let f: ProjectFile = serde_json::from_str(&old).expect("an older project file still reads");
+        assert!(f.history[0].graphql.is_empty(), "the file itself carries no operation");
+
+        let ctx = eframe::egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(&cc, Some("/dev/null".into()), None, false);
+        apply_all(&mut app, f);
+
+        let kept = app.history.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(kept[0].graphql, "mutation SignIn", "and the load works it out from the request");
     }
 
     /// A project saved while the app still had a separate browsing view opens unchanged. That

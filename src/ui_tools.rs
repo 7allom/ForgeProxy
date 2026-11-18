@@ -2357,7 +2357,8 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
             theme::fitted_table(ui, p, ("traffic_table", view as u8), table_h, &HISTORY_COLS, |ui, w| {
                 use crate::history::HistorySortColumn as C;
                 let cols: &[(&str, f32, C)] = &[("#", w[0], C::Id), ("Time", w[1], C::Time), ("Tool", w[2], C::Tool), ("Method", w[3], C::Method), ("Host", w[4], C::Host),
-                    ("Path", w[5], C::Path), ("Status code", w[6], C::Status), ("Length", w[7], C::Length), ("MIME type", w[8], C::Mime)];
+                    ("Path", w[5], C::Path), ("Operation", w[6], C::Operation), ("Status code", w[7], C::Status),
+                    ("Length", w[8], C::Length), ("MIME type", w[9], C::Mime)];
                 if let Some(col) = theme::sort_header(ui, p, cols, app.history_filter.sort_column, app.history_filter.sort_ascending) {
                     app.history_filter.click_column(col);
                 }
@@ -2371,9 +2372,10 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
                             (e.method.clone(), w[3], Some(method_color(p, &e.method))),
                             (e.host.clone(), w[4], None),
                             (e.path.clone(), w[5], None),
-                            (e.status.clone(), w[6], Some(crate::ui_core::status_color(p, &e.status))),
-                            (e.length.to_string(), w[7], None),
-                            (e.mime.clone(), w[8], None),
+                            (e.graphql.clone(), w[6], Some(p.badge_info)),
+                            (e.status.clone(), w[7], Some(crate::ui_core::status_color(p, &e.status))),
+                            (e.length.to_string(), w[8], None),
+                            (e.mime.clone(), w[9], None),
                         ];
                         let row = theme::table_row(ui, p, &cells, sel_id == Some(e.id), i % 2 == 1);
                         if row.clicked() { clicked = Some(e.id); }
@@ -2395,12 +2397,14 @@ pub fn traffic_view(app: &mut App, ui: &mut Ui, p: &Palette, view: View) {
 }
 
 /// HTTP history columns, as (minimum width, share of the spare width): #, Time, Tool, Method,
-/// Host, Path, Status code, Length, MIME type. Path takes all of the slack, so the row reaches
-/// the right edge instead of stopping short of it and leaving the MIME column marooned in blank
-/// space; below the minimums the table scrolls sideways rather than cutting the last column off.
-/// Status code is wide enough for "405 Method Not Allowed", as in the Intruder results table.
-const HISTORY_COLS: [(f32, f32); 9] = [(50.0, 0.0), (72.0, 0.0), (80.0, 0.0), (70.0, 0.0), (200.0, 0.0),
-    (220.0, 1.0), (170.0, 0.0), (80.0, 0.0), (150.0, 0.0)];
+/// Host, Path, Operation, Status code, Length, MIME type. Path takes all of the slack, so the
+/// row reaches the right edge instead of stopping short of it and leaving the MIME column
+/// marooned in blank space; below the minimums the table scrolls sideways rather than cutting
+/// the last column off. Status code is wide enough for "405 Method Not Allowed", as in the
+/// Intruder results table. Operation sits next to the path it belongs to, and is blank for
+/// every request that carries none.
+const HISTORY_COLS: [(f32, f32); 10] = [(50.0, 0.0), (72.0, 0.0), (80.0, 0.0), (70.0, 0.0), (180.0, 0.0),
+    (150.0, 1.0), (130.0, 0.0), (170.0, 0.0), (80.0, 0.0), (150.0, 0.0)];
 
 
 /// Carry out a message editor's right-click choice. `what` names the message for a
@@ -3013,7 +3017,7 @@ mod sort_header_tests {
     /// are checked against the same phrases.
     #[test]
     fn standard_status_phrases_fit_the_status_column() {
-        let width = COLS[2].1.min(HISTORY_COLS[6].0).min(crate::ui_target::SITE_MAP_COLS[5].0) - 8.0;
+        let width = COLS[2].1.min(HISTORY_COLS[7].0).min(crate::ui_target::SITE_MAP_COLS[6].0) - 8.0;
         let ctx = egui::Context::default();
         // fonts installed by a pass of their own: a new set only takes effect the pass after
         let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));
@@ -3027,11 +3031,28 @@ mod sort_header_tests {
         });
     }
 
+    /// A table whose column minimums come to more than the width the app hands it scrolls
+    /// sideways, and the scrollbar it grows lands on the splitter below it, which then cannot
+    /// be grabbed. Both tables are measured at the default window: HTTP history gets 1162px
+    /// and the site map 962px, so their minimums have to stay under those.
+    #[test]
+    fn both_traffic_tables_fit_the_width_they_are_given() {
+        // the well's own padding, as `theme::fitted_table` counts it
+        const PADDING: f32 = 12.0;
+        for (what, cols, budget) in [
+            ("HTTP history", HISTORY_COLS.as_slice(), 1162.0),
+            ("the site map", crate::ui_target::SITE_MAP_COLS.as_slice(), 962.0),
+        ] {
+            let total: f32 = cols.iter().map(|c| c.0).sum::<f32>() + PADDING;
+            assert!(total <= budget, "{what}: columns need {total:.0}px of a {budget:.0}px table");
+        }
+    }
+
     /// The last column has no slack to grow into, so it carries its own room: "application/
     /// javascript" has to read in full rather than stopping mid-word at the table's edge.
     #[test]
     fn common_mime_types_fit_the_last_history_column() {
-        let width = HISTORY_COLS[8].0 - 8.0;
+        let width = HISTORY_COLS[9].0 - 8.0;
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| crate::theme::install_fonts(ctx));
         let _ = ctx.run(egui::RawInput::default(), |ctx| {

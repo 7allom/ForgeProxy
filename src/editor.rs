@@ -404,6 +404,7 @@ fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMod
                         MessageViewMode::Raw => "The message as received",
                         MessageViewMode::Pretty => "JSON re-indented and coloured; XML and HTML tags indented",
                         MessageViewMode::Hex => "Every byte, 16 per row, with an ASCII column",
+                        MessageViewMode::GraphQl => "A GraphQL operation's document re-indented, with its variables",
                     };
                     if ui
                         .add(
@@ -456,6 +457,19 @@ impl egui::cache::ComputerMut<(&str,), (String, crate::viewer::BodyKind)> for Pr
 /// Pretty renderings, computed once per message rather than every frame.
 type PrettyCache = egui::cache::FrameCache<(String, crate::viewer::BodyKind), PrettyComputer>;
 
+#[derive(Default)]
+struct GraphQlComputer;
+
+impl egui::cache::ComputerMut<(&str,), Option<String>> for GraphQlComputer {
+    fn compute(&mut self, (s,): (&str,)) -> Option<String> {
+        crate::graphql::formatted(s)
+    }
+}
+
+/// GraphQL renderings, on the same footing as the Pretty ones: worked out once per message
+/// rather than once per frame, because a table of them is redrawn continuously.
+type GraphQlCache = egui::cache::FrameCache<Option<String>, GraphQlComputer>;
+
 /// "Large message" note with its "Show full message" button; true when the whole message
 /// should be shown (it's under `limit`, or the button was pressed for this message).
 fn large_note(ui: &mut Ui, p: &Palette, id: &str, full_len: usize, limit: usize) -> bool {
@@ -491,6 +505,24 @@ pub fn message_view(ui: &mut Ui, p: &Palette, id: &str, text: &str, min_height: 
             let (pretty, kind) = ui.ctx().memory_mut(|m| m.caches.cache::<PrettyCache>().get((src,)));
             let out = show_text(ui, p, &wid, Buffer::View(&pretty), Style::Pretty(kind), min_height);
             MessageView { out, shown: Some(pretty) }
+        }
+        MessageViewMode::GraphQl => {
+            // a message carrying no GraphQL has nothing of its own to show, so it falls back
+            // to Pretty rather than leaving the pane blank
+            let cap = display_limit(ui.ctx());
+            let full = large_note(ui, p, &wid, text.len(), cap);
+            let src = if full { text } else { capped(text, cap) };
+            match ui.ctx().memory_mut(|m| m.caches.cache::<GraphQlCache>().get((src,))) {
+                Some(doc) => {
+                    let out = show_text(ui, p, &wid, Buffer::View(&doc), Style::Pretty(crate::viewer::BodyKind::Other), min_height);
+                    MessageView { out, shown: Some(doc) }
+                }
+                None => {
+                    let (pretty, kind) = ui.ctx().memory_mut(|m| m.caches.cache::<PrettyCache>().get((src,)));
+                    let out = show_text(ui, p, &wid, Buffer::View(&pretty), Style::Pretty(kind), min_height);
+                    MessageView { out, shown: Some(pretty) }
+                }
+            }
         }
         MessageViewMode::Hex => {
             let full = large_note(ui, p, &wid, text.len(), crate::viewer::HEX_LIMIT);
@@ -609,6 +641,27 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
 #[cfg(test)]
 mod tests {
     use crate::test_utils::assert_table;
+
+    /// The GraphQL view shows the operation's document re-indented, not the escaped JSON
+    /// string the request actually carries.
+    #[test]
+    fn the_graphql_view_shows_the_document_not_the_envelope() {
+        let raw = "POST /graphql HTTP/1.1\nHost: shop.test\nContent-Type: application/json\n\n                   {\"query\":\"mutation Pay { pay }\"}";
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut shown = String::new();
+        let _ = ctx.run(input, |ctx| {
+            super::set_view_mode(ctx, "gql_test", super::MessageViewMode::GraphQl);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let view = super::message_view(ui, &crate::theme::DARK_WORKSTATION, "gql_test", raw, 300.0);
+                shown = view.shown_text(raw).to_string();
+            });
+        });
+        assert_eq!(shown, "mutation Pay {\n  pay\n}", "the view shows the document");
+    }
 
     /// Lay out one message in a pane far narrower than it, and count the rows the editor
     /// produced. Wrapping would turn a long line into many rows (and put the text out of step

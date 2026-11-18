@@ -425,6 +425,7 @@ pub fn record_bg_full(
     r: &http::SendResult,
 ) -> usize {
     let (host, path) = http::split_url(url);
+    let graphql = crate::graphql::operation_label(&request);
     rec.record(|id| HttpEntry {
         id,
         tool: tool.into(),
@@ -442,6 +443,7 @@ pub fn record_bg_full(
         truncated: false,
         time: http::now_ms(),
         elapsed_ms: elapsed.as_millis() as u64,
+        graphql,
     })
     .unwrap_or(0)
 }
@@ -1899,7 +1901,7 @@ mod tests {
             status: "200 OK".into(), length: 2, mime: "text/html".into(),
             request: "GET /cart HTTP/1.1\r\nHost: shop.test\r\n\r\n".into(),
             response: "HTTP/1.1 200 OK\r\n\r\nok".into(),
-            url: "http://shop.test/cart".into(), truncated: false, time: 0, elapsed_ms: 0,
+            url: "http://shop.test/cart".into(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new(),
         };
         // routed by index; the work happens on a thread, so what is checked here is that the
         // dispatch accepts it and leaves the app alone (no tab change, nothing recorded)

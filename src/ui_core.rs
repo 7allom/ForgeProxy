@@ -1741,6 +1741,7 @@ mod chrome_tests {
                 truncated: false,
                 time: 0,
                 elapsed_ms: 1,
+                graphql: String::new(),
             }));
         }
         *app.next_id.lock().unwrap() = 3;

@@ -11,6 +11,7 @@ mod comparer;
 mod decoder_ops;
 mod editor;
 mod export;
+mod graphql;
 mod http;
 mod intruder;
 mod organizer;

@@ -174,11 +174,12 @@ fn filter_bar(app: &mut App, ui: &mut Ui, p: &Palette) {
 }
 
 /// Site map request columns, as (minimum width, share of the spare width): #, Time, Method,
-/// Host, Path, Status code, Length. Path takes the slack; below these minimums the table
-/// scrolls sideways instead of cutting the last columns off. Status code is as wide as it is
-/// in HTTP history, so "405 Method Not Allowed" reads in full.
-pub(crate) const SITE_MAP_COLS: [(f32, f32); 7] = [(50.0, 0.0), (72.0, 0.0), (70.0, 0.0),
-    (180.0, 0.0), (280.0, 1.0), (170.0, 0.0), (80.0, 0.0)];
+/// Host, Path, Operation, Status code, Length. Path takes the slack; below these minimums the
+/// table scrolls sideways instead of cutting the last columns off. Status code is as wide as it
+/// is in HTTP history, so "405 Method Not Allowed" reads in full, and Operation is as wide as
+/// it is there too.
+pub(crate) const SITE_MAP_COLS: [(f32, f32); 8] = [(50.0, 0.0), (72.0, 0.0), (70.0, 0.0),
+    (170.0, 0.0), (200.0, 1.0), (130.0, 0.0), (170.0, 0.0), (80.0, 0.0)];
 
 pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
     let all = app.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -320,7 +321,8 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
             let table_h = ui.available_height().max(0.0);
             theme::fitted_table(ui, p, "site_map_table", table_h, &SITE_MAP_COLS, |ui, w| {
                 use crate::history::time_of_day;
-                theme::table_header(ui, p, &[("#", w[0]), ("Time", w[1]), ("Method", w[2]), ("Host", w[3]), ("Path", w[4]), ("Status code", w[5]), ("Length", w[6])]);
+                theme::table_header(ui, p, &[("#", w[0]), ("Time", w[1]), ("Method", w[2]), ("Host", w[3]), ("Path", w[4]),
+                    ("Operation", w[5]), ("Status code", w[6]), ("Length", w[7])]);
                 let sel = app.target_selected_history_id;
                 let mut clicked = None;
                 egui::ScrollArea::vertical().id_salt("site_map_rows").show_rows(ui, 19.0, rows.len(), |ui, range| {
@@ -331,8 +333,9 @@ pub fn site_map(app: &mut App, ui: &mut Ui, p: &Palette) {
                             (e.method.clone(), w[2], Some(method_color(p, &e.method))),
                             (e.host.clone(), w[3], None),
                             (e.path.clone(), w[4], None),
-                            (e.status.clone(), w[5], None),
-                            (e.length.to_string(), w[6], None),
+                            (e.graphql.clone(), w[5], Some(p.badge_info)),
+                            (e.status.clone(), w[6], None),
+                            (e.length.to_string(), w[7], None),
                         ];
                         let row = theme::table_row(ui, p, &cells, sel == Some(e.id), i % 2 == 1);
                         if row.clicked() {

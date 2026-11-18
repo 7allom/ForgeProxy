@@ -261,6 +261,7 @@ pub struct UserSettings {
     /// Seconds between polls while the Interactor tab's timer is on.
     pub interactor_poll_secs: u64,
     /// Which way a message pane opens before anyone has switched it.
+    #[serde(default, deserialize_with = "crate::viewer::de_view_mode")]
     pub default_message_view: crate::viewer::MessageViewMode,
     /// The folder the Root CA was last exported to.
     pub ca_export_dir: String,
@@ -1490,7 +1491,7 @@ mod close_tests {
 
     fn entry() -> crate::http::HttpEntry {
         crate::http::HttpEntry { id: 1, tool: "Proxy".into(), method: "GET".into(), host: "a.test".into(), path: "/".into(), status: "200 OK".into(),
-            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: "http://a.test/".into(), truncated: false, time: 0, elapsed_ms: 0 }
+            length: 0, mime: String::new(), request: String::new(), response: String::new(), url: "http://a.test/".into(), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new() }
     }
 
     #[test]

@@ -30,6 +30,12 @@ pub struct HttpEntry {
     /// and those read from a project saved before this was kept.
     #[serde(default)]
     pub elapsed_ms: u64,
+    /// The GraphQL operation the request carries ("mutation SignIn"), or empty when it carries
+    /// none. Worked out once, when the entry is recorded, because the history table filters and
+    /// sorts on it and re-reading every request body each frame would not keep up. Projects
+    /// saved before this have none, and `project::apply_all` fills them in on load.
+    #[serde(default)]
+    pub graphql: String,
 }
 
 /// Now, as Unix time in milliseconds (an `HttpEntry::time`).
@@ -991,7 +997,7 @@ mod client_tests {
         HttpEntry {
             id, tool: "Proxy".into(), method: "GET".into(), host: "shop.test".into(), path: path.into(),
             status: "200 OK".into(), length: 0, mime: String::new(), request: String::new(), response: String::new(),
-            url: format!("http://shop.test{path}"), truncated: false, time: 0, elapsed_ms: 0,
+            url: format!("http://shop.test{path}"), truncated: false, time: 0, elapsed_ms: 0, graphql: String::new(),
         }
     }
 

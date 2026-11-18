@@ -17,6 +17,7 @@ pub enum HistorySortColumn {
     Status,
     Length,
     Mime,
+    Operation,
 }
 
 /// The filter ribbon's settings, and the table's sort order.
@@ -117,7 +118,7 @@ impl HistoryFilter {
         if q.is_empty() {
             return true;
         }
-        let fields = [e.method.as_str(), e.host.as_str(), e.path.as_str(), e.status.as_str(), e.mime.as_str()];
+        let fields = [e.method.as_str(), e.host.as_str(), e.path.as_str(), e.status.as_str(), e.mime.as_str(), e.graphql.as_str()];
         if self.is_regex {
             return match self.search_regex() {
                 Some(re) => fields.iter().any(|f| re.is_match(f)),
@@ -161,6 +162,7 @@ pub fn sort_rows(rows: &mut [Arc<HttpEntry>], col: HistorySortColumn, ascending:
             HistorySortColumn::Path => text(&a.path, &b.path),
             HistorySortColumn::Length => a.length.cmp(&b.length),
             HistorySortColumn::Mime => text(&a.mime, &b.mime),
+            HistorySortColumn::Operation => text(&a.graphql, &b.graphql),
             HistorySortColumn::Status => match (a.status_code(), b.status_code()) {
                 (Some(x), Some(y)) => x.cmp(&y),
                 // no response: always last
@@ -226,6 +228,46 @@ mod tests {
 
     fn ids(rows: &[Arc<HttpEntry>]) -> Vec<usize> {
         rows.iter().map(|e| e.id).collect()
+    }
+
+    /// Every GraphQL request is the same method on the same path, so the operation is the
+    /// only thing in the row that tells one apart from another: the search box has to reach it.
+    #[test]
+    fn the_search_box_matches_an_operation() {
+        let mut e = entry(1, "http://a.test/graphql", "200 OK");
+        e.graphql = "mutation SignIn".into();
+        let rows = [Arc::new(e)];
+        let scope = TargetScope::default();
+
+        let mut f = HistoryFilter::default();
+        f.search_term = "signin".into();
+        assert!(f.matches(&rows[0], &scope, &skip()), "a search matches the operation, whatever its case");
+
+        f.search_term = "mutation".into();
+        assert!(f.matches(&rows[0], &scope, &skip()), "and matches the kind on its own");
+
+        f.search_term = "signup".into();
+        assert!(!f.matches(&rows[0], &scope, &skip()), "and does not match an operation that isn't there");
+    }
+
+    /// Sorting by the operation groups a GraphQL session by what it was doing.
+    #[test]
+    fn rows_sort_by_their_operation() {
+        let labels = ["query Me", "mutation SignIn", "", "query Cart"];
+        let mut rows: Vec<Arc<HttpEntry>> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let mut e = entry(i + 1, "http://a.test/graphql", "200 OK");
+                e.graphql = (*label).into();
+                Arc::new(e)
+            })
+            .collect();
+        sort_rows(&mut rows, HistorySortColumn::Operation, true);
+        assert_eq!(
+            rows.iter().map(|e| e.graphql.as_str()).collect::<Vec<_>>(),
+            ["", "mutation SignIn", "query Cart", "query Me"],
+        );
     }
 
     #[test]
