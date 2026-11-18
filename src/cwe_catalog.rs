@@ -93,7 +93,7 @@ mod tests {
             );
         }
         let w = lookup(scan::SQL_INJECTION.0).expect("SQL injection is explained");
-        assert!(w.name.contains("SQL Injection"), "{}", w.name);
+        assert!(w.name.contains("SQL Command"), "{}", w.name);
         assert!(title(scan::SQL_INJECTION.0).starts_with("CWE-89: "));
         assert!(remediation(scan::SQL_INJECTION.0).is_some());
     }

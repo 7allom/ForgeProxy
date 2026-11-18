@@ -86,7 +86,8 @@ def clean(text):
 
 def common_name(w):
     """The name people actually use ("SQL Injection", "SSRF"), from the alternate terms MITRE
-    marks Common-Name. Releases before 4.21 put it in the title instead and have none here."""
+    marks Common-Name. Only the JSON in MITRE's GitHub repository carries those roles: the
+    live API (CWE 4.21) leaves them off its terms, so there the official title stands alone."""
     for t in w.get("AlternateTerms") or []:
         roles = t.get("Roles") or []
         if isinstance(roles, str):

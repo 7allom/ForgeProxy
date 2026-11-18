@@ -27,15 +27,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: DEBUG alternate terms (temporary)
-        run: |
-          curl -sS https://cwe-api.mitre.org/api/v1/cwe/weakness/89,918 | python3 -c "
-          import json,sys
-          for w in json.load(sys.stdin)['Weaknesses']:
-              print(w['ID'], sorted(w))
-              print(json.dumps(w.get('AlternateTerms'))[:800])
-              print(repr(w.get('Description'))[-300:])"
-
       - name: Fetch from the CWE REST API
         run: python3 tools/update_cwe.py
 
