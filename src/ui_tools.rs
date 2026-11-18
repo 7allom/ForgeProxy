@@ -4,7 +4,9 @@ use crate::actions;
 use crate::decoder_ops;
 use crate::editor;
 use crate::intruder::{self, AttackType};
+use crate::cwe_catalog;
 use crate::issue_defs;
+use crate::scan;
 use crate::state::{App, DecBlock, Tab};
 use crate::theme::{self, bold, EmptyIcon, Palette};
 use crate::ui_core::{c, method_color, sub_tabs};
@@ -373,15 +375,16 @@ fn target_issues(app: &mut App, ui: &mut Ui, p: &Palette) {
             const ISSUE_COLS: [(f32, f32); 3] = [(290.0, 1.0), (110.0, 0.0), (90.0, 0.0)];
             let table_h = ui.available_height().max(0.0);
             theme::fitted_table(ui, p, "issue_defs_table", table_h, &ISSUE_COLS, |ui, w| {
-                theme::table_header(ui, p, &[("Name", w[0]), ("Typical severity", w[1]), ("Type index", w[2])]);
+                theme::table_header(ui, p, &[("Name", w[0]), ("Typical severity", w[1]), ("CWE", w[2])]);
                 egui::ScrollArea::vertical().id_salt("issue_defs_rows").auto_shrink([false, false])
                     .show_rows(ui, theme::ROW_HEIGHT, defs.len(), |ui, range| {
-                        for (i, (idx, name, sev)) in defs.iter().enumerate().skip(range.start).take(range.len()) {
+                        for (i, (cwe, name, sev)) in defs.iter().enumerate().skip(range.start).take(range.len()) {
                             let sel = app.issue_sel == i;
+                            let sev = sev.label();
                             let r = theme::table_row(ui, p, &[
                                 ((*name).into(), w[0], None),
-                                ((*sev).into(), w[1], Some(sev_color(p, sev))),
-                                (format!("0x{idx:08x}"), w[2], None),
+                                (sev.into(), w[1], Some(sev_color(p, sev))),
+                                (scan::cwe_label(*cwe), w[2], None),
                             ], sel, i % 2 == 1);
                             r.widget_info(|| {
                                 egui::WidgetInfo::selected(egui::WidgetType::Button, true, sel, format!("{name} ({sev})"))
@@ -394,25 +397,38 @@ fn target_issues(app: &mut App, ui: &mut Ui, p: &Palette) {
             });
         });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::same(14))).show_inside(ui, |ui| {
-        let (idx, name, sev) = defs[app.issue_sel.min(defs.len() - 1)];
-        ui.label(bold(name, 15.0).color(p.strong));
-        ui.add_space(8.0);
-        ui.label(bold("Description", 13.0).color(p.strong));
-        ui.add(egui::Label::new(RichText::new(describe(name)).color(p.text)).wrap());
-        ui.add_space(10.0);
-        ui.label(bold("Typical severity", 13.0).color(p.strong));
-        ui.colored_label(sev_color(p, sev), sev);
-        ui.add_space(10.0);
-        ui.label(bold("Type index", 13.0).color(p.strong));
-        ui.label(RichText::new(format!("0x{idx:08x}")).color(p.text));
+        let (cwe, name, sev) = defs[app.issue_sel.min(defs.len() - 1)];
+        let sev = sev.label();
+        let weakness = cwe_catalog::lookup(cwe);
+        egui::ScrollArea::vertical().id_salt("issue_def_detail").auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(bold(name, 15.0).color(p.strong));
+            ui.add_space(8.0);
+            ui.label(bold("Typical severity", 13.0).color(p.strong));
+            ui.colored_label(sev_color(p, sev), sev);
+            ui.add_space(10.0);
+            ui.label(bold("Weakness class", 13.0).color(p.strong));
+            match issue_defs::cwe_url(cwe) {
+                Some(url) => { ui.hyperlink_to(cwe_catalog::title(cwe), url); }
+                None => { ui.label(RichText::new(scan::cwe_label(cwe)).color(p.text)); }
+            }
+            if let Some(w) = weakness {
+                ui.add_space(10.0);
+                ui.label(bold("Description", 13.0).color(p.strong));
+                ui.add(egui::Label::new(RichText::new(&w.description).color(p.text)).wrap());
+                if !w.mitigations.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(bold("Remediation", 13.0).color(p.strong));
+                    for m in &w.mitigations {
+                        ui.add(egui::Label::new(RichText::new(format!("• {m}")).color(p.text)).wrap());
+                        ui.add_space(4.0);
+                    }
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new(format!("From MITRE CWE {}. CWE is a trademark of The MITRE Corporation.", cwe_catalog::version()))
+                    .size(11.0).color(p.disabled));
+            }
+        });
     });
-}
-
-fn describe(name: &str) -> String {
-    format!("This issue type covers {}. The scanner reports it when the relevant conditions are \
-             observed in a response or confirmed by an active check. Review the affected request and \
-             response, confirm the finding, and apply the appropriate remediation for this class of \
-             vulnerability.", name.to_ascii_lowercase())
 }
 
 // ---- Intruder (picture-16) ----------------------------------------------

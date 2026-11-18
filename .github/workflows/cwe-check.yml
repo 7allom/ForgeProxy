@@ -1,0 +1,41 @@
+name: CWE catalogue check
+
+# Asks MITRE's CWE REST API for the descriptions of the scanner's CWEs and compares them
+# with the copy built into the app (assets/cwe/catalog.json). Fails if the API cannot be
+# reached or rejects a CWE number; warns, without failing, when MITRE has newer text.
+on:
+  push:
+    paths:
+      - 'tools/update_cwe.py'
+      - 'assets/cwe/**'
+      - 'src/scan.rs'
+      - '.github/workflows/cwe-check.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 1 * *' # monthly, to notice new CWE releases
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch from the CWE REST API
+        run: python3 tools/update_cwe.py
+
+      - name: Compare with the built-in copy
+        run: |
+          if git diff --quiet -- assets/cwe/catalog.json; then
+            echo "The built-in CWE text matches MITRE's API."
+          else
+            git diff --stat -- assets/cwe/catalog.json
+            git diff -- assets/cwe/catalog.json | head -40
+            echo "::warning::MITRE's CWE text differs from assets/cwe/catalog.json. Run python3 tools/update_cwe.py and commit the result."
+          fi

@@ -215,3 +215,5 @@ Set `FORGEPROXY_CONFIG_DIR` (or pass `--config`) to keep settings and the root C
 ## License
 
 Distributed under the Apache 2.0 License. See [LICENSE](LICENSE) for details.
+
+Issue descriptions and remediation advice for the CWE numbers the scanner reports come from MITRE's [Common Weakness Enumeration](https://cwe.mitre.org), Copyright © The MITRE Corporation, used under the [CWE Terms of Use](assets/cwe/LICENSE). CWE is a trademark of The MITRE Corporation. After adding a check with a new CWE, run `python3 tools/update_cwe.py` to bring in its description.

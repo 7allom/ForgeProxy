@@ -1730,7 +1730,7 @@ mod startup_tests {
         let path = dir.join("triage.forge").display().to_string();
         let mut file = crate::project::ProjectFile::fresh("Saved triage");
         file.imported_findings = vec![crate::scan::Finding {
-            type_index: crate::tooling::IMPORTED_TYPE_INDEX,
+            cwe: crate::scan::NO_CWE,
             name: "Folder contents listed".into(),
             severity: crate::scan::Severity::Low,
             confidence: crate::scan::Confidence::Firm,

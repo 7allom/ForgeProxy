@@ -1384,7 +1384,7 @@ mod chrome_tests {
         assert!(list.width() >= 540.0, "the listing is wide enough for its three columns: {:.0}", list.width());
 
         // the first definition is drawn, whole, inside the listing and below the header
-        let row = find(&frame(&ctx, &mut app), "OS command injection (High)");
+        let row = find(&frame(&ctx, &mut app), "SQL injection (High)");
         assert!(row.top() >= header.bottom() - 0.5, "the first row is not under the header ({row:?})");
         assert!(row.right() <= list.right() + 0.5, "nor past the edge of the listing ({row:?})");
         assert!(row.width() > 400.0, "and it has the width of the listing to write in: {:.0}", row.width());

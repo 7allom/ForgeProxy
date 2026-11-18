@@ -23,6 +23,7 @@ mod windows;
 mod proxy;
 mod browser;
 mod ca;
+mod cwe_catalog;
 mod issue_defs;
 mod regex_cache;
 mod repeater;

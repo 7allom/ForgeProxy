@@ -1600,8 +1600,19 @@ fn report(events: &crate::proxy::Events, label: &str, status: RunStatus, exit_co
     }
 }
 
-/// The type number an imported finding carries when it names none of its own.
-pub const IMPORTED_TYPE_INDEX: u32 = 0x0080_0000;
+/// A finding's CWE as a program writes it: a number (`79`) or a label (`"CWE-79"`, any case).
+/// Anything else, or nothing, means the program named no weakness class.
+fn cwe_of(v: &serde_json::Value) -> Option<u32> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            let digits = if s.len() > 4 && s[..4].eq_ignore_ascii_case("cwe-") { &s[4..] } else { s };
+            digits.parse().ok()
+        }
+        _ => None,
+    }
+}
 
 /// A findings document, as a sample for the Automation tab's "Copy sample schema" button.
 pub const SAMPLE_FINDINGS_JSON: &str = r#"{
@@ -1613,7 +1624,7 @@ pub const SAMPLE_FINDINGS_JSON: &str = r#"{
       "url": "https://shop.test/account",
       "detail": "The session cookie can be read by page scripts.",
       "remediation": "Set the HttpOnly attribute when the cookie is issued.",
-      "type_index": 8388608,
+      "cwe": "CWE-1004",
       "request": "GET /account HTTP/1.1\r\nHost: shop.test\r\n\r\n",
       "response": "HTTP/1.1 200 OK\r\n\r\n"
     }
@@ -1656,11 +1667,11 @@ pub fn parse_findings(text: &str, ctx: &ToolContext) -> Result<Vec<Finding>, Str
         let url = text_of("url").unwrap_or(fallback_url);
         let (host, path) = crate::http::split_url(url);
         out.push(Finding {
-            type_index: fields
-                .get("type_index")
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(IMPORTED_TYPE_INDEX),
+            // "type_index" is what documents written for ForgeProxy 1.0.x called it
+            cwe: match fields.get("cwe") {
+                Some(v) => cwe_of(v).unwrap_or(crate::scan::NO_CWE),
+                None => fields.get("type_index").and_then(cwe_of).map_or(crate::scan::NO_CWE, crate::scan::cwe_from_legacy),
+            },
             name: title.to_string(),
             severity: text_of("severity").map_or(Severity::Info, Severity::from_name),
             confidence: text_of("confidence").map_or(Confidence::Firm, Confidence::from_name),
@@ -1941,7 +1952,7 @@ mod tests {
         };
         let one = r#"{"title":"Session fixation","severity":"HIGH","confidence":"Certain",
                       "url":"https://shop.test/login","detail":"d","remediation":"r",
-                      "type_index":42,"request":"GET /login HTTP/1.1\r\n\r\n","response":"HTTP/1.1 302\r\n\r\n"}"#;
+                      "cwe":"cwe-384","request":"GET /login HTTP/1.1\r\n\r\n","response":"HTTP/1.1 302\r\n\r\n"}"#;
         let cases: [(&str, String); 2] = [
             ("an object with a findings list", format!(r#"{{"findings":[{one}]}}"#)),
             ("a bare list", format!("[{one}]")),
@@ -1955,7 +1966,7 @@ mod tests {
             assert_eq!(f.confidence, Confidence::Certain, "case #{idx} ({what})");
             assert_eq!((f.host.as_str(), f.path.as_str()), ("shop.test", "/login"), "case #{idx} ({what})");
             assert_eq!((f.detail.as_str(), f.remediation.as_str()), ("d", "r"), "case #{idx} ({what})");
-            assert_eq!(f.type_index, 42, "case #{idx} ({what})");
+            assert_eq!(f.cwe, 384, "case #{idx} ({what}): a CWE label, however it was cased");
             assert!(f.request.contains("/login") && f.response.contains("302"), "case #{idx} ({what})");
         });
 
@@ -1970,7 +1981,11 @@ mod tests {
         assert_eq!((f.host.as_str(), f.path.as_str()), ("shop.test", "/cart"), "the run's own address");
         assert_eq!(f.request, ctx.request, "and the exchange it was started on");
         assert_eq!(f.response, ctx.response);
-        assert_eq!(f.type_index, IMPORTED_TYPE_INDEX, "with the type number for an import");
+        assert_eq!(f.cwe, crate::scan::NO_CWE, "with no weakness class named");
+
+        // a plain number is a CWE too, and the 1.0.x "type_index" still reads
+        let numbered = parse_findings(r#"[{"title":"t","cwe":89},{"title":"u","type_index":1049088}]"#, &ctx).expect("reads");
+        assert_eq!((numbered[0].cwe, numbered[1].cwe), (89, crate::scan::SQL_INJECTION.0));
         assert!(f.detail.is_empty() && f.remediation.is_empty());
 
         // "description" is read where "detail" is absent

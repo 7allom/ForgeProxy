@@ -252,8 +252,8 @@ pub fn report(findings: &[Finding], fmt: ReportFormat) -> String {
             let mut s = String::from("<?xml version=\"1.0\"?>\n<issues>\n");
             for f in findings {
                 s.push_str(&format!(
-                    "  <issue>\n    <type>{}</type>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n  </issue>\n",
-                    f.type_index, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path)));
+                    "  <issue>\n    <cwe>{}</cwe>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n  </issue>\n",
+                    f.cwe, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path)));
             }
             s.push_str("</issues>\n");
             s
@@ -263,8 +263,23 @@ pub fn report(findings: &[Finding], fmt: ReportFormat) -> String {
             for f in findings {
                 let (r, g, b) = f.severity.rgb();
                 s.push_str(&format!(
-                    "<h2 style=\"color:#{r:02x}{g:02x}{b:02x}\">{} — {}</h2><p><b>Host:</b> {}{}<br><b>Confidence:</b> {}</p><p>{}</p>\n",
-                    esc(&f.name), f.severity.label(), esc(&f.host), esc(&f.path), f.confidence.label(), esc(&f.detail)));
+                    "<h2 style=\"color:#{r:02x}{g:02x}{b:02x}\">{} — {}</h2><p><b>Host:</b> {}{}<br><b>Confidence:</b> {}<br><b>Weakness:</b> {}</p><p>{}</p>\n",
+                    esc(&f.name), f.severity.label(), esc(&f.host), esc(&f.path), f.confidence.label(),
+                    esc(&crate::cwe_catalog::title(f.cwe)), esc(&f.detail)));
+                if let Some(w) = crate::cwe_catalog::lookup(f.cwe) {
+                    s.push_str(&format!("<h3>Issue background</h3><p>{}</p>\n", esc(&w.description)));
+                }
+                let remediation = if f.remediation.trim().is_empty() {
+                    crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
+                } else {
+                    f.remediation.clone()
+                };
+                if !remediation.trim().is_empty() {
+                    s.push_str("<h3>Remediation</h3>\n");
+                    for para in remediation.split("\n\n") {
+                        s.push_str(&format!("<p>{}</p>\n", esc(para)));
+                    }
+                }
             }
             s.push_str("</body></html>\n");
             s
@@ -291,7 +306,7 @@ mod report_tests {
 
     fn finding(name: &str, host: &str, path: &str, detail: &str) -> Finding {
         Finding {
-            type_index: 42,
+            cwe: 79,
             name: name.into(),
             severity: Severity::Medium,
             confidence: Confidence::Certain,
@@ -342,7 +357,7 @@ mod report_tests {
             assert!(!doc.contains("<input>"), "and reach nothing as markup: {doc}");
             assert!(doc.contains("/search?q=a&amp;b=1"), "the ampersand too: {doc}");
         }
-        assert!(xml.contains("<severity>Medium</severity>") && xml.contains("<type>42</type>"), "{xml}");
+        assert!(xml.contains("<severity>Medium</severity>") && xml.contains("<cwe>79</cwe>"), "{xml}");
         // nothing to report is still a well-formed document
         assert!(report(&[], ReportFormat::Xml).contains("<issues>"), "an empty XML report");
         assert!(report(&[], ReportFormat::Html).contains("<h1>Scan report</h1>"), "an empty HTML report");
