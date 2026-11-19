@@ -269,7 +269,10 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         for (label, fmt) in [("HTML", crate::export::ReportFormat::Html), ("XML", crate::export::ReportFormat::Xml), ("JSON", crate::export::ReportFormat::Json)] {
             if theme::plain_button(ui, p, &format!("Export report ({label})"), !list.is_empty()).clicked() {
                 let findings: Vec<Finding> = list.iter().map(|x| x.2.clone()).collect();
-                app.report_msg = export_report(&findings, fmt);
+                // a dismissed dialog changes nothing, message included
+                if let Some(msg) = export_report(&findings, fmt) {
+                    app.report_msg = msg;
+                }
             }
         }
         if !app.report_msg.is_empty() {
@@ -396,12 +399,32 @@ pub fn windows(app: &mut App, ctx: &egui::Context, p: &Palette) {
 /// The Dashboard's "Export report" buttons: write the issues on screen to the usual place,
 /// and say where they went. The document itself is [`crate::export::report`], which is what
 /// the command line's `--report` writes too.
-fn export_report(findings: &[Finding], fmt: crate::export::ReportFormat) -> String {
-    let path = crate::paths::documents_dir().join(format!("forgeproxy-report.{}", fmt.extension()));
-    match crate::export::write_report(findings, &path) {
+/// Write the issues to `path` and say what happened, for the status line beside the buttons.
+/// The path's extension chooses the format, so a name typed in the dialog decides it.
+fn export_report_to(findings: &[Finding], path: &std::path::Path) -> String {
+    match crate::export::write_report(findings, path) {
         Ok(_) => format!("Saved {} issues to {}", findings.len(), path.display()),
         Err(e) => format!("Couldn't save the report: {e}"),
     }
+}
+
+/// The Dashboard's "Export report" buttons: ask where the report goes, then write it there.
+/// `None` when the dialog is dismissed, which leaves the status line as it was.
+///
+/// This used to write one fixed name in the documents folder without asking, so exporting a
+/// second scan silently destroyed the first report -- and a report is usually the deliverable.
+/// The suggested name still carries the chosen format's extension, so pressing straight through
+/// the dialog gives the same file it always did, in a folder the operator picked.
+fn export_report(findings: &[Finding], fmt: crate::export::ReportFormat) -> Option<String> {
+    let ext = fmt.extension();
+    let path = rfd::FileDialog::new()
+        .set_title("Save the issue report")
+        .add_filter(&ext.to_uppercase(), &[ext])
+        .add_filter("All files", &["*"])
+        .set_directory(crate::paths::documents_dir())
+        .set_file_name(format!("forgeproxy-report.{ext}"))
+        .save_file()?;
+    Some(export_report_to(findings, &path))
 }
 
 #[cfg(test)]
@@ -604,5 +627,41 @@ mod tests {
             "the wheel moved the 'Remediation' heading from y {:.0} to y {:.0}: the detail panel does not scroll, so text past its bottom cannot be reached",
             before.y0, after.y0,
         );
+    }
+
+    /// A report is written where the operator chose, in the format that path asks for, and the
+    /// message names the file so it can be found again.
+    ///
+    /// The export used to write one fixed name in the documents folder with no dialog at all,
+    /// so exporting a second scan destroyed the first report without asking. Choosing the path
+    /// is the fix; this is the half of it that can be tested without a native dialog.
+    #[test]
+    fn a_report_is_written_to_the_chosen_path_and_the_message_names_it() {
+        let dir = std::env::temp_dir().join(format!("forgeproxy-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let findings = vec![
+            crate::scan::Finding::new(crate::scan::REFLECTED_XSS, crate::scan::Confidence::Firm, "a.test", "/s", "reflected"),
+            crate::scan::Finding::new(crate::scan::SQL_INJECTION, crate::scan::Confidence::Tentative, "a.test", "/i", "database error"),
+        ];
+
+        // two exports, two names: the second must not disturb the first
+        let first = dir.join("audit-one.html");
+        let msg = export_report_to(&findings, &first);
+        assert!(msg.contains("2 issues"), "the message counts them: {msg}");
+        assert!(msg.contains("audit-one.html"), "the message names the file: {msg}");
+        let html = std::fs::read_to_string(&first).expect("the first report");
+        assert!(html.starts_with("<!doctype html"), "the path's extension chose HTML: {}", &html[..40.min(html.len())]);
+
+        let second = dir.join("audit-two.xml");
+        let msg = export_report_to(&findings, &second);
+        assert!(msg.contains("audit-two.xml"), "{msg}");
+        let xml = std::fs::read_to_string(&second).expect("the second report");
+        assert!(xml.starts_with("<?xml"), "the path's extension chose XML: {xml}");
+        assert!(std::fs::read_to_string(&first).unwrap().starts_with("<!doctype html"), "the first report is still there");
+
+        // a path that cannot be written is reported rather than lost
+        let refused = export_report_to(&findings, std::path::Path::new("/"));
+        assert!(refused.to_lowercase().contains("couldn't"), "a failure says so: {refused}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
