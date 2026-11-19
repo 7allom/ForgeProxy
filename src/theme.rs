@@ -882,6 +882,18 @@ pub fn sort_header<C: Copy + PartialEq>(ui: &mut Ui, p: &Palette, cols: &[(&str,
     clicked
 }
 
+/// The colour a table cell's text takes. A cell given a colour of its own keeps it, selected or
+/// not: in the severity column the colour *is* the information, and flattening it to the
+/// selection's text colour threw that away exactly when the row was being read. Cells with no
+/// colour of their own follow the row.
+fn cell_color(p: &Palette, col: Option<Color32>, selected: bool) -> Color32 {
+    match col {
+        Some(c) => c,
+        None if selected => p.selection_text,
+        None => p.text,
+    }
+}
+
 /// One table row (text cells at the same widths). Returns the click response.
 pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32>)], selected: bool, stripe: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
@@ -907,7 +919,7 @@ pub fn table_row(ui: &mut Ui, p: &Palette, cells: &[(String, f32, Option<Color32
             egui::Align2::LEFT_CENTER,
             text,
             FontId::proportional(12.5),
-            if selected { p.selection_text } else { col.unwrap_or(p.text) },
+            cell_color(p, *col, selected),
         );
         x += w;
     }
@@ -1294,6 +1306,36 @@ mod tests {
         let (a, b) = (luminance(fg), luminance(bg));
         let (hi, lo) = if a > b { (a, b) } else { (b, a) };
         (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// A selected row keeps the colour its cells were given.
+    ///
+    /// Selecting a row used to repaint every cell in the selection's own text colour, so the
+    /// severity column -- the one column whose colour *is* its meaning -- went plain the moment
+    /// you clicked the row to read it.
+    #[test]
+    fn a_selected_rows_cells_keep_the_colour_they_were_given() {
+        let p = &DARK_WORKSTATION;
+        assert_eq!(cell_color(p, Some(p.high), true), p.high, "a severity keeps its colour when selected");
+        assert_eq!(cell_color(p, Some(p.high), false), p.high, "and when it is not");
+        assert_eq!(cell_color(p, None, true), p.selection_text, "a plain cell reads as selected");
+        assert_eq!(cell_color(p, None, false), p.text, "and as ordinary text otherwise");
+    }
+
+    /// The severities stay readable on the selection fill, which is what lets a selected row
+    /// keep them rather than flattening them to the selection's text colour.
+    #[test]
+    fn severities_are_legible_on_a_selected_row_in_both_themes() {
+        let mut bad: Vec<String> = Vec::new();
+        for (theme, p) in [("dark", &DARK_WORKSTATION), ("light", &LIGHT_WORKSTATION)] {
+            for (what, fg) in [("high", p.high), ("medium", p.medium), ("low", p.low), ("info", p.info)] {
+                let r = contrast(fg, p.selection);
+                if r < 3.0 {
+                    bad.push(format!("{theme}: {what} on a selected row is {r:.2}:1 (needs 3.0)"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} shortfalls:\n  {}", bad.len(), bad.join("\n  "));
     }
 
     /// Every colour the app writes text or a badge in, against the surface it is drawn on, in

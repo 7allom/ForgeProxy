@@ -237,6 +237,9 @@ fn capture(app: &mut App, ui: &mut Ui, p: &Palette) {
     });
 }
 
+/// The least room the two analysis panels are given, for a window dragged very short.
+const MIN_ANALYSIS_PANEL_H: f32 = 140.0;
+
 fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
     ui.horizontal(|ui| {
         theme::section_title(ui, p, "Analysis", "Randomness statistics for the captured tokens.");
@@ -290,13 +293,18 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 
     ui.add_space(10.0);
+    // Both panels take the height that is actually left rather than a fixed 260/280. The bar
+    // chart has one row per character of the token, so a longer token used to run past a cap
+    // that sat well short of the bottom of the pane: the last positions were a scroll away
+    // with a screenful of empty space underneath them.
+    let panel_h = ui.available_height().max(MIN_ANALYSIS_PANEL_H);
     theme::columns(ui, 2, |cols| {
         // per-position entropy
         cols[0].label(bold("Per-position entropy", 13.0).color(cols[0].style().visuals.strong_text_color()));
         cols[0].label(RichText::new("Low bars mark fixed prefixes or timestamp digits.").size(11.5).color(p.disabled));
         cols[0].add_space(4.0);
         let max_bits = a.per_char_entropy.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-        egui::ScrollArea::vertical().id_salt("seq_pos").max_height(260.0).show(&mut cols[0], |ui| {
+        egui::ScrollArea::vertical().id_salt("seq_pos").max_height(panel_h).show(&mut cols[0], |ui| {
             for (i, &e) in a.per_char_entropy.iter().enumerate() {
                 // avoid "-0.00": a zero entropy can arrive as a negative zero from the sum
                 let e = if e.abs() < 1e-4 { 0.0 } else { e };
@@ -312,7 +320,7 @@ fn analysis(app: &mut App, ui: &mut Ui, p: &Palette) {
         cols[1].label(bold("Character distribution", 13.0).color(cols[1].style().visuals.strong_text_color()));
         cols[1].add_space(4.0);
         let total: usize = a.char_distribution.values().sum();
-        theme::table_well(&mut cols[1], p, 280.0, |ui| {
+        theme::table_well(&mut cols[1], p, panel_h, |ui| {
             theme::table_header(ui, p, &[("Char", 60.0), ("Count", 80.0), ("%", 70.0)]);
             egui::ScrollArea::vertical().id_salt("seq_chars").auto_shrink([false, false]).show(ui, |ui| {
                 for (i, (c, n)) in a.char_distribution.iter().enumerate() {

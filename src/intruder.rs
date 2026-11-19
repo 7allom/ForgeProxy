@@ -289,6 +289,12 @@ pub fn auto_positions(template: &str) -> String {
     res
 }
 
+/// How many marked positions a request has, worded for a reader: "1 payload position", not
+/// "1 payload positions".
+pub fn positions_label(n: usize) -> String {
+    format!("{n} payload position{}", if n == 1 { "" } else { "s" })
+}
+
 /// Count the § positions in a template (pairs of markers).
 pub fn count_positions(template: &str) -> usize {
     template.matches('§').count() / 2
@@ -1175,5 +1181,15 @@ mod tests {
         let (_, req) = plan.request(0);
         assert!(req.contains("a=x%20y"), "the filled position is encoded: {req:?}");
         assert!(req.contains("b=two two"), "the default is left as written: {req:?}");
+    }
+
+    /// The marked-position count reads as English at one, which is the count a request most
+    /// often has.
+    #[test]
+    fn one_payload_position_is_not_plural() {
+        let cases = [(0, "0 payload positions"), (1, "1 payload position"), (2, "2 payload positions")];
+        assert_table!(cases, |(n, expected)| {
+            assert_eq!(positions_label(n), expected);
+        });
     }
 }

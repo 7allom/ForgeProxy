@@ -177,6 +177,15 @@ fn command_bar(app: &mut App, ctx: &egui::Context, p: &Palette, mode: RailMode) 
         });
 }
 
+/// The band inside the search chip the placeholder may be drawn in: after the search icon, and
+/// stopping short of whatever sits at the right end -- the key badge when there is room for one,
+/// otherwise just the padding. Never wider than the chip, however narrow the chip gets.
+fn chip_text_band(rect: egui::Rect, right_reserved: f32) -> egui::Rect {
+    let left = (rect.left() + 26.0).min(rect.right());
+    let right = (rect.right() - 8.0 - right_reserved).max(left);
+    egui::Rect::from_min_max(egui::pos2(left, rect.top()), egui::pos2(right, rect.bottom()))
+}
+
 /// "Search or run a command   Ctrl+K" ("Cmd+K" on macOS): opens the command palette.
 fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
     let width = (ui.available_width() - 8.0).clamp(0.0, 300.0);
@@ -196,12 +205,18 @@ fn search_chip(app: &mut App, ui: &mut Ui, p: &Palette) {
     theme::paint_search(ui.painter(), egui::pos2(rect.left() + 13.0, mid), 5.5, p.disabled);
     let galley = ui.painter().layout_no_wrap("Search or run a command".into(), FontId::proportional(theme::FONT_UI), p.disabled);
     let label_w = galley.size().x;
-    ui.painter().galley(egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(rect.left() + 26.0, mid), galley.size()).min, galley, p.disabled);
     // the shortcut as a key badge, 8px in from the right edge and on the pill's centreline
     let chord = crate::hotkeys::command_chord("K");
     let keys = ui.painter().layout_no_wrap(chord.clone(), FontId::proportional(theme::FONT_CAPTION), p.text);
     let badge_w = keys.size().x + 10.0;
-    if rect.width() > 26.0 + label_w + badge_w + 16.0 {
+    let badge_fits = rect.width() > 26.0 + label_w + badge_w + 16.0;
+    // Clipped to the chip: a window narrow enough that the words no longer fit shows fewer of
+    // them, rather than painting them out over the icons to the right of the chip.
+    let band = chip_text_band(rect, if badge_fits { badge_w + 8.0 } else { 0.0 });
+    ui.painter()
+        .with_clip_rect(band.intersect(ui.clip_rect()))
+        .galley(egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(rect.left() + 26.0, mid), galley.size()).min, galley, p.disabled);
+    if badge_fits {
         let badge = egui::Rect::from_min_max(
             egui::pos2(rect.right() - 8.0 - badge_w, mid - 8.0),
             egui::pos2(rect.right() - 8.0, mid + 8.0),
@@ -1238,6 +1253,38 @@ mod window_tests {
         });
     }
 
+}
+
+#[cfg(test)]
+mod search_chip_tests {
+    use super::*;
+    use crate::test_utils::assert_table;
+
+    /// The placeholder is confined to the chip, whatever the window is narrowed to.
+    ///
+    /// It used to be painted with no clip at all, so once the chip stopped shrinking the words
+    /// ran out past its right edge and the globe and gear icons were drawn on top of them --
+    /// between roughly 700 and 760 pixels of window width.
+    #[test]
+    fn the_placeholder_band_never_reaches_past_the_chip() {
+        let cases = [
+            ("roomy, with the key badge", 300.0, 44.0),
+            ("roomy, no badge", 300.0, 0.0),
+            ("narrow", 90.0, 0.0),
+            ("narrower than its own padding", 24.0, 0.0),
+            ("narrower than the badge it reserves", 30.0, 44.0),
+        ];
+        assert_table!(cases, |(name, width, reserved)| {
+            let rect = egui::Rect::from_min_size(egui::pos2(100.0, 10.0), egui::vec2(width, 26.0));
+            let band = chip_text_band(rect, reserved);
+            assert!(band.right() <= rect.right(), "{name}: the band stays inside the chip");
+            assert!(band.left() >= rect.left(), "{name}: and does not start before it");
+            assert!(band.width() >= 0.0, "{name}: a band is never negative");
+            if reserved > 0.0 && width > 100.0 {
+                assert!(band.right() <= rect.right() - reserved, "{name}: the key badge keeps its room");
+            }
+        });
+    }
 }
 
 #[cfg(test)]

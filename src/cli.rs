@@ -2849,6 +2849,81 @@ mod tests {
     }
 }
 
+/// Standard output with the one courtesy a terminal expects: a final newline.
+///
+/// Subcommands write exactly the bytes they mean -- `decode` hands back the decoded data and
+/// nothing else, which is what makes `decode gzip-decode > out.bin` work. At a terminal that
+/// left the shell prompt glued to the last byte, so the newline is added here, at the one place
+/// that knows where the output is going, rather than by every subcommand guessing.
+pub struct TerminalOut<'a> {
+    inner: &'a mut dyn Write,
+    tty: bool,
+    last: Option<u8>,
+}
+
+impl<'a> TerminalOut<'a> {
+    pub fn new(inner: &'a mut dyn Write, tty: bool) -> Self {
+        TerminalOut { inner, tty, last: None }
+    }
+
+    /// Standard output, told whether it is a terminal.
+    pub fn stdout(inner: &'a mut dyn Write) -> Self {
+        Self::new(inner, std::io::IsTerminal::is_terminal(&std::io::stdout()))
+    }
+
+    /// Close off the run: at a terminal, end the output on a line of its own. Nothing is added
+    /// when nothing was written, so a subcommand that printed only to stderr stays silent.
+    pub fn finish(&mut self) {
+        if self.tty && self.last.is_some_and(|b| b != b'\n') {
+            let _ = self.inner.write_all(b"\n");
+        }
+        let _ = self.inner.flush();
+    }
+}
+
+impl Write for TerminalOut<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if let Some(&b) = buf[..n].last() {
+            self.last = Some(b);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod terminal_out_tests {
+    use super::*;
+    use crate::test_utils::assert_table;
+
+    /// At a terminal, output that does not end in a newline gets one, so the shell prompt does
+    /// not land glued to the last byte. Redirected or piped, the bytes are left exactly as the
+    /// subcommand wrote them -- `decode gzip-decode > out.bin` must not gain a stray byte.
+    #[test]
+    fn a_trailing_newline_is_added_only_at_a_terminal() {
+        let cases = [
+            ("needs one", true, "%61%20%62", "%61%20%62\n"),
+            ("already has one", true, "line\n", "line\n"),
+            ("nothing written", true, "", ""),
+            ("redirected, untouched", false, "%61%20%62", "%61%20%62"),
+            ("redirected binary", false, "\u{1}\u{2}\u{0}", "\u{1}\u{2}\u{0}"),
+        ];
+        assert_table!(cases, |(name, tty, written, expected)| {
+            let mut sink: Vec<u8> = Vec::new();
+            {
+                let mut out = TerminalOut::new(&mut sink, tty);
+                out.write_all(written.as_bytes()).unwrap();
+                out.finish();
+            }
+            assert_eq!(String::from_utf8_lossy(&sink), expected, "{name}");
+        });
+    }
+}
+
 #[cfg(test)]
 mod subcommand_tests {
     use super::*;

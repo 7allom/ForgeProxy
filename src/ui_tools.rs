@@ -550,7 +550,7 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
             if theme::plain_button(ui, p, "Clear §", true).clicked() { app.int_template = app.int_template.replace('§', ""); }
             if theme::plain_button(ui, p, "Auto §", true).clicked() { app.int_template = crate::intruder::auto_positions(&app.int_template); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} payload positions", intruder::count_positions(&app.int_template))).size(11.5).color(p.text));
+                ui.label(RichText::new(intruder::positions_label(intruder::count_positions(&app.int_template))).size(11.5).color(p.text));
             });
         });
         let out = editor::message_editor(ui, p, "int_pos", &mut app.int_template, true, true, 240.0);
@@ -1173,7 +1173,7 @@ fn interactor_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
         if theme::primary_button(ui, p, "Copy to clipboard").clicked() {
             if app.interactor_server.trim().is_empty() {
                 // nothing to collect against without a relay, and nothing is sent until one is named
-                app.interactor_msg = "Enter a Interactor server address first.".into();
+                app.interactor_msg = "Enter an Interactor server address first.".into();
             } else {
                 let with_server = app.interactor_with_server;
                 let custom = app.interactor_custom.clone();
@@ -1209,7 +1209,7 @@ fn interactor_toolbar(app: &mut App, ui: &mut Ui, p: &Palette) {
                 app.interactor_auto_poll = false;
                 app.interactor_last_poll = None;
             } else if app.interactor_server.trim().is_empty() {
-                app.interactor_msg = "Enter a Interactor server address first.".into();
+                app.interactor_msg = "Enter an Interactor server address first.".into();
             } else {
                 app.interactor_auto_poll = true;
                 // due at once, so turning it on polls rather than waiting ten seconds first
@@ -3552,7 +3552,7 @@ mod interactor_tests {
         app.interactor_server.clear();
         click(&ctx, &mut app, "Auto-poll");
         assert!(!app.interactor_auto_poll, "nothing to poll, so the timer does not start");
-        assert_eq!(app.interactor_msg, "Enter a Interactor server address first.");
+        assert_eq!(app.interactor_msg, "Enter an Interactor server address first.");
         assert!(!app.interactor_polling, "and no request went out");
 
         // with a relay named it turns on, and turning it off again stops it

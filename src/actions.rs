@@ -1129,7 +1129,7 @@ pub fn register_interactor(app: &mut App) {
 pub fn poll_interactor(app: &mut App) {
     let server = app.interactor_server.trim().to_string();
     if server.is_empty() {
-        app.interactor_msg = "Enter a Interactor server address first.".into();
+        app.interactor_msg = "Enter an Interactor server address first.".into();
         return;
     }
     if app.interactor_polling {
@@ -1166,7 +1166,7 @@ pub fn interactor_auto_poll_tick(app: &mut App, ctx: &eframe::egui::Context) {
         // seconds: say it once and stop the timer
         app.interactor_auto_poll = false;
         app.interactor_last_poll = None;
-        app.interactor_msg = "Enter a Interactor server address first.".into();
+        app.interactor_msg = "Enter an Interactor server address first.".into();
         return;
     }
     // Settings > Interactor: how long to wait between polls

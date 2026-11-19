@@ -101,8 +101,15 @@ fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     // a subcommand (scan, intruder, repeat, proxy, sequence, decode) runs its own engine and
     // ends the process; anything else is the flat flags, exactly as before
-    if let Some(code) = cli::run_subcommand(&raw_args, &mut std::io::stdout(), &mut std::io::stderr()) {
-        std::process::exit(code);
+    // Output goes through a writer that ends on a newline when a person is reading it, and
+    // leaves the bytes untouched when they are being piped or redirected into a file.
+    {
+        let mut stdout = std::io::stdout();
+        let mut out = cli::TerminalOut::stdout(&mut stdout);
+        if let Some(code) = cli::run_subcommand(&raw_args, &mut out, &mut std::io::stderr()) {
+            out.finish();
+            std::process::exit(code);
+        }
     }
     let opts = match cli::parse(raw_args) {
         Ok(o) => o,
@@ -118,8 +125,13 @@ fn main() -> eframe::Result<()> {
         std::env::set_var("FORGEPROXY_CONFIG_DIR", dir);
     }
     // whatever needs no window is done here, and the process ends with what it came to
-    if let Some(code) = cli::run(&opts, &mut std::io::stdout(), &mut std::io::stderr()) {
-        std::process::exit(code);
+    {
+        let mut stdout = std::io::stdout();
+        let mut out = cli::TerminalOut::stdout(&mut stdout);
+        if let Some(code) = cli::run(&opts, &mut out, &mut std::io::stderr()) {
+            out.finish();
+            std::process::exit(code);
+        }
     }
 
     let shot_path = opts.screenshot.clone();
