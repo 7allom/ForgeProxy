@@ -1683,6 +1683,8 @@ pub fn parse_findings(text: &str, ctx: &ToolContext) -> Result<Vec<Finding>, Str
             // started on, which is the only one it can have been about
             request: text_of("request").unwrap_or(ctx.request.as_str()).to_string(),
             response: text_of("response").unwrap_or(ctx.response.as_str()).to_string(),
+            point: text_of("point").unwrap_or_default().to_string(),
+            payload: text_of("payload").unwrap_or_default().to_string(),
         });
     }
     Ok(out)

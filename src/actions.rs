@@ -170,6 +170,30 @@ pub fn start_attack(app: &mut App) {
     }
 }
 
+/// Audit the traffic already captured in the proxy history with the passive checks, making no
+/// new requests, and show the findings as a finished task. A quick way to surface the passive
+/// issues in whatever has been browsed without starting a crawl.
+pub fn audit_traffic_passively(app: &mut App) {
+    let entries: Vec<http::HttpEntry> = {
+        let hist = app.history.lock().unwrap_or_else(|e| e.into_inner());
+        hist.iter().map(|e| (**e).clone()).collect()
+    };
+    let findings = scan::passive_audit_history(&entries);
+    let task = app.tasks.len();
+    app.tasks.push(Task {
+        kind: TaskKind::Scan { crawl: false },
+        url: format!("Passive audit of {} captured responses", entries.len()),
+        capturing: false,
+        running: false,
+        requests: entries.len(),
+        findings,
+        log: vec![format!("Audited {} captured responses with the passive checks; no new requests were made.", entries.len())],
+    });
+    app.task_sel = task;
+    app.task_sub = 0;
+    app.tab = crate::state::Tab::Dashboard;
+}
+
 /// Start a scan task: optional crawl of same-site links within the crawl limits,
 /// passive checks on every page, then a benign marker check on the start page.
 pub fn start_scan(app: &mut App, url: String, crawl: bool) {
@@ -188,63 +212,42 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
     let (tx, rec) = (app.tx.clone(), app.recorder());
     let opts = app.send_options();
     let (relay, token) = (app.interactor_server.clone(), app.interactor_token.clone());
+    let (intensity, depth, max_pages) =
+        (app.settings.scan_intensity, app.settings.scan_depth, app.settings.scan_max_pages);
+    // A scope the user has set bounds the crawl and the probes; a default (empty) scope leaves
+    // the same-origin rule to do the bounding, exactly as before.
+    let scope = (app.target_scope != crate::scope::TargetScope::default()).then(|| app.target_scope.clone());
+    let login = scan::Login { username: app.scan_login_user.clone(), password: app.scan_login_password.clone() };
+    let login = login.is_set().then_some(login);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         // Out-of-band wiring: built here on the worker so the relay key pair is made off the
         // drawing thread. `None` when no Interactor relay is set, which leaves OAST off.
         let oast = scan::ScanInteractor::configure(&relay, &token);
+        let limits = scan::ScanLimits {
+            depth,
+            max_pages,
+            oast_settle: scan::DEFAULT_OAST_SETTLE,
+            intensity,
+        };
+        // The drawn scan is held to the crawl time limit exactly as before: the sink raises the
+        // shared stop flag once the wall clock is passed, and the engine checks it between
+        // requests. Each exchange is recorded to history and reported as progress from the one
+        // callback, so there is a single scan engine behind both the app and the command line.
         let limit = std::time::Duration::from_secs(rules::CRAWL_MAX_TIME_MIN * 60);
-        let mut findings = Vec::new();
-        let mut queue = std::collections::VecDeque::from([(url.clone(), 0usize)]);
-        let mut seen = std::collections::HashSet::from([url.clone()]);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clock = stop.clone();
         let mut requests = 0usize;
-        while let Some((page, depth)) = queue.pop_front() {
-            if requests >= rules::CRAWL_MAX_UNIQUE_LOCATIONS || started.elapsed() > limit {
-                break;
-            }
+        let ctx = scan::ScanContext { scope: scope.as_ref(), login };
+        let outcome = scan::run_scan(&url, crawl, limits, oast, &opts, &ctx, &stop, &mut |method, u, elapsed, r| {
+            let _ = record_bg(&rec, "Scanner", method, u, elapsed, r);
             requests += 1;
-            let sent_at = std::time::Instant::now();
-            let r = http::send("GET", &page, &[], "", rules::AUDIT_FOLLOW_REDIRECTS, true, &opts);
-            let _ = record_bg(&rec, "Scanner", "GET", &page, sent_at.elapsed(), &r);
-            let (host, path) = http::split_url(&page);
-            findings.extend(scan::passive_checks(&host, &path, page.starts_with("https"), &r.headers, &r.body));
-            let _ = tx.send(Job::ScanProgress { task, requests, line: format!("GET {page} — {}", r.status) });
-            if crawl && depth < rules::CRAWL_MAX_LINK_DEPTH {
-                for link in scan::extract_links(&page, &r.body) {
-                    if seen.insert(link.clone()) {
-                        queue.push_back((link, depth + 1));
-                    }
-                }
+            let _ = tx.send(Job::ScanProgress { task, requests, line: format!("{method} {u} — {}", r.status) });
+            if started.elapsed() > limit {
+                stop_clock.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-        let (host, path) = http::split_url(&url);
-        let marker = "fpx9q7z";
-        let probe = if url.contains('?') { format!("{url}&q={marker}") } else { format!("{url}?q={marker}") };
-        let probe_at = std::time::Instant::now();
-        let pr = http::send("GET", &probe, &[], "", rules::AUDIT_FOLLOW_REDIRECTS, true, &opts);
-        requests += 1;
-        let _ = record_bg(&rec, "Scanner", "GET", &probe, probe_at.elapsed(), &pr);
-        let _ = tx.send(Job::ScanProgress { task, requests, line: format!("GET {probe} — {}", pr.status) });
-        if scan::reflects_marker(&pr.body, marker) {
-            findings.push(scan::Finding::new(scan::INPUT_REFLECTED, scan::Confidence::Certain, &host, &path,
-                "A value sent in the query string came back unchanged in the page. That is the first condition \
-                 for reflected cross-site scripting; check how this value is encoded."));
-        }
-        if let Some(sig) = scan::sql_error_signature(&pr.body) {
-            findings.push(scan::Finding::new(scan::SQL_INJECTION, scan::Confidence::Tentative, &host, &path,
-                &format!("The page showed a database error message ({sig}). That can point to SQL injection and \
-                          also reveals details about the database.")));
-        }
-        // Out-of-band audit: plant the canaries, record each probe, settle, poll for callbacks.
-        if let Some(mut oast) = oast {
-            for ex in oast.plant(&url, &opts) {
-                let _ = record_bg(&rec, "Scanner", &ex.method, &ex.url, std::time::Duration::ZERO, &ex.result);
-                requests += 1;
-                let _ = tx.send(Job::ScanProgress { task, requests, line: format!("{} {} — {}", ex.method, ex.url, ex.result.status) });
-            }
-            findings.extend(oast.collect(scan::DEFAULT_OAST_SETTLE, &opts));
-        }
-        let _ = tx.send(Job::ScanDone { task, findings: scan::consolidate(findings) });
+        });
+        let _ = tx.send(Job::ScanDone { task, findings: outcome.findings });
     });
 }
 

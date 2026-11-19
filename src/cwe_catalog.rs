@@ -102,6 +102,6 @@ mod tests {
     fn unknown_and_missing_cwes_fall_back_to_the_number() {
         assert!(lookup(scan::NO_CWE).is_none());
         assert_eq!(title(scan::NO_CWE), "No CWE");
-        assert_eq!(title(79), "CWE-79", "a CWE no check reports is shown by its number");
+        assert_eq!(title(99999), "CWE-99999", "a CWE no check reports is shown by its number");
     }
 }

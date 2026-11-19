@@ -47,6 +47,12 @@ pub struct ProjectFile {
     pub interactor_token: String,
     #[serde(default)]
     pub interactor_session: Option<crate::interactor::OastSession>,
+    /// Settings > Scanner credentials for the authenticated crawl, kept per project with the
+    /// other secrets. Empty (and absent from older files) means the crawl does not log in.
+    #[serde(default)]
+    pub scan_login_user: String,
+    #[serde(default)]
+    pub scan_login_password: String,
     #[serde(default)]
     pub interactor_payloads: Vec<String>,
     #[serde(default)]
@@ -109,6 +115,8 @@ pub fn snapshot(app: &App) -> ProjectFile {
         interactor_server: Some(app.interactor_server.clone()),
         interactor_token: app.interactor_token.clone(),
         interactor_session: app.interactor_session.clone(),
+        scan_login_user: app.scan_login_user.clone(),
+        scan_login_password: app.scan_login_password.clone(),
         interactor_payloads: app.interactor_payloads.clone(),
         interactor_interactions: app.interactor_interactions.clone(),
         intercept_at_startup: app.intercept_default,
@@ -243,6 +251,8 @@ pub fn reset(app: &mut App) {
     app.interactor_server = default_relay(app);
     app.interactor_token.clear();
     app.interactor_session = None;
+    app.scan_login_user.clear();
+    app.scan_login_password.clear();
     app.interactor_registering = false;
     app.interactor_sel = None;
     app.interactor_payloads.clear();
@@ -324,6 +334,8 @@ pub fn apply_all(app: &mut App, f: ProjectFile) {
     };
     app.interactor_token = f.interactor_token;
     app.interactor_session = f.interactor_session;
+    app.scan_login_user = f.scan_login_user;
+    app.scan_login_password = f.scan_login_password;
     app.interactor_registering = false;
     app.interactor_sel = None;
     app.interactor_payloads = f.interactor_payloads;

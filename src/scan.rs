@@ -86,17 +86,59 @@ pub const NO_CWE: u32 = 0;
 
 pub const SQL_INJECTION: IssueDef = (89, "SQL injection", Severity::High);
 pub const CSP_NOT_ENFORCED: IssueDef = (693, "Content security policy: not enforced", Severity::Info);
-pub const CLEARTEXT_PASSWORD: IssueDef = (319, "Cleartext submission of password", Severity::High);
+pub const CLEARTEXT_PASSWORD: IssueDef = (523, "Cleartext submission of password", Severity::High);
 pub const INPUT_REFLECTED: IssueDef = (20, "Input returned in response (reflected)", Severity::Info);
 pub const TLS_COOKIE_NO_SECURE: IssueDef = (614, "TLS cookie without secure flag set", Severity::Medium);
 pub const COOKIE_NO_HTTPONLY: IssueDef = (1004, "Cookie without HttpOnly flag set", Severity::Low);
-pub const PASSWORD_AUTOCOMPLETE: IssueDef = (525, "Password field with autocomplete enabled", Severity::Low);
+pub const PASSWORD_AUTOCOMPLETE: IssueDef = (522, "Password field with autocomplete enabled", Severity::Low);
 pub const FRAMEABLE: IssueDef = (1021, "Frameable response (potential Clickjacking)", Severity::Info);
 pub const DIRECTORY_LISTING: IssueDef = (548, "Directory listing", Severity::Info);
 pub const EMAIL_DISCLOSED: IssueDef = (200, "Email addresses disclosed", Severity::Info);
 pub const PRIVATE_IP_DISCLOSED: IssueDef = (497, "Private IP addresses disclosed", Severity::Info);
-pub const CACHEABLE_HTTPS: IssueDef = (524, "Cacheable HTTPS response", Severity::Info);
+pub const CACHEABLE_HTTPS: IssueDef = (525, "Cacheable HTTPS response", Severity::Info);
 pub const HSTS_NOT_ENFORCED: IssueDef = (319, "Strict transport security not enforced", Severity::Low);
+
+// --- Passive header, cookie, disclosure and client-side checks (no extra traffic) ----------
+pub const CONTENT_TYPE_OPTIONS: IssueDef = (16, "Content type is not pinned (sniffing allowed)", Severity::Info);
+pub const CORS_PERMISSIVE: IssueDef = (942, "Cross-origin resource sharing: permissive policy", Severity::Medium);
+pub const CORS_CREDENTIALED_ORIGIN: IssueDef = (346, "Cross-origin resource sharing: credentials shared with a named origin", Severity::Medium);
+pub const REFERRER_POLICY: IssueDef = (200, "Referrer policy not set", Severity::Info);
+pub const VERSION_BANNER: IssueDef = (200, "Software version disclosed", Severity::Info);
+pub const MIXED_CONTENT: IssueDef = (311, "Mixed content on a secure page", Severity::Medium);
+pub const MISSING_SRI: IssueDef = (353, "Subresource integrity not used", Severity::Low);
+pub const UNTRUSTED_INCLUSION: IssueDef = (829, "Active content included from an external origin", Severity::Low);
+pub const COOKIE_NO_SAMESITE: IssueDef = (1275, "Cookie without SameSite attribute", Severity::Low);
+pub const TOKEN_IN_URL: IssueDef = (598, "Sensitive information in the URL query string", Severity::Medium);
+pub const JWT_UNSIGNED: IssueDef = (347, "Unsigned web token accepted", Severity::Medium);
+pub const JWT_UNPROTECTED: IssueDef = (327, "Web token carries no signature", Severity::Low);
+pub const SECRET_IN_RESPONSE: IssueDef = (798, "Credential exposed in a response", Severity::Medium);
+pub const SOURCE_MAP_EXPOSED: IssueDef = (540, "Source map reference exposed", Severity::Info);
+pub const STACK_TRACE: IssueDef = (209, "Error message reveals internal detail", Severity::Low);
+pub const DOM_XSS_SINK: IssueDef = (79, "Client-side input may reach a dangerous sink (DOM XSS)", Severity::Low);
+pub const POSTMESSAGE_NO_ORIGIN: IssueDef = (345, "Cross-document message handler without an origin check", Severity::Low);
+
+// --- Active injection and exposure checks (traffic gated by scan intensity) -----------------
+pub const REFLECTED_XSS: IssueDef = (79, "Reflected cross-site scripting", Severity::High);
+pub const SSTI: IssueDef = (1336, "Server-side template injection", Severity::High);
+pub const PATH_TRAVERSAL: IssueDef = (22, "Path traversal", Severity::High);
+pub const CRLF_INJECTION: IssueDef = (113, "HTTP response header injection (CRLF)", Severity::High);
+pub const XPATH_INJECTION: IssueDef = (643, "XPath injection", Severity::High);
+pub const LDAP_INJECTION: IssueDef = (90, "LDAP injection", Severity::High);
+pub const OPEN_REDIRECT: IssueDef = (601, "Open redirection", Severity::Medium);
+pub const HOST_HEADER_INJECTION: IssueDef = (644, "Host header injection", Severity::Medium);
+pub const PROTOTYPE_POLLUTION: IssueDef = (1321, "Prototype pollution", Severity::Medium);
+pub const EXPOSED_FILE: IssueDef = (538, "Sensitive file exposed", Severity::Medium);
+pub const GRAPHQL_INTROSPECTION: IssueDef = (200, "GraphQL introspection enabled", Severity::Low);
+pub const GRAPHQL_BATCHING: IssueDef = (400, "GraphQL query batching not limited", Severity::Medium);
+// Time-based variants (Thorough intensity only): confirmed by a response delay the probe caused.
+pub const TIMED_SQL_INJECTION: IssueDef = (89, "SQL injection (time-based)", Severity::High);
+pub const TIMED_COMMAND_INJECTION: IssueDef = (78, "OS command injection (time-based)", Severity::High);
+
+// --- Crawler-driven checks (forms, login, upgraded connections) -----------------------------
+pub const CSRF_MISSING: IssueDef = (352, "Anti-CSRF token missing on a state-changing form", Severity::Medium);
+pub const SESSION_NOT_ROTATED: IssueDef = (384, "Session identifier not rotated after login", Severity::Medium);
+pub const CSWSH: IssueDef = (1385, "Cross-site WebSocket hijacking", Severity::Medium);
+
 /// Out-of-band findings confirmed by an Interactor relay callback.
 pub const BLIND_SSRF: IssueDef = (918, "Out-of-band resource load (potential SSRF)", Severity::High);
 pub const BLIND_XXE: IssueDef = (611, "XML external entity injection (out-of-band)", Severity::High);
@@ -105,6 +147,23 @@ pub const OOB_COMMAND_INJECTION: IssueDef = (78, "OS command injection (out-of-b
 /// Every issue the scanner can raise, in the order the Issue definitions listing shows them.
 pub const ALL_CHECKS: &[IssueDef] = &[
     SQL_INJECTION,
+    REFLECTED_XSS,
+    SSTI,
+    PATH_TRAVERSAL,
+    CRLF_INJECTION,
+    XPATH_INJECTION,
+    LDAP_INJECTION,
+    OPEN_REDIRECT,
+    HOST_HEADER_INJECTION,
+    PROTOTYPE_POLLUTION,
+    EXPOSED_FILE,
+    GRAPHQL_INTROSPECTION,
+    GRAPHQL_BATCHING,
+    TIMED_SQL_INJECTION,
+    TIMED_COMMAND_INJECTION,
+    CSRF_MISSING,
+    SESSION_NOT_ROTATED,
+    CSWSH,
     OOB_COMMAND_INJECTION,
     BLIND_SSRF,
     BLIND_XXE,
@@ -120,6 +179,23 @@ pub const ALL_CHECKS: &[IssueDef] = &[
     EMAIL_DISCLOSED,
     PRIVATE_IP_DISCLOSED,
     CACHEABLE_HTTPS,
+    CONTENT_TYPE_OPTIONS,
+    CORS_PERMISSIVE,
+    CORS_CREDENTIALED_ORIGIN,
+    REFERRER_POLICY,
+    VERSION_BANNER,
+    MIXED_CONTENT,
+    MISSING_SRI,
+    UNTRUSTED_INCLUSION,
+    COOKIE_NO_SAMESITE,
+    TOKEN_IN_URL,
+    JWT_UNSIGNED,
+    JWT_UNPROTECTED,
+    SECRET_IN_RESPONSE,
+    SOURCE_MAP_EXPOSED,
+    STACK_TRACE,
+    DOM_XSS_SINK,
+    POSTMESSAGE_NO_ORIGIN,
 ];
 
 /// "CWE-89", or "No CWE" for a finding that names none.
@@ -183,6 +259,15 @@ pub struct Finding {
     pub request: String,
     #[serde(default)]
     pub response: String,
+    /// Which insertion point the finding was raised against, e.g. `query parameter "id"`, when
+    /// an active check names one. Empty for passive findings and older project files. Part of
+    /// the consolidation key, so the same weakness on two parameters stays two findings.
+    #[serde(default)]
+    pub point: String,
+    /// The benign value the active check substituted, kept so a reader can see what was sent.
+    /// Empty for passive findings and older project files.
+    #[serde(default)]
+    pub payload: String,
 }
 
 /// A finding with nothing said about it: the shape a parser fills in field by field. Not a
@@ -201,6 +286,8 @@ impl Default for Finding {
             remediation: String::new(),
             request: String::new(),
             response: String::new(),
+            point: String::new(),
+            payload: String::new(),
         }
     }
 }
@@ -234,92 +321,98 @@ impl Finding {
 /// number alone would merge two unrelated issues into one.
 pub fn consolidate(mut fs: Vec<Finding>) -> Vec<Finding> {
     let mut seen = std::collections::HashSet::new();
-    fs.retain(|f| seen.insert((f.cwe, f.name.clone(), f.host.clone(), f.path.clone())));
+    fs.retain(|f| seen.insert((f.cwe, f.name.clone(), f.host.clone(), f.path.clone(), f.point.clone())));
     fs.sort_by(|a, b| b.severity.cmp(&a.severity));
     fs
 }
 
-fn header_present(headers: &str, name: &str) -> bool {
-    let lname = name.to_ascii_lowercase();
-    headers.lines().any(|l| l.to_ascii_lowercase().trim_start().starts_with(&lname))
-}
-
-fn header_lines<'a>(headers: &'a str, name: &str) -> Vec<&'a str> {
-    let lname = name.to_ascii_lowercase();
-    headers
-        .lines()
-        .filter(|l| l.to_ascii_lowercase().trim_start().starts_with(&lname))
-        .collect()
-}
-
 /// Passive audit of one request/response pair. `secure` = request was over HTTPS.
+///
+/// The individual checks live in `crate::checks::passive`, one small function each; this drives
+/// them in registry order and gathers their findings. The signature and the findings produced
+/// are unchanged from when every check was inlined here.
 pub fn passive_checks(host: &str, path: &str, secure: bool, headers: &str, body: &str) -> Vec<Finding> {
+    let ctx = crate::checks::PassiveCtx::new(host, path, secure, headers, body);
     let mut out = Vec::new();
-    let mut push = |def, conf, detail: &str| out.push(Finding::new(def, conf, host, path, detail));
-    let lbody = body.to_ascii_lowercase();
+    for (_id, check) in crate::checks::passive_registry() {
+        out.extend(check(&ctx));
+    }
+    out
+}
 
-    if secure && !header_present(headers, "strict-transport-security") {
-        push(HSTS_NOT_ENFORCED, Confidence::Certain,
-            "The HTTPS response did not set a Strict-Transport-Security header, so a browser may be \
-             downgraded to plain HTTP by a network attacker.");
-    }
-    if !header_present(headers, "content-security-policy") {
-        push(CSP_NOT_ENFORCED, Confidence::Certain,
-            "No Content-Security-Policy header was present. A policy limits the damage of \
-             cross-site scripting by restricting where scripts may load from.");
-    }
-    let framed = header_present(headers, "x-frame-options")
-        || headers.to_ascii_lowercase().contains("frame-ancestors");
-    if !framed {
-        push(FRAMEABLE, Confidence::Firm,
-            "The response can be shown inside a frame on another site, so it may be open to \
-             clickjacking unless framing is restricted.");
-    }
-    for cookie in header_lines(headers, "set-cookie") {
-        let low = cookie.to_ascii_lowercase();
-        if secure && !low.contains("secure") {
-            push(TLS_COOKIE_NO_SECURE, Confidence::Firm,
-                "A cookie was set over HTTPS without the Secure flag, so it may also be sent over \
-                 an unencrypted connection.");
+/// Split a recorded raw response into its header block (without the status line) and its body,
+/// tolerating either CRLF or LF framing. Used to audit already-captured traffic passively.
+fn split_recorded_response(raw: &str) -> (&str, &str) {
+    let (head, body) = if let Some(i) = raw.find("\r\n\r\n") {
+        (&raw[..i], &raw[i + 4..])
+    } else if let Some(i) = raw.find("\n\n") {
+        (&raw[..i], &raw[i + 2..])
+    } else {
+        (raw, "")
+    };
+    // the first line is the status line, which no header check should see
+    let headers = head.split_once('\n').map(|(_, h)| h).unwrap_or("");
+    (headers, body)
+}
+
+/// Audit traffic already captured in the proxy history with the passive checks, making no new
+/// requests. Every recorded response is inspected and the findings consolidated, so a scan is
+/// not needed to surface the passive issues in what has already been browsed.
+pub fn passive_audit_history(entries: &[crate::http::HttpEntry]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for e in entries {
+        // A cookie-authenticated WebSocket handshake: the browser attaches the cookie across
+        // sites, and a WebSocket is not covered by the same-origin rules that guard fetch, so
+        // unless the server checks Origin another site can open an authenticated socket.
+        if is_ws_handshake(&e.request) && request_has_cookie(&e.request) {
+            let mut f = Finding::new(CSWSH, Confidence::Tentative, &e.host, &e.path,
+                "A WebSocket handshake carried a session cookie, so the connection is authenticated by \
+                 the cookie alone. Unless the server verifies the Origin header, another site can open \
+                 this socket on a logged-in user's behalf (cross-site WebSocket hijacking).");
+            f.point = "WebSocket handshake".to_string();
+            out.push(f);
         }
-        if !low.contains("httponly") {
-            push(COOKIE_NO_HTTPONLY, Confidence::Firm,
-                "A cookie was set without the HttpOnly flag, so page scripts can read it, which \
-                 makes it easier to steal through cross-site scripting.");
+        if e.response.trim().is_empty() {
+            continue;
         }
+        let secure = e.url.starts_with("https");
+        let (headers, body) = split_recorded_response(&e.response);
+        out.extend(passive_checks(&e.host, &e.path, secure, headers, body));
     }
-    if secure {
-        let cc = header_lines(headers, "cache-control").join(" ").to_ascii_lowercase();
-        if !cc.contains("no-store") {
-            push(CACHEABLE_HTTPS, Confidence::Certain,
-                "The HTTPS response may be kept by caches because Cache-Control: no-store was not \
-                 set, so sensitive content could be left on disk.");
+    consolidate(out)
+}
+
+/// Whether a recorded request is a WebSocket upgrade handshake.
+fn is_ws_handshake(request: &str) -> bool {
+    request.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("upgrade:") && l.contains("websocket")
+    })
+}
+
+/// Whether a recorded request carries a Cookie header.
+fn request_has_cookie(request: &str) -> bool {
+    request.lines().any(|l| l.to_ascii_lowercase().trim_start().starts_with("cookie:"))
+}
+
+/// The session identifiers a response set, as name -> value: the Set-Cookie cookies whose name
+/// looks like a session. Used to tell whether logging in rotated the session.
+fn session_ids(headers: &str) -> std::collections::BTreeMap<String, String> {
+    const SESSION_NAMES: &[&str] = &["sess", "sid", "auth"];
+    let mut out = std::collections::BTreeMap::new();
+    for line in headers.lines() {
+        if !line.to_ascii_lowercase().trim_start().starts_with("set-cookie:") {
+            continue;
         }
-    }
-    if lbody.contains("index of /") || lbody.contains("directory listing for /") {
-        push(DIRECTORY_LISTING, Confidence::Firm,
-            "The response looks like an automatic directory listing, which can reveal files that \
-             were not meant to be public.");
-    }
-    if lbody.contains("type=\"password\"") {
-        if !lbody.contains("autocomplete=\"off\"") {
-            push(PASSWORD_AUTOCOMPLETE, Confidence::Certain,
-                "A password box did not turn off autocomplete, so the browser may store the value.");
+        let value = line.split_once(':').map(|x| x.1).unwrap_or("").trim();
+        let cookie = value.split(';').next().unwrap_or("");
+        if let Some((name, val)) = cookie.split_once('=') {
+            let name = name.trim();
+            let lname = name.to_ascii_lowercase();
+            if SESSION_NAMES.iter().any(|p| lname.contains(p)) {
+                out.insert(name.to_string(), val.trim().to_string());
+            }
         }
-        if !secure {
-            push(CLEARTEXT_PASSWORD, Confidence::Certain,
-                "A page served over plain HTTP contains a password box, so the password would be \
-                 sent unencrypted.");
-        }
-    }
-    if contains_email(body) {
-        push(EMAIL_DISCLOSED, Confidence::Firm,
-            "The response contained one or more email addresses, which can help an attacker with \
-             phishing or password guessing.");
-    }
-    if contains_private_ip(body) {
-        push(PRIVATE_IP_DISCLOSED, Confidence::Firm,
-            "The response mentioned a private (internal) IP address, which leaks network layout.");
     }
     out
 }
@@ -409,34 +502,6 @@ pub fn extract_links(base: &str, body: &str) -> Vec<String> {
     out
 }
 
-fn contains_email(s: &str) -> bool {
-    let b = s.as_bytes();
-    for (i, &c) in b.iter().enumerate() {
-        if c == b'@' && i > 0 && i + 3 < b.len() && b[i - 1].is_ascii_alphanumeric() {
-            let after = &s[i + 1..];
-            let domain = after.split(['/', ' ', '"', '<', ')', '\n', ',']).next().unwrap_or("");
-            if domain.contains('.') && domain.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn contains_private_ip(s: &str) -> bool {
-    for tok in s.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        let parts: Vec<&str> = tok.split('.').collect();
-        if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-            let a: u8 = parts[0].parse().unwrap();
-            let b: u8 = parts[1].parse().unwrap();
-            if a == 10 || (a == 192 && b == 168) || (a == 172 && (16..=31).contains(&b)) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// How far a headless scan goes, so a command line can hold it in where the GUI leans on the
 /// fixed crawl limits.
 #[derive(Clone, Copy, Debug)]
@@ -449,6 +514,9 @@ pub struct ScanLimits {
     /// relay for callbacks. A real target resolves or fetches a canary a moment after it is
     /// given it, so a short settle window catches the interaction; tests set it tiny.
     pub oast_settle: std::time::Duration,
+    /// How hard the active checks probe. Passive checks run at every level; the engine skips
+    /// active checks whose minimum level is above this one.
+    pub intensity: crate::checks::Intensity,
 }
 
 impl Default for ScanLimits {
@@ -457,6 +525,7 @@ impl Default for ScanLimits {
             depth: crate::rules::CRAWL_MAX_LINK_DEPTH,
             max_pages: crate::rules::CRAWL_MAX_UNIQUE_LOCATIONS,
             oast_settle: DEFAULT_OAST_SETTLE,
+            intensity: crate::checks::Intensity::default(),
         }
     }
 }
@@ -465,8 +534,11 @@ impl Default for ScanLimits {
 /// relay for callbacks, unless a caller shortens it.
 pub const DEFAULT_OAST_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// One line of a scan's running account, for a caller to show as it arrives.
-pub type ScanProgress<'a> = dyn FnMut(&str) + 'a;
+/// Called once for every exchange a scan makes, as it is made: the method, the URL, how long
+/// it took, and its result. A command line turns this into a running account; the drawn app
+/// records the exchange to history and reports progress from the same callback, so both drivers
+/// share one engine. The scan also keeps every exchange in [`ScanOutcome::history`].
+pub type ScanSink<'a> = dyn FnMut(&str, &str, std::time::Duration, &crate::http::SendResult) + 'a;
 
 /// What a headless scan found and fetched.
 pub struct ScanOutcome {
@@ -676,94 +748,236 @@ fn command_substitution_vector(canary: &str) -> String {
     format!("{open}nslookup {canary})")
 }
 
+/// A scanner request, sent on the shared crawl agent when one could be built (so a long crawl
+/// reuses one client and its connection pool) and otherwise on a fresh client per request. All
+/// scanner traffic follows redirects and unpacks compressed bodies, as it always has.
+fn scan_send(
+    agent: &Option<ureq::Agent>,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    opts: &crate::http::SendOptions,
+) -> crate::http::SendResult {
+    match agent {
+        Some(a) => crate::http::send_with(a, method, url, headers, body, true),
+        None => crate::http::send(method, url, headers, body, crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts),
+    }
+}
+
+/// Append one exchange to a scan's history, with the monotonic id the history table expects.
+fn record_exchange(
+    history: &mut Vec<crate::http::HttpEntry>,
+    next_id: &mut usize,
+    method: &str,
+    url: &str,
+    elapsed: std::time::Duration,
+    r: &crate::http::SendResult,
+) {
+    *next_id += 1;
+    let (host, path) = crate::http::split_url(url);
+    history.push(crate::http::HttpEntry {
+        id: *next_id,
+        tool: "Scanner".into(),
+        method: method.into(),
+        host,
+        path,
+        status: r.status.clone(),
+        length: r.length,
+        mime: r.mime.clone(),
+        request: format!("{method} {url}"),
+        response: r.raw_response(),
+        url: url.to_string(),
+        truncated: false,
+        time: crate::http::now_ms(),
+        elapsed_ms: elapsed.as_millis() as u64,
+        graphql: String::new(),
+    });
+}
+
 /// Crawl (when `crawl` is set) and audit `start`, synchronously, with no app behind it.
 ///
-/// This is the engine the scan task in the drawn app drives on a worker; run here on the
-/// calling thread so a command line can wait for it and act on what it found. Every page is
-/// audited with the passive checks, and the start page is then probed once with a benign
-/// marker for a reflected value and for a database error message. `progress` is called with a
-/// line for each request as it is made.
+/// This is the single scan engine: the drawn app drives it on a worker thread and a command
+/// line drives it in the foreground, both through `sink` (called for every exchange) and the
+/// shared `stop` flag (checked between requests, so a scan can be cancelled or held to a wall
+/// clock from outside). Every page is audited with the passive checks, the start page is probed
+/// once with a benign marker for a reflected value and a database error message, and -- when a
+/// relay is configured -- the out-of-band canaries are planted and polled.
+/// Login credentials for the authenticated crawl: when set, the scanner submits them to the
+/// first login form it finds, carries the resulting session forward, and checks that the session
+/// identifier was rotated.
+#[derive(Clone, Debug, Default)]
+pub struct Login {
+    pub username: String,
+    pub password: String,
+}
+
+impl Login {
+    /// Credentials worth using: both fields are present.
+    pub fn is_set(&self) -> bool {
+        !self.username.trim().is_empty() && !self.password.trim().is_empty()
+    }
+}
+
+/// What bounds and steers a scan beyond its limits: the scope it may not leave, and the login it
+/// may use. Default is an unbounded (same-origin) scan with no login, which is how a plain scan
+/// runs.
+#[derive(Default)]
+pub struct ScanContext<'a> {
+    pub scope: Option<&'a crate::scope::TargetScope>,
+    pub login: Option<Login>,
+}
+
+// The scan engine's inputs are distinct runtime concerns -- where to start, how far to go, the
+// relay, the network options, the scope and login, the stop flag and the progress sink -- so it
+// takes them as arguments rather than one grab-bag struct.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scan(
     start: &str,
     crawl: bool,
     limits: ScanLimits,
     oast: Option<ScanInteractor>,
     opts: &crate::http::SendOptions,
-    progress: &mut ScanProgress<'_>,
+    ctx: &ScanContext<'_>,
+    stop: &std::sync::atomic::AtomicBool,
+    sink: &mut ScanSink<'_>,
 ) -> ScanOutcome {
+    use std::sync::atomic::Ordering;
     let mut findings = Vec::new();
     let mut history = Vec::new();
     let mut next_id = 0usize;
-    let mut record = |method: &str, url: &str, r: &crate::http::SendResult, history: &mut Vec<crate::http::HttpEntry>| {
-        next_id += 1;
-        let (host, path) = crate::http::split_url(url);
-        history.push(crate::http::HttpEntry {
-            id: next_id,
-            tool: "Scanner".into(),
-            method: method.into(),
-            host,
-            path,
-            status: r.status.clone(),
-            length: r.length,
-            mime: r.mime.clone(),
-            request: format!("{method} {url}"),
-            response: r.raw_response(),
-            url: url.to_string(),
-            truncated: false,
-            time: crate::http::now_ms(),
-            elapsed_ms: 0,
-            graphql: String::new(),
-        });
-    };
+    // One client for the whole crawl and the marker probe; falls back to a per-request client
+    // only if it cannot be built, so a scan never fails for want of connection pooling.
+    let agent = crate::http::agent(crate::rules::AUDIT_FOLLOW_REDIRECTS, opts).ok();
+
+    // Scope is a hard boundary: a configured scope gates every crawled link and submitted form,
+    // and an empty scope lets the same-origin rule stand, so behaviour is unchanged until one is
+    // set. The start URL is where the operator pointed the scan, so it is always audited.
+    let start_origin = origin_of_url(start);
+    let active = limits.intensity > crate::checks::Intensity::PassiveOnly;
+    let in_scope = |url: &str| ctx.scope.is_none_or(|s| s.is_in_scope(url));
+
+    let mut form_targets: Vec<crate::insertion::BaseRequest> = Vec::new();
+    let mut form_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Authenticated crawl: log in once up front, check that the session identifier was rotated,
+    // and carry the session cookie on every later request. Skipped when no login is configured.
+    let mut cookie_header: Vec<(String, String)> = Vec::new();
+    if let Some(login) = ctx.login.as_ref().filter(|l| l.is_set() && !stop.load(Ordering::Relaxed)) {
+        let pre = scan_send(&agent, "GET", start, &[], "", opts);
+        record_exchange(&mut history, &mut next_id, "GET", start, std::time::Duration::ZERO, &pre);
+        sink("GET", start, std::time::Duration::ZERO, &pre);
+        let pre_ids = session_ids(&pre.headers);
+        if let Some(form) = crate::crawler::parse_forms(start, &pre.body).into_iter().find(|f| f.has_password()) {
+            let req = crate::crawler::login_request(&form, &login.username, &login.password);
+            let post = scan_send(&agent, &req.method, &req.url, &req.headers, &req.body, opts);
+            record_exchange(&mut history, &mut next_id, &req.method, &req.url, std::time::Duration::ZERO, &post);
+            sink(&req.method, &req.url, std::time::Duration::ZERO, &post);
+            let post_ids = session_ids(&post.headers);
+            let (host, path) = crate::http::split_url(start);
+            // session fixation: a session id that was set before login and is unchanged after it
+            for (name, before) in &pre_ids {
+                if post_ids.get(name) == Some(before) {
+                    let mut f = Finding::new(SESSION_NOT_ROTATED, Confidence::Firm, &host, &path,
+                        &format!("The session cookie \"{name}\" was not changed when the user logged in. An \
+                                  attacker who fixes a victim's session identifier before login keeps access \
+                                  after it (session fixation); issue a fresh session on authentication."));
+                    f.point = format!("session cookie \"{name}\"");
+                    findings.push(f);
+                }
+            }
+            // carry the freshest session forward for the authenticated crawl
+            let carry = if post_ids.is_empty() { &pre_ids } else { &post_ids };
+            let joined = carry.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
+            if !joined.is_empty() {
+                cookie_header.push(("Cookie".to_string(), joined));
+            }
+        }
+    }
 
     let mut queue = std::collections::VecDeque::from([(start.to_string(), 0usize)]);
     let mut seen = std::collections::HashSet::from([start.to_string()]);
     let mut requests = 0usize;
     while let Some((page, depth)) = queue.pop_front() {
-        if requests >= limits.max_pages {
+        if requests >= limits.max_pages || stop.load(Ordering::Relaxed) {
             break;
         }
         requests += 1;
-        let r = crate::http::send("GET", &page, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
-        record("GET", &page, &r, &mut history);
+        let sent_at = std::time::Instant::now();
+        let r = scan_send(&agent, "GET", &page, &cookie_header, "", opts);
+        let elapsed = sent_at.elapsed();
+        record_exchange(&mut history, &mut next_id, "GET", &page, elapsed, &r);
         let (host, path) = crate::http::split_url(&page);
         findings.extend(passive_checks(&host, &path, page.starts_with("https"), &r.headers, &r.body));
-        progress(&format!("GET {page} — {}", r.status));
+        sink("GET", &page, elapsed, &r);
+
+        // Forms on the page: a passive anti-CSRF check always, and -- at active intensities -- a
+        // deduplicated submission to audit, filled with realistic values and its hidden fields kept.
+        for form in crate::crawler::parse_forms(&page, &r.body) {
+            if origin_of_url(&form.action) != start_origin || !in_scope(&form.action) {
+                continue;
+            }
+            if let Some(f) = crate::crawler::csrf_finding(&form, &host, &path) {
+                findings.push(f);
+            }
+            if active && form_sigs.insert(form.signature()) {
+                form_targets.push(crate::crawler::to_request(&form));
+            }
+        }
+
         if crawl && depth < limits.depth {
             for link in extract_links(&page, &r.body) {
-                if seen.insert(link.clone()) {
+                if in_scope(&link) && seen.insert(link.clone()) {
                     queue.push_back((link, depth + 1));
                 }
             }
         }
     }
 
-    // the start page, probed once with a value that is safe to send and unmistakable to find
-    let (host, path) = crate::http::split_url(start);
-    let marker = "fpx9q7z";
-    let probe = if start.contains('?') { format!("{start}&q={marker}") } else { format!("{start}?q={marker}") };
-    let pr = crate::http::send("GET", &probe, &[], "", crate::rules::AUDIT_FOLLOW_REDIRECTS, true, opts);
-    record("GET", &probe, &pr, &mut history);
-    progress(&format!("GET {probe} — {}", pr.status));
-    if reflects_marker(&pr.body, marker) {
-        findings.push(Finding::new(INPUT_REFLECTED, Confidence::Certain, &host, &path,
-            "A value sent in the query string came back unchanged in the page. That is the first condition \
-             for reflected cross-site scripting; check how this value is encoded."));
-    }
-    if let Some(sig) = sql_error_signature(&pr.body) {
-        findings.push(Finding::new(SQL_INJECTION, Confidence::Tentative, &host, &path,
-            &format!("The page showed a database error message ({sig}). That can point to SQL injection and \
-                      also reveals details about the database.")));
+    // the start page, audited actively: each insertion point is probed, the request as a whole
+    // is probed, and the endpoint is checked for exposed files and open GraphQL. Every probe is
+    // confirmed before it reports. Skipped at the passive-only level and once the scan is stopped.
+    if limits.intensity > crate::checks::Intensity::PassiveOnly && !stop.load(Ordering::Relaxed) {
+        let (host, path) = crate::http::split_url(start);
+        let base = crate::insertion::BaseRequest::get(start);
+        // a second client that does not follow redirects, so a check can read a Location or the
+        // raw response headers (open redirect, CRLF, host-header, exposed files)
+        let agent_nf = crate::http::agent(false, opts).ok();
+        let mut send = |p: &crate::insertion::PreparedRequest, follow: bool| -> crate::http::SendResult {
+            let client = if follow { &agent } else { &agent_nf };
+            let sent_at = std::time::Instant::now();
+            let r = match client {
+                Some(a) => crate::http::send_with(a, &p.method, &p.url, &p.headers, &p.body, true),
+                None => crate::http::send(&p.method, &p.url, &p.headers, &p.body, follow, true, opts),
+            };
+            let elapsed = sent_at.elapsed();
+            record_exchange(&mut history, &mut next_id, &p.method, &p.url, elapsed, &r);
+            sink(&p.method, &p.url, elapsed, &r);
+            r
+        };
+        findings.extend(crate::checks::active::audit_in_band(&base, &host, &path, limits.intensity, &mut send));
+        findings.extend(crate::checks::active::audit_endpoint(start, &host, &path, limits.intensity, &mut send));
+        // Each form discovered during the crawl is submitted and audited like any other request,
+        // so its fields become insertion points. The list is already deduplicated by signature.
+        for ft in &form_targets {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let (fh, fp) = crate::http::split_url(&ft.url);
+            findings.extend(crate::checks::active::audit_in_band(ft, &fh, &fp, limits.intensity, &mut send));
+        }
     }
 
     // Out-of-band audit: plant the canaries, record each probe exchange, settle, and poll the
-    // relay for callbacks. Skipped entirely when no relay is configured.
+    // relay for callbacks. Skipped entirely when no relay is configured or the scan was stopped.
     if let Some(mut oast) = oast {
-        for ex in oast.plant(start, opts) {
-            record(&ex.method, &ex.url, &ex.result, &mut history);
-            progress(&format!("{} {} — {}", ex.method, ex.url, ex.result.status));
+        if !stop.load(Ordering::Relaxed) {
+            for ex in oast.plant(start, opts) {
+                record_exchange(&mut history, &mut next_id, &ex.method, &ex.url, std::time::Duration::ZERO, &ex.result);
+                sink(&ex.method, &ex.url, std::time::Duration::ZERO, &ex.result);
+            }
+            findings.extend(oast.collect(limits.oast_settle, opts));
         }
-        findings.extend(oast.collect(limits.oast_settle, opts));
     }
 
     ScanOutcome { findings: consolidate(findings), history }
@@ -903,11 +1117,12 @@ mod tests {
     fn out_of_band_canaries_become_consolidated_findings() {
         let mocks = crate::test_utils::OastMocks::start();
         let oast = ScanInteractor::configure(&mocks.relay, "").expect("the relay is configured");
-        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(150) };
+        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(150), ..ScanLimits::default() };
         let opts = crate::http::SendOptions::default();
         let url = format!("{}/app", mocks.target);
 
-        let outcome = run_scan(&url, false, limits, Some(oast), &opts, &mut |_| {});
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = run_scan(&url, false, limits, Some(oast), &opts, &ScanContext::default(), &stop, &mut |_, _, _, _| {});
 
         // the target was actually sent unique correlation tokens, one per probe
         let seen = mocks.seen.lock().unwrap().clone();
@@ -950,10 +1165,11 @@ mod tests {
         let mocks = crate::test_utils::OastMocks::start();
         assert!(ScanInteractor::configure("", "").is_none(), "an empty relay leaves OAST off");
         let opts = crate::http::SendOptions::default();
-        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(10) };
+        let limits = ScanLimits { depth: 0, max_pages: 1, oast_settle: std::time::Duration::from_millis(10), ..ScanLimits::default() };
         let url = format!("{}/app", mocks.target);
 
-        let outcome = run_scan(&url, false, limits, None, &opts, &mut |_| {});
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = run_scan(&url, false, limits, None, &opts, &ScanContext::default(), &stop, &mut |_, _, _, _| {});
 
         assert!(mocks.seen.lock().unwrap().is_empty(), "no canary is sent when no relay is set");
         assert!(
@@ -1007,5 +1223,152 @@ mod tests {
         );
         assert!(links.iter().all(|l| !l.contains("evil") && !l.contains(":8443") && !l.starts_with("http:")));
         assert!(extract_links("not a url", page).is_empty());
+    }
+
+    /// The passive checks added with the wider CWE coverage: each fires on a fixture that shows
+    /// its weakness and stays quiet on one that does not, so new checks do not add false-positive
+    /// noise. Findings are matched by name through the aggregate `passive_checks`.
+    #[test]
+    fn expanded_passive_matrix() {
+        fn present(secure: bool, path: &str, headers: &str, body: &str, name: &str) -> bool {
+            passive_checks("a.test", path, secure, headers, body)
+                .iter()
+                .any(|f| f.name == name)
+        }
+
+        // X-Content-Type-Options
+        assert!(present(true, "/", "Content-Type: text/html", "", CONTENT_TYPE_OPTIONS.1));
+        assert!(!present(true, "/", "X-Content-Type-Options: nosniff", "", CONTENT_TYPE_OPTIONS.1));
+
+        // CORS: wildcard is permissive; a named origin with credentials is flagged separately
+        assert!(present(true, "/", "Access-Control-Allow-Origin: *", "", CORS_PERMISSIVE.1));
+        assert!(present(true, "/", "Access-Control-Allow-Origin: https://x.test\nAccess-Control-Allow-Credentials: true", "", CORS_CREDENTIALED_ORIGIN.1));
+        assert!(!present(true, "/", "Access-Control-Allow-Origin: https://x.test", "", CORS_CREDENTIALED_ORIGIN.1));
+
+        // Referrer-Policy present silences the check
+        assert!(present(true, "/", "Content-Type: text/html", "", REFERRER_POLICY.1));
+        assert!(!present(true, "/", "Referrer-Policy: no-referrer", "", REFERRER_POLICY.1));
+
+        // version banner
+        assert!(present(true, "/", "Server: acme/1.4.2", "", VERSION_BANNER.1));
+        assert!(!present(true, "/", "Server: acme", "", VERSION_BANNER.1));
+
+        // SameSite
+        assert!(present(true, "/", "Set-Cookie: s=1; Secure; HttpOnly", "", COOKIE_NO_SAMESITE.1));
+        assert!(!present(true, "/", "Set-Cookie: s=1; Secure; HttpOnly; SameSite=Lax", "", COOKIE_NO_SAMESITE.1));
+
+        // sensitive token in the URL query string
+        assert!(present(true, "/cb?access_token=abc123", "", "", TOKEN_IN_URL.1));
+        assert!(!present(true, "/cb?page=2", "", "", TOKEN_IN_URL.1));
+
+        // JWTs: alg none and a missing signature
+        let hn = crate::codec::base64url_encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let hs = crate::codec::base64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let pl = crate::codec::base64url_encode(br#"{"sub":"1"}"#);
+        let sig = crate::codec::base64url_encode(b"signaturebytes");
+        let body_none = format!("token: {hn}.{pl}.");
+        let body_unprot = format!("token: {hs}.{pl}.");
+        let body_signed = format!("token: {hs}.{pl}.{sig}");
+        assert!(present(true, "/", "", &body_none, JWT_UNSIGNED.1));
+        assert!(present(true, "/", "", &body_unprot, JWT_UNPROTECTED.1));
+        assert!(!present(true, "/", "", &body_signed, JWT_UNSIGNED.1));
+        assert!(!present(true, "/", "", &body_signed, JWT_UNPROTECTED.1));
+
+        // credential in a response: a PEM key, and a long secret assignment (but not a placeholder)
+        assert!(present(true, "/", "", "-----BEGIN RSA PRIVATE KEY-----\nMIIB...\n", SECRET_IN_RESPONSE.1));
+        assert!(present(true, "/", "", "{\"api_key\":\"a1b2c3d4e5f6g7h8i9j0\"}", SECRET_IN_RESPONSE.1));
+        assert!(!present(true, "/", "", "{\"api_key\":\"your_example_key_here\"}", SECRET_IN_RESPONSE.1));
+
+        // source map reference
+        assert!(present(true, "/app.js", "", "//# sourceMappingURL=app.js.map", SOURCE_MAP_EXPOSED.1));
+        assert!(!present(true, "/app.js", "", "var x = 1;", SOURCE_MAP_EXPOSED.1));
+
+        // stack trace
+        assert!(present(true, "/", "", "Traceback (most recent call last):\n  File ...", STACK_TRACE.1));
+        assert!(!present(true, "/", "", "<p>All good</p>", STACK_TRACE.1));
+
+        // mixed content on a secure page
+        assert!(present(true, "/", "", r#"<img src="http://cdn.test/a.png">"#, MIXED_CONTENT.1));
+        assert!(!present(false, "/", "", r#"<img src="http://cdn.test/a.png">"#, MIXED_CONTENT.1));
+        assert!(!present(true, "/", "", r#"<img src="https://cdn.test/a.png">"#, MIXED_CONTENT.1));
+
+        // external script without SRI
+        assert!(present(true, "/", "", r#"<script src="https://cdn.other/x.js"></script>"#, MISSING_SRI.1));
+        assert!(!present(true, "/", "", r#"<script src="https://cdn.other/x.js" integrity="sha384-x"></script>"#, MISSING_SRI.1));
+        assert!(!present(true, "/", "", r#"<script src="/local.js"></script>"#, MISSING_SRI.1));
+
+        // framed-in active content from another origin
+        assert!(present(true, "/", "", r#"<iframe src="https://ads.other/f"></iframe>"#, UNTRUSTED_INCLUSION.1));
+        assert!(!present(true, "/", "", r#"<iframe src="/own/f"></iframe>"#, UNTRUSTED_INCLUSION.1));
+
+        // DOM XSS source-to-sink
+        assert!(present(true, "/", "", "var h = location.hash; el.innerHTML = h;", DOM_XSS_SINK.1));
+        assert!(!present(true, "/", "", "var h = location.hash; el.textContent = h;", DOM_XSS_SINK.1));
+
+        // postMessage handler with no origin check
+        assert!(present(true, "/", "", "window.addEventListener('message', function(e){ handle(e.data); });", POSTMESSAGE_NO_ORIGIN.1));
+        assert!(!present(true, "/", "", "window.addEventListener('message', function(e){ if (e.origin === O) handle(e.data); });", POSTMESSAGE_NO_ORIGIN.1));
+    }
+
+    #[test]
+    fn passive_audit_of_captured_traffic_finds_issues_without_new_requests() {
+        let entry = |url: &str, response: &str| crate::http::HttpEntry {
+            id: 1,
+            tool: "Proxy".into(),
+            method: "GET".into(),
+            host: "a.test".into(),
+            path: "/".into(),
+            status: "200 OK".into(),
+            length: 0,
+            mime: "text/html".into(),
+            request: "GET /".into(),
+            response: response.into(),
+            url: url.into(),
+            truncated: false,
+            time: 0,
+            elapsed_ms: 0,
+            graphql: String::new(),
+        };
+        let entries = vec![
+            entry("https://a.test/", "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: acme/1.2\r\n\r\n<p>hi</p>"),
+            entry("https://a.test/", ""),
+        ];
+        let names: Vec<String> = passive_audit_history(&entries).iter().map(|f| f.name.clone()).collect();
+        assert!(names.iter().any(|n| n == VERSION_BANNER.1), "version banner from the Server header: {names:?}");
+        assert!(names.iter().any(|n| n == CSP_NOT_ENFORCED.1), "missing CSP: {names:?}");
+    }
+
+    #[test]
+    fn session_ids_reads_only_session_cookies() {
+        let h = "set-cookie: sessionid=abc; Path=/\nset-cookie: theme=dark\nset-cookie: user_sid=xyz; HttpOnly";
+        let ids = session_ids(h);
+        assert_eq!(ids.get("sessionid").map(String::as_str), Some("abc"));
+        assert_eq!(ids.get("user_sid").map(String::as_str), Some("xyz"));
+        assert!(!ids.contains_key("theme"), "a non-session cookie is ignored");
+    }
+
+    #[test]
+    fn cookie_authenticated_websocket_handshake_is_flagged_as_cswsh() {
+        let entry = |request: &str| crate::http::HttpEntry {
+            id: 1,
+            tool: "Proxy".into(),
+            method: "GET".into(),
+            host: "a.test".into(),
+            path: "/ws".into(),
+            status: "101 Switching Protocols".into(),
+            length: 0,
+            mime: String::new(),
+            request: request.into(),
+            response: "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".into(),
+            url: "https://a.test/ws".into(),
+            truncated: false,
+            time: 0,
+            elapsed_ms: 0,
+            graphql: String::new(),
+        };
+        let with_cookie = entry("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nCookie: sid=abc\r\n\r\n");
+        let no_cookie = entry("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+        assert!(passive_audit_history(&[with_cookie]).iter().any(|f| f.name == CSWSH.1), "a cookie-authed handshake is flagged");
+        assert!(!passive_audit_history(&[no_cookie]).iter().any(|f| f.name == CSWSH.1), "no cookie, no CSWSH");
     }
 }

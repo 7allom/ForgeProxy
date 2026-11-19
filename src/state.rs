@@ -194,6 +194,7 @@ pub enum DrawerTab {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
     Proxy,
+    Scanner,
     Intruder,
     Repeater,
     Sequencer,
@@ -260,6 +261,14 @@ pub struct UserSettings {
     pub interactor_default_server: String,
     /// Seconds between polls while the Interactor tab's timer is on.
     pub interactor_poll_secs: u64,
+    /// Settings > Scanner: how hard a new scan probes by default.
+    #[serde(default)]
+    pub scan_intensity: crate::checks::Intensity,
+    /// Settings > Scanner: how far a crawl follows links, and the page cap.
+    #[serde(default = "default_scan_depth")]
+    pub scan_depth: usize,
+    #[serde(default = "default_scan_max_pages")]
+    pub scan_max_pages: usize,
     /// Which way a message pane opens before anyone has switched it.
     #[serde(default, deserialize_with = "crate::viewer::de_view_mode")]
     pub default_message_view: crate::viewer::MessageViewMode,
@@ -290,6 +299,14 @@ pub struct UserSettings {
     pub browser_start_url: String,
 }
 
+fn default_scan_depth() -> usize {
+    crate::rules::CRAWL_MAX_LINK_DEPTH
+}
+
+fn default_scan_max_pages() -> usize {
+    crate::rules::CRAWL_MAX_UNIQUE_LOCATIONS
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         UserSettings {
@@ -312,6 +329,9 @@ impl Default for UserSettings {
             sequencer_threads: crate::rules::SEQUENCER_THREADS,
             interactor_default_server: String::new(),
             interactor_poll_secs: DEFAULT_INTERACTOR_POLL_SECS,
+            scan_intensity: crate::checks::Intensity::default(),
+            scan_depth: default_scan_depth(),
+            scan_max_pages: default_scan_max_pages(),
             default_message_view: crate::viewer::MessageViewMode::Raw,
             ca_export_dir: String::new(),
             hotkeys: std::collections::BTreeMap::new(),
@@ -334,6 +354,9 @@ impl UserSettings {
     /// Fast enough to feel live, slow enough not to hammer a relay that rate-limits.
     pub const INTERACTOR_POLL_RANGE: std::ops::RangeInclusive<u64> = 2..=300;
     pub const HTTP_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1..=120;
+    /// A crawl this deep already visits a great many pages; deeper rarely finds more.
+    pub const SCAN_DEPTH_MAX: usize = 20;
+    pub const SCAN_MAX_PAGES_MAX: usize = 100_000;
     pub const PROXY_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
 
     /// Values brought into their ranges (a hand-edited file can hold anything).
@@ -347,6 +370,8 @@ impl UserSettings {
         self.int_concurrency = self.int_concurrency.clamp(1, 50);
         self.int_delay_ms = self.int_delay_ms.min(60_000);
         self.sequencer_threads = self.sequencer_threads.clamp(1, 20);
+        self.scan_depth = self.scan_depth.min(Self::SCAN_DEPTH_MAX);
+        self.scan_max_pages = self.scan_max_pages.clamp(1, Self::SCAN_MAX_PAGES_MAX);
         let c = Self::INTERACTOR_POLL_RANGE;
         self.interactor_poll_secs = self.interactor_poll_secs.clamp(*c.start(), *c.end());
         let e = crate::rules::ENTRY_LIMIT_RANGE;
@@ -713,6 +738,9 @@ pub struct App {
     /// Sent as the `Authorization` header to a relay that asks for one. Blank for the public
     /// relays, which do not.
     pub interactor_token: String,
+    /// Settings > Scanner: credentials for the authenticated crawl, kept with the project.
+    pub scan_login_user: String,
+    pub scan_login_password: String,
     /// The session registered with the relay: the correlation id payloads are built from and
     /// the key the interactions come back encrypted to.
     pub interactor_session: Option<crate::interactor::OastSession>,
@@ -969,6 +997,8 @@ impl App {
             report_msg: String::new(),
             interactor_server: crate::interactor::DEFAULT_SERVER.into(),
             interactor_token: String::new(),
+            scan_login_user: String::new(),
+            scan_login_password: String::new(),
             interactor_session: None,
             interactor_registering: false,
             interactor_sel: None,
@@ -1156,6 +1186,11 @@ impl App {
     }
 
     /// Something a project file would keep is in the app: captured history, a Repeater
+    /// Whether any traffic has been captured yet, so a passive audit of it has something to read.
+    pub fn has_traffic(&self) -> bool {
+        !self.history.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// request, Organizer items, scope rules or Intruder payloads (saved or not).
     pub fn has_project_data(&self) -> bool {
         !self.history.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -1758,6 +1793,8 @@ mod startup_tests {
             remediation: String::new(),
             request: String::new(),
             response: String::new(),
+            point: String::new(),
+            payload: String::new(),
         }];
         crate::project::write(&file, &path).expect("the project");
 

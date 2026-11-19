@@ -99,6 +99,7 @@ pub fn default_commands() -> Vec<PaletteCommand> {
             |a| a.inspector.show_inspector = !a.inspector.show_inspector, always),
         cmd("Open browser", "Open in browser", None, "🌐", ui_proxy::open_browser, always),
         cmd("New scan", "Scan", None, "+", |a| { a.tab = Tab::Dashboard; a.show_new_scan = true; }, always),
+        cmd("Audit captured traffic (passive)", "Scan", None, "⚠", crate::actions::audit_traffic_passively, |a| a.has_traffic()),
     ]
 }
 

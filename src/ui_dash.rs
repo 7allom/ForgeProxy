@@ -266,7 +266,7 @@ pub(crate) fn issues_view(app: &mut App, ui: &mut Ui, p: &Palette, task: Option<
         }
     }
     ui.horizontal(|ui| {
-        for (label, fmt) in [("HTML", crate::export::ReportFormat::Html), ("XML", crate::export::ReportFormat::Xml)] {
+        for (label, fmt) in [("HTML", crate::export::ReportFormat::Html), ("XML", crate::export::ReportFormat::Xml), ("JSON", crate::export::ReportFormat::Json)] {
             if theme::plain_button(ui, p, &format!("Export report ({label})"), !list.is_empty()).clicked() {
                 let findings: Vec<Finding> = list.iter().map(|x| x.2.clone()).collect();
                 app.report_msg = export_report(&findings, fmt);
@@ -370,8 +370,8 @@ pub fn windows(app: &mut App, ctx: &egui::Context, p: &Palette) {
                 ui.add(egui::TextEdit::multiline(&mut app.new_scan_urls).desired_rows(4).desired_width(f32::INFINITY).hint_text("https://example.com/ — one per line"));
                 ui.add_space(6.0);
                 ui.label(RichText::new(format!(
-                    "Configuration: crawl up to {} links deep and {} locations, {} minutes at most; repeated issues are merged.",
-                    rules::CRAWL_MAX_LINK_DEPTH, rules::CRAWL_MAX_UNIQUE_LOCATIONS, rules::CRAWL_MAX_TIME_MIN)).size(11.5).color(p.disabled));
+                    "Configuration: {} intensity, crawl up to {} links deep and {} locations, {} minutes at most; repeated issues are merged. Change these under Settings > Scanner.",
+                    app.settings.scan_intensity.label().to_ascii_lowercase(), app.settings.scan_depth, app.settings.scan_max_pages, rules::CRAWL_MAX_TIME_MIN)).size(11.5).color(p.disabled));
                 ui.label(RichText::new("Only scan sites you own or have permission to test.").size(11.5).color(p.disabled));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {

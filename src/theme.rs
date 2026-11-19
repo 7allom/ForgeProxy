@@ -441,7 +441,7 @@ pub fn underline_tabs<T: Copy + PartialEq>(ui: &mut Ui, p: &Palette, items: &[(T
     }
 }
 
-/// Bold section title with the round "?" and gear icons on its left, as in the settings panes.
+/// Bold section title with the round "?" on its right.
 /// One compact strip per tool: the name, and a `?` that explains it on hover.
 ///
 /// The explanation used to sit under the title as a paragraph of its own, on every tab, with a

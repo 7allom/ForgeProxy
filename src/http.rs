@@ -380,6 +380,21 @@ pub fn send(
             error: Some(e),
         },
     };
+    send_with(&agent, method, url, headers, body, unpack)
+}
+
+/// Perform a request on an already-built [`agent`], so a caller making many requests (a scan
+/// crawl) reuses one client and its connection pool rather than building a fresh client -- and
+/// paying a fresh TLS handshake -- for every request. Whether redirects are followed is fixed
+/// when the agent is built; `unpack` decompresses gzip/deflate response bodies as [`send`] does.
+pub fn send_with(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    unpack: bool,
+) -> SendResult {
     let mut req = agent.request(method, url);
     for (k, v) in headers {
         if !k.trim().is_empty() {

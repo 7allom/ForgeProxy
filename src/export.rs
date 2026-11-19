@@ -218,14 +218,16 @@ pub fn to_csv(entries: &[HttpEntry]) -> String {
 pub enum ReportFormat {
     Html,
     Xml,
+    Json,
 }
 
 impl ReportFormat {
-    /// The format a path asks for: `.xml` writes XML, and anything else -- `.html`, another
-    /// extension, or none at all -- writes HTML.
+    /// The format a path asks for: `.xml` writes XML, `.json` writes JSON, and anything else --
+    /// `.html`, another extension, or none at all -- writes HTML.
     pub fn of_path(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
             Some(e) if e.eq_ignore_ascii_case("xml") => ReportFormat::Xml,
+            Some(e) if e.eq_ignore_ascii_case("json") => ReportFormat::Json,
             _ => ReportFormat::Html,
         }
     }
@@ -235,6 +237,7 @@ impl ReportFormat {
         match self {
             ReportFormat::Html => "html",
             ReportFormat::Xml => "xml",
+            ReportFormat::Json => "json",
         }
     }
 }
@@ -251,12 +254,46 @@ pub fn report(findings: &[Finding], fmt: ReportFormat) -> String {
         ReportFormat::Xml => {
             let mut s = String::from("<?xml version=\"1.0\"?>\n<issues>\n");
             for f in findings {
+                let background = crate::cwe_catalog::lookup(f.cwe).map(|w| w.description.clone()).unwrap_or_default();
+                let remediation = if f.remediation.trim().is_empty() {
+                    crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
+                } else {
+                    f.remediation.clone()
+                };
                 s.push_str(&format!(
-                    "  <issue>\n    <cwe>{}</cwe>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n  </issue>\n",
-                    f.cwe, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path)));
+                    "  <issue>\n    <cwe>{}</cwe>\n    <name>{}</name>\n    <severity>{}</severity>\n    <confidence>{}</confidence>\n    <host>{}</host>\n    <path>{}</path>\n    <detail>{}</detail>\n    <background>{}</background>\n    <remediation>{}</remediation>\n  </issue>\n",
+                    f.cwe, esc(&f.name), f.severity.label(), f.confidence.label(), esc(&f.host), esc(&f.path),
+                    esc(&f.detail), esc(&background), esc(&remediation)));
             }
             s.push_str("</issues>\n");
             s
+        }
+        ReportFormat::Json => {
+            let items: Vec<serde_json::Value> = findings
+                .iter()
+                .map(|f| {
+                    let background = crate::cwe_catalog::lookup(f.cwe).map(|w| w.description.clone()).unwrap_or_default();
+                    let remediation = if f.remediation.trim().is_empty() {
+                        crate::cwe_catalog::remediation(f.cwe).unwrap_or_default()
+                    } else {
+                        f.remediation.clone()
+                    };
+                    serde_json::json!({
+                        "cwe": f.cwe,
+                        "name": f.name,
+                        "severity": f.severity.label(),
+                        "confidence": f.confidence.label(),
+                        "host": f.host,
+                        "path": f.path,
+                        "point": f.point,
+                        "detail": f.detail,
+                        "background": background,
+                        "remediation": remediation,
+                    })
+                })
+                .collect();
+            serde_json::to_string_pretty(&serde_json::json!({ "issues": items })).unwrap_or_else(|_| "{\"issues\":[]}".into())
+                + "\n"
         }
         ReportFormat::Html => {
             let mut s = String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>Scan report</title></head><body><h1>Scan report</h1>\n");
@@ -316,15 +353,18 @@ mod report_tests {
             remediation: String::new(),
             request: String::new(),
             response: String::new(),
+            point: String::new(),
+            payload: String::new(),
         }
     }
 
     /// The path decides the format: only `.xml` asks for XML, whatever its capitals.
     #[test]
     fn the_path_says_which_report_to_write_matrix() {
-        let cases: [(&str, ReportFormat); 7] = [
+        let cases: [(&str, ReportFormat); 8] = [
             ("/tmp/r.xml", ReportFormat::Xml),
             ("/tmp/r.XML", ReportFormat::Xml),
+            ("/tmp/r.json", ReportFormat::Json),
             ("/tmp/r.html", ReportFormat::Html),
             ("/tmp/r.htm", ReportFormat::Html),
             ("/tmp/r.txt", ReportFormat::Html),
@@ -376,6 +416,20 @@ mod report_tests {
         assert!(write_report(&[], &path).is_ok());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), report(&[], ReportFormat::Xml));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The JSON report is valid JSON and carries each finding with its CWE background and
+    /// remediation text pulled from the catalogue.
+    #[test]
+    fn json_report_carries_catalogue_text() {
+        let fs = vec![finding("Reflected cross-site scripting", "a.test", "/s", "a value was reflected")];
+        let out = report(&fs, ReportFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let issue = &v["issues"][0];
+        assert_eq!(issue["cwe"], 79);
+        assert_eq!(issue["name"], "Reflected cross-site scripting");
+        assert!(issue["background"].as_str().is_some_and(|s| !s.is_empty()), "CWE background included");
+        assert!(issue["remediation"].as_str().is_some_and(|s| !s.is_empty()), "remediation included");
     }
 }
 

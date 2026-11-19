@@ -122,15 +122,17 @@ If a client refuses the intercepted connection because it pins its server certif
 
 ### Scanner
 
-Start a scan from **Dashboard > New scan**, or with `forgeproxy scan` on the command line. The scanner requests the URL you give it, or follows its links (same scheme, host and port only) when crawling is on, and checks what comes back:
+Start a scan from **Dashboard > New scan**, or with `forgeproxy scan` on the command line. The scanner fetches the URL you give it, optionally follows its links (same scheme, host and port only), fills in and submits the forms it finds, and audits everything it reaches. It recognises around fifty checks across forty-four CWE categories, and each finding carries its CWE number so **Target > Issues** and every report come with an official description and remediation.
 
-- **Passive checks** on every page it fetches: missing HSTS, CSP and clickjacking protection, cookies without `Secure` or `HttpOnly`, cacheable HTTPS responses, passwords sent over plain HTTP or with autocomplete on, directory listings, and leaked email addresses or private IP addresses.
-- **Active checks** on the starting URL: a test value in the query string that comes back unchanged in the page (reflected input), and database error messages.
+- **Passive checks** read each response and send no traffic of their own: missing HSTS, CSP, clickjacking, `X-Content-Type-Options` and `Referrer-Policy` protection; permissive cross-origin sharing; cookies without `Secure`, `HttpOnly` or `SameSite`; mixed content, missing subresource integrity and active content pulled from other origins; cacheable sensitive responses; passwords sent over plain HTTP or with autocomplete on; directory listings; sensitive tokens carried in the URL; unsigned or unprotected web tokens; exposed source maps, stack traces, version banners and credentials in responses; and client-side source-to-sink and message-handler patterns. You can also run these over traffic you have already browsed, with **Audit captured traffic** from the command palette.
+- **Active checks** probe each insertion point — query and form parameters, JSON values, cookies and selected headers — with benign values built at run time, and confirm every signal against a baseline before reporting: reflected cross-site scripting, SQL, template, XPath and LDAP injection, path traversal, CR/LF response splitting, open redirection, host-header injection, prototype pollution, exposed configuration files, and open query introspection and batching. Missing anti-CSRF tokens, a session identifier that is not rotated at login, and cookie-authenticated upgraded (WebSocket) connections are reported too.
 - **Out-of-band checks**, when an Interactor relay is set up: probes for blind SSRF, blind XXE and blind command injection, with each callback matched back to the request that caused it.
 
-Findings show up in the scan's task on the Dashboard and in **All issues**, and can be exported as an HTML or XML report. **Target > Issues** lists every issue type the scanner knows about.
+**Scan intensity** — set under **Settings > Scanner** or with `--intensity` — ranges from `passive` (no active traffic at all) through `light` and `standard` to `thorough`, which adds the slower time-based injection probes. The crawl and every probe stay inside the project's **scope** when one is set, and fall back to same-origin otherwise. Give the crawler a username and password under **Settings > Scanner** (kept with the project) and it submits them to the first login form it meets, then audits the pages behind the login and checks that the session identifier was rotated.
 
-The Dashboard also has a **live passive crawl** task. While its **Capturing** switch is on, it lists the items your proxied browsing adds to the site map. It doesn't run the checks above.
+Findings show up in the scan's task on the Dashboard and in **All issues**, and export as an HTML, XML or JSON report — the XML and JSON carry the CWE background and remediation text as well. **Target > Issues** lists every weakness the scanner knows about.
+
+The Dashboard also has a **live passive crawl** task. While its **Capturing** switch is on, it lists the items your proxied browsing adds to the site map; use **Audit captured traffic** to run the passive checks over them.
 
 ### Manual testing tools
 
@@ -179,8 +181,12 @@ forgeproxy proxy --project capture.forge --duration 600
 # crawl and scan a site, write a report, and fail the CI job on any finding
 forgeproxy scan https://staging.example.com --crawl --report issues.html --fail-on-findings
 
-# findings as JSON, with out-of-band checks through an Interactor relay
-forgeproxy scan https://staging.example.com --crawl --json --interactor relay.example.com
+# a thorough scan behind a login, written as a JSON report (carrying CWE text and remediation)
+forgeproxy scan https://staging.example.com --crawl --intensity thorough \
+  --login-user tester --login-password 's3cret!' --report issues.json
+
+# out-of-band (blind) checks through an Interactor relay
+forgeproxy scan https://staging.example.com --crawl --interactor relay.example.com
 
 # send a raw request saved in a file
 forgeproxy repeat --req login.txt --target https://staging.example.com --follow-redirects

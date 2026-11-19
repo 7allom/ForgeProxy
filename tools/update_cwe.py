@@ -40,37 +40,66 @@ def scanner_cwes():
     return found
 
 
-def get_json(url):
+def get_json(url, allow_404=False):
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "ForgeProxy-update_cwe"})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            sys.exit(f"{url}: 404 -- one of the numbers in src/scan.rs is not a current CWE weakness")
+            if allow_404:
+                return None
+            sys.exit(f"{url}: 404 -- one of the numbers in src/scan.rs is not a current CWE entry")
         raise
     except urllib.error.URLError as e:
         sys.exit(f"could not reach {API} ({e.reason}); try --from-dir with a copy of MITRE's json_repo")
 
 
 def from_api(ids):
+    """Fetch every scanner CWE. Most are weaknesses; a few (e.g. CWE-16 Configuration) are
+    categories, which the weakness endpoint 404s, so those are fetched from the category
+    endpoint instead. The weakness batch is tried first and, when any id in it is not a
+    weakness, MITRE 404s the whole batch, so each id is then resolved on its own."""
     version = get_json(f"{API}/cwe/version")
-    weaknesses = get_json(f"{API}/cwe/weakness/{','.join(str(i) for i in sorted(ids))}")["Weaknesses"]
-    return version, weaknesses
+    ids_sorted = sorted(ids)
+    batch = get_json(f"{API}/cwe/weakness/{','.join(str(i) for i in ids_sorted)}", allow_404=True)
+    entries = list(batch["Weaknesses"]) if batch else []
+    have = {int(w["ID"]) for w in entries}
+    for i in ids_sorted:
+        if i in have:
+            continue
+        w = get_json(f"{API}/cwe/weakness/{i}", allow_404=True)
+        if w and w.get("Weaknesses"):
+            entries.extend(w["Weaknesses"])
+            continue
+        c = get_json(f"{API}/cwe/category/{i}", allow_404=True)
+        if c and c.get("Categories"):
+            entries.extend(c["Categories"])
+            continue
+        sys.exit(f"CWE-{i} is neither a current weakness nor a category in MITRE's API")
+    return version, entries
 
 
 def from_dir(folder, ids):
     folder = Path(folder)
     version = json.loads((folder / "cwev.json").read_text(encoding="utf-8"))
-    weaknesses = []
+    entries = []
     for i in sorted(ids):
+        # a weakness lives under W/, a category under C/ in MITRE's json_repo layout
         path = folder / "W" / f"{i}.json"
         if not path.exists():
-            sys.exit(f"{path} is missing -- CWE-{i} is not a current weakness in that copy")
+            path = folder / "C" / f"{i}.json"
+        if not path.exists():
+            sys.exit(f"CWE-{i} is missing from that copy (looked in W/ and C/)")
         data = json.loads(path.read_text(encoding="utf-8"))
-        # a file may hold the bare entry or the API's {"Weaknesses": [...]} wrapper
-        weaknesses.extend(data["Weaknesses"] if "Weaknesses" in data else [data])
-    return version, weaknesses
+        # a file may hold the bare entry or the API's {"Weaknesses"/"Categories": [...]} wrapper
+        for key in ("Weaknesses", "Categories"):
+            if key in data:
+                entries.extend(data[key])
+                break
+        else:
+            entries.append(data)
+    return version, entries
 
 
 def clean(text):
@@ -110,7 +139,8 @@ def entry(w):
     return {
         "id": int(w["ID"]),
         "name": name,
-        "description": clean(w.get("Description")),
+        # weaknesses carry a Description; a category carries a Summary instead
+        "description": clean(w.get("Description") or w.get("Summary")),
         "mitigations": mitigations[:MAX_MITIGATIONS],
     }
 

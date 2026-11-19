@@ -72,9 +72,10 @@ mod tests {
     #[test]
     fn undoing_a_false_positive_restores_the_checks_own_severity() {
         assert_eq!(typical_severity(scan::TLS_COOKIE_NO_SECURE.0, scan::TLS_COOKIE_NO_SECURE.1), Severity::Medium);
-        // same CWE, different check
-        assert_eq!(typical_severity(319, scan::HSTS_NOT_ENFORCED.1), Severity::Low);
-        assert_eq!(typical_severity(319, scan::CLEARTEXT_PASSWORD.1), Severity::High);
+        assert_eq!(typical_severity(scan::CLEARTEXT_PASSWORD.0, scan::CLEARTEXT_PASSWORD.1), Severity::High);
+        // one CWE shared by several checks: each keeps its own severity, told apart by name
+        assert_eq!(typical_severity(200, scan::EMAIL_DISCLOSED.1), Severity::Info);
+        assert_eq!(typical_severity(200, scan::VERSION_BANNER.1), Severity::Info);
         assert_eq!(typical_severity(scan::NO_CWE, "Something a program reported"), Severity::Info);
     }
 }

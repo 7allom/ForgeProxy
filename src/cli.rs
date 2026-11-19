@@ -1012,10 +1012,13 @@ Crawl and audit a URL, and report the issues found.
 
 Options:
   --crawl                Follow same-site links, not just the one page.
+  --intensity <level>    How hard to probe: passive, light, standard (default) or thorough.
+  --login-user <name>    Submit these credentials to the first login form found, then crawl
+  --login-password <pw>    authenticated (checks that the session id is rotated on login).
   --depth <n>            How far to follow links when crawling (default 4).
   --max-pages <n>        Stop after this many pages (default 1500).
   --project <path>       Keep the findings and the traffic in this .forge file.
-  --report <path>        Write the issues to this file (.xml for XML, else HTML).
+  --report <path>        Write the issues to this file (.xml for XML, .json for JSON, else HTML).
   --fail-on-findings     Exit 2 when the scan reports one issue or more.
   --json                 Print the findings as JSON instead of a table.
   --interactor <server>  Interactor relay for out-of-band (blind) checks. Defaults to the one
@@ -1029,7 +1032,7 @@ Options:
 fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let parsed = match SubArgs::parse(
         argv,
-        &["--depth", "--max-pages", "--project", "--report", "--config", "--interactor", "--interactor-token", "--oast-settle-ms"],
+        &["--depth", "--max-pages", "--project", "--report", "--config", "--interactor", "--interactor-token", "--oast-settle-ms", "--intensity", "--login-user", "--login-password"],
         &["--crawl", "--fail-on-findings", "--json"],
         &[],
     ) {
@@ -1057,6 +1060,10 @@ fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Ok(n) => std::time::Duration::from_millis(n as u64),
             Err(e) => return refuse(err, &e),
         },
+        intensity: parsed
+            .value("--intensity")
+            .map(crate::checks::Intensity::from_name)
+            .unwrap_or_default(),
     };
     let settings = settings_of_config(&parsed, err);
     let opts = settings.send_options();
@@ -1069,9 +1076,20 @@ fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if oast.is_some() {
         let _ = writeln!(err, "Out-of-band checks via {}...", crate::interactor::server_host(&relay));
     }
-    let _ = writeln!(err, "{} {url}...", if crawl { "Crawling and auditing" } else { "Auditing" });
-    let outcome = crate::scan::run_scan(url, crawl, limits, oast, &opts, &mut |line| {
-        let _ = writeln!(err, "  {line}");
+    let _ = writeln!(err, "{} {url} at {} intensity...", if crawl { "Crawling and auditing" } else { "Auditing" }, limits.intensity.label().to_ascii_lowercase());
+    // A command-line scan runs to completion; the flag is here so the one engine has a stop to
+    // read, and so a future signal handler can set it.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let login = crate::scan::Login {
+        username: parsed.value("--login-user").unwrap_or("").to_string(),
+        password: parsed.value("--login-password").unwrap_or("").to_string(),
+    };
+    let ctx = crate::scan::ScanContext { scope: None, login: login.is_set().then_some(login) };
+    if ctx.login.is_some() {
+        let _ = writeln!(err, "Logging in to the first login form found...");
+    }
+    let outcome = crate::scan::run_scan(url, crawl, limits, oast, &opts, &ctx, &stop, &mut |method, u, _elapsed, r| {
+        let _ = writeln!(err, "  {method} {u} — {}", r.status);
     });
 
     if parsed.has("--json") {

@@ -46,6 +46,11 @@ const PAGES: &[PageInfo] = &[
         card("Storage and limits", "How much traffic is kept in memory, how much of a body is read, and what gives way when the store is full.", Home::User),
         card("Browser", "Which browser the Open browser button launches, and how.", Home::User),
     ]},
+    PageInfo { page: SettingsPage::Scanner, group: Some("Tools"), name: "Scanner", cards: &[
+        card("Audit intensity", "How hard a new scan probes: passive only, or increasingly thorough active checks.", Home::User),
+        card("Crawl limits", "How far a crawl follows same-site links, and the most pages one scan visits.", Home::User),
+        card("Login credentials", "Credentials the crawler submits to the first login form it finds, so it can audit pages behind a login. Kept with this project.", Home::Project),
+    ]},
     PageInfo { page: SettingsPage::Intruder, group: Some("Tools"), name: "Intruder", cards: &[
         card("Attack execution", "How many requests an attack sends at once, and the pause between them.", Home::User),
         card("Automatic payload placement", "How each filled-in request is addressed.", Home::User),
@@ -279,24 +284,28 @@ fn toggle_badge(ui: &mut Ui, p: &Palette, project: &mut bool) {
     });
 }
 
-/// The shared card frame: "(?)" icon, bold title, a header control drawn on the right, a "⚙"
-/// description line, the padded body, and a separator underneath.
+/// The shared card frame: bold title, a header control drawn on the right, the description
+/// line, the padded body, and a separator underneath.
+///
+/// No round "?" here. Elsewhere in the app that glyph is `theme::icon_help`, and it means
+/// "there is an explanation you cannot otherwise see" -- `theme::section_title` hangs the
+/// description off it instead of spending a line on it. A settings card already prints its
+/// description under the title, so a `?` beside it could only repeat what is on screen, and
+/// a `?` that repeats visible text teaches the eye to stop trusting the ones that don't.
 fn card_shell<R>(ui: &mut Ui, title: &str, description: &str, header: impl FnOnce(&mut Ui), add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     let strong = ui.visuals().strong_text_color();
     let weak = ui.visuals().weak_text_color();
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-        ui.painter().circle_stroke(r.center(), 6.5, egui::Stroke::new(1.2_f32, weak));
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, "?", FontId::proportional(10.5), weak);
         ui.label(RichText::new(title).font(FontId::new(14.0, egui::FontFamily::Name("bold".into()))).color(strong));
         header(ui);
     });
-    egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 8, top: 2, bottom: 0 }).show(ui, |ui| {
+    // flush with the title now that no icon holds the first 22px of the header row
+    egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 8, top: 2, bottom: 0 }).show(ui, |ui| {
         ui.add(egui::Label::new(RichText::new(description).size(12.0).color(weak)).wrap());
     });
     ui.add_space(6.0);
-    let r = egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 8, top: 0, bottom: 4 }).show(ui, add_contents).inner;
+    let r = egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 8, top: 0, bottom: 4 }).show(ui, add_contents).inner;
     ui.add_space(10.0);
     ui.separator();
     r
@@ -367,6 +376,42 @@ fn card_body(app: &mut App, ui: &mut Ui, p: &Palette, page: SettingsPage, title:
             ui.radio_value(&mut app.intercept_default, true, "Enable interception");
             ui.radio_value(&mut app.intercept_default, false, "Disable interception");
             ui.label(RichText::new("Applied when this project is opened. Turn Intercept on or off for now in Proxy > Intercept.").size(11.5).color(p.disabled));
+        }
+        (SettingsPage::Scanner, "Audit intensity") => {
+            use crate::checks::Intensity;
+            ui.label("A new scan starts at this level. Passive only sends no active probes; each higher level adds more.");
+            for level in [Intensity::PassiveOnly, Intensity::Light, Intensity::Standard, Intensity::Thorough] {
+                ui.radio_value(&mut app.settings.scan_intensity, level, level.label());
+            }
+            let note = match app.settings.scan_intensity {
+                Intensity::PassiveOnly => "Only passive checks run: response headers, cookies and body are inspected with no extra requests.",
+                Intensity::Light => "Passive checks plus a light active pass over each page's own parameters.",
+                Intensity::Standard => "The balanced level: existing parameters are fuzzed and confirmed, with out-of-band checks when a relay is set.",
+                Intensity::Thorough => "Everything in Standard plus the slower timing-based probes.",
+            };
+            ui.label(RichText::new(note).size(11.5).color(p.disabled));
+        }
+        (SettingsPage::Scanner, "Login credentials") => {
+            ui.horizontal(|ui| {
+                ui.label("Username:");
+                ui.add(egui::TextEdit::singleline(&mut app.scan_login_user).desired_width(220.0).hint_text("account the crawler logs in as"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut app.scan_login_password).password(true).desired_width(220.0));
+            });
+            ui.label(RichText::new("Left empty, the crawler does not log in. Only use an account you are authorised to test with.").size(11.5).color(p.disabled));
+        }
+        (SettingsPage::Scanner, "Crawl limits") => {
+            ui.horizontal(|ui| {
+                ui.label("Link depth:");
+                ui.add(egui::Slider::new(&mut app.settings.scan_depth, 0..=crate::state::UserSettings::SCAN_DEPTH_MAX));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Maximum pages:");
+                ui.add(egui::DragValue::new(&mut app.settings.scan_max_pages).range(1..=crate::state::UserSettings::SCAN_MAX_PAGES_MAX).speed(5.0));
+            });
+            ui.label(RichText::new("A depth of 0 audits only the start page. These bound a crawl and audit; a scan also stops at its time limit.").size(11.5).color(p.disabled));
         }
         (SettingsPage::Intruder, "Attack execution") => {
             ui.horizontal(|ui| {
