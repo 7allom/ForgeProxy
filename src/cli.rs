@@ -1086,11 +1086,17 @@ fn sub_scan(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let ctx = crate::scan::ScanContext { scope: None, login: login.is_set().then_some(login) };
     if ctx.login.is_some() {
-        let _ = writeln!(err, "Logging in to the first login form found...");
+        let _ = writeln!(err, "Logging in at the first login form the crawl finds...");
     }
     let outcome = crate::scan::run_scan(url, crawl, limits, oast, &opts, &ctx, &stop, &mut |method, u, _elapsed, r| {
         let _ = writeln!(err, "  {method} {u} — {}", r.status);
     });
+
+    // Anything the run was told to do but could not: said before the findings, so it is not
+    // lost at the end of a long report.
+    for w in &outcome.warnings {
+        let _ = writeln!(err, "Warning: {w}");
+    }
 
     if parsed.has("--json") {
         let _ = writeln!(out, "{}", findings_json(&outcome.findings));
@@ -1292,6 +1298,8 @@ Options:
   --threads <n>          How many requests to keep in flight (default 10).
   --match-status <csv>   Keep only these status codes or classes (e.g. 200,3xx).
   --hide-length <csv>    Drop results whose length is one of these.
+  --raw-payloads         Substitute each word byte for byte. Without this, characters that
+                         would otherwise end the value (a space, & or =) are percent-encoded.
   --project <path>       Keep the exchanges in this .forge file.
   --json                 Print the results as JSON instead of a table.
   --config <dir>         Read settings.json from here.
@@ -1301,7 +1309,7 @@ fn sub_intruder(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
     let parsed = match SubArgs::parse(
         argv,
         &["--req", "--wordlist", "--target", "--threads", "--match-status", "--hide-length", "--project", "--config"],
-        &["--battering-ram", "--json"],
+        &["--battering-ram", "--json", "--raw-payloads"],
         &[],
     ) {
         Ok(p) => p,
@@ -1355,7 +1363,13 @@ fn sub_intruder(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         Err(e) => return refuse(err, &e),
     };
     let settings = settings_of_config(&parsed, err);
-    let plan = std::sync::Arc::new(crate::intruder::AttackPlan::new(kind, &template, &[words]));
+    let encoding = if parsed.has("--raw-payloads") {
+        crate::intruder::PayloadEncoding::Raw
+    } else {
+        crate::intruder::PayloadEncoding::UrlUnsafe
+    };
+    let plan =
+        std::sync::Arc::new(crate::intruder::AttackPlan::new(kind, &template, &[words]).with_encoding(encoding));
     let total = plan.len();
     if total == 0 {
         let _ = writeln!(err, "These payloads produce no requests for this attack type.");
@@ -3092,6 +3106,41 @@ mod subcommand_tests {
 
     // ---- intruder -------------------------------------------------------
 
+    /// A payload with a space reaches the target whole, and --raw-payloads turns that off.
+    ///
+    /// Unencoded, the space ends the request line: the target reads the rest as the HTTP
+    /// version and sees only the first word, while the result still comes back 200.
+    #[test]
+    fn intruder_encodes_payloads_unless_told_to_send_them_raw() {
+        // 200 only when the whole payload arrived as one query value; a raw space ends the
+        // request line, so the target then sees just "1" and answers 404
+        let origin = serve(|path, _| {
+            if path == "/s?q=1%20OR%201" { (200, "whole".into()) } else { (404, "truncated".into()) }
+        });
+        let dir = work_dir("intruder-encode");
+        let req = dir.join("req.txt");
+        std::fs::write(&req, "GET /s?q=\u{00a7}x\u{00a7} HTTP/1.1\r\nHost: h.test\r\n\r\n").unwrap();
+        let words = dir.join("words.txt");
+        std::fs::write(&words, "1 OR 1\n").unwrap();
+
+        let args = [
+            "--req", req.to_str().unwrap(), "--wordlist", words.to_str().unwrap(),
+            "--target", &origin, "--json",
+        ];
+        let (code, out, _) = run(sub_intruder, &args);
+        assert_eq!(code, EXIT_OK, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["results"][0]["status"], "200 OK", "the whole payload reached the target: {out}");
+
+        let mut raw_args = args.to_vec();
+        raw_args.push("--raw-payloads");
+        let (code, out, _) = run(sub_intruder, &raw_args);
+        assert_eq!(code, EXIT_OK, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["results"][0]["status"], "404 Not Found", "raw sends the bytes as typed, space and all: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// intruder substitutes each word into the marked position, filters by status and length,
     /// and records the exchanges.
     #[test]
@@ -3190,6 +3239,21 @@ mod subcommand_tests {
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("needs a URL"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Credentials given on the command line that never reach a login form are reported on
+    /// stderr, so a headless run cannot quietly come back as an anonymous visitor's view of the
+    /// site while looking like a full authenticated audit.
+    #[test]
+    fn scan_says_so_when_the_login_never_happened() {
+        let origin = serve(|_path, _| (200, "<html><body>no form here</body></html>".to_string()));
+        let (code, _out, err) = run(
+            sub_scan,
+            &[&origin, "--login-user", "agent", "--login-password", "secret", "--intensity", "passive"],
+        );
+        assert_eq!(code, EXIT_OK, "the scan still finishes: {err}");
+        assert!(err.contains("never submitted"), "the unused credentials are reported: {err}");
+        assert!(err.contains("no login form"), "and why: {err}");
     }
 
     /// scan given an Interactor relay plants out-of-band canaries, polls the relay, and turns a

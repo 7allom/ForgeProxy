@@ -109,7 +109,8 @@ pub fn start_attack(app: &mut App) {
     // the plan computes each request from its index on demand, so a large Cluster bomb is
     // never materialised in memory
     let plan = intruder::AttackPlan::from_two(app.int_attack, &app.int_template,
-        &payload_lines(&app.int_payloads), &payload_lines(&app.int_payloads_b));
+        &payload_lines(&app.int_payloads), &payload_lines(&app.int_payloads_b))
+        .with_encoding(app.int_payload_encoding);
     if plan.is_empty() {
         app.int_msg = "These payloads produce no requests for this attack type".into();
         return;
@@ -247,6 +248,11 @@ pub fn start_scan(app: &mut App, url: String, crawl: bool) {
                 stop_clock.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
+        // Anything the run was told to do but could not goes into the task's own log, where the
+        // Dashboard shows it beside the progress lines.
+        for w in &outcome.warnings {
+            let _ = tx.send(Job::ScanProgress { task, requests, line: format!("Warning: {w}") });
+        }
         let _ = tx.send(Job::ScanDone { task, findings: outcome.findings });
     });
 }

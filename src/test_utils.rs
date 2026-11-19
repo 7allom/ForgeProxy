@@ -318,7 +318,7 @@ fn correlation_tokens(raw: &str) -> Vec<String> {
 }
 
 /// Read one HTTP request off a stream: the head, and the body named by Content-Length.
-fn read_http_request(stream: &std::net::TcpStream) -> (String, String) {
+pub(crate) fn read_http_request(stream: &std::net::TcpStream) -> (String, String) {
     use std::io::{BufRead, Read};
     let mut reader = std::io::BufReader::new(stream);
     let mut head = String::new();
@@ -396,5 +396,82 @@ impl OastMocks {
         });
 
         OastMocks { target, relay, seen }
+    }
+}
+
+/// A small routed site for the scanner's tests: a landing page that links on to a page whose
+/// query parameter is reflected unencoded, and a login form that only hands out a session when
+/// it is given the right credentials.
+///
+/// The weakness is the reflection itself -- the parameter is written back into the markup as it
+/// arrived -- so no attack string is stored here. The scanner brings its own test vectors.
+pub struct ScanTarget {
+    /// `http://127.0.0.1:<port>`, the base every path hangs off.
+    pub base: String,
+    /// Every request line the target was sent, in order, as `METHOD path` plus any body.
+    pub seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ScanTarget {
+    /// Start the target on an ephemeral port. The thread ends with the test process.
+    pub fn start() -> Self {
+        use std::io::Write;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen_t = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (head, body) = read_http_request(&stream);
+                let line = head.lines().next().unwrap_or("").to_string();
+                let method = line.split_whitespace().next().unwrap_or("").to_string();
+                let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                seen_t.lock().unwrap().push(format!("{method} {target} {body}"));
+                let has_session = head.lines().any(|l| {
+                    let (k, v) = l.split_once(':').unwrap_or(("", ""));
+                    k.trim().eq_ignore_ascii_case("cookie") && v.contains("sid=live")
+                });
+                let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+                let value = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("q="))
+                    .map(crate::codec::url_decode)
+                    .unwrap_or_default();
+                let (code, extra, payload) = match (method.as_str(), path) {
+                    // the landing page: no parameters of its own, two links onward
+                    ("GET", "/") => (200, String::new(),
+                        "<html><body><a href=\"/s?q=hi\">search</a> <a href=\"/s?q=there\">again</a> \
+                         <a href=\"/login\">sign in</a> <a href=\"/home\">home</a></body></html>".to_string()),
+                    // the reflecting page, reached only by following a link
+                    ("GET", "/s") => (200, String::new(), format!("<html><body><p>you said {value}</p></body></html>")),
+                    // the login form lives here, not on the landing page
+                    ("GET", "/login") => (200, String::new(),
+                        "<html><body><form method=\"post\" action=\"/login\">\
+                         <input name=\"user\"><input type=\"password\" name=\"pass\">\
+                         <button>go</button></form></body></html>".to_string()),
+                    ("POST", "/login") if body.contains("user=agent") && body.contains("pass=secret") =>
+                        (302, "Location: /home\r\nSet-Cookie: sid=live; Path=/\r\n".to_string(), String::new()),
+                    ("POST", "/login") => (200, String::new(), "<html><body>no</body></html>".to_string()),
+                    ("GET", "/home") if has_session => (200, String::new(),
+                        "<html><body><p>signed in</p><a href=\"/vault\">vault</a></body></html>".to_string()),
+                    ("GET", "/home") => (302, "Location: /login\r\n".to_string(), String::new()),
+                    ("GET", "/vault") if has_session => (200, String::new(), "<html><body>vault</body></html>".to_string()),
+                    _ => (404, String::new(), "<html><body>no such page</body></html>".to_string()),
+                };
+                let reason = match code { 200 => "OK", 302 => "Found", _ => "Not Found" };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n{extra}\r\n{payload}",
+                    payload.len()
+                );
+                let mut stream = stream;
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        ScanTarget { base, seen }
+    }
+
+    /// Every request line the target was sent, as `METHOD path body`.
+    pub fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
     }
 }

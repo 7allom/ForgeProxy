@@ -338,12 +338,14 @@ fn split_template(template: &str) -> (Vec<String>, Vec<String>) {
 /// (`None` keeps that position's default). If the request contains a `Content-Length`
 /// header (without `§` markers on that header line itself) and a body separated by a
 /// blank line, `Content-Length` is dynamically updated to match the substituted body length.
-fn fill_values(parts: &[String], defaults: &[String], values: &[Option<String>]) -> String {
+fn fill_values(parts: &[String], defaults: &[String], values: &[Option<String>], encoding: PayloadEncoding) -> String {
     let mut out = String::new();
     for k in 0..defaults.len() {
         out.push_str(parts.get(k).map_or("", |s| s.as_str()));
         match values.get(k).and_then(|v| v.as_ref()) {
-            Some(v) => out.push_str(v),
+            // only a substituted payload is encoded; a position left at the value the operator
+            // wrote in the template is theirs, and goes out as written
+            Some(v) => out.push_str(&encoding.apply(v)),
             None => out.push_str(&defaults[k]),
         }
     }
@@ -456,6 +458,39 @@ fn label_of(values: &[Option<String>]) -> String {
     values.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
 }
 
+/// How a payload is written into the request it is substituted into.
+///
+/// A marked position is almost always a URL query value, a urlencoded body field or a cookie,
+/// and in every one of those a raw space ends the token and a raw `&` or `=` starts the next
+/// field. Sent unencoded, the target receives something other than the test vector and answers
+/// normally, so the results table reads as healthy and the finding is missed -- which is why
+/// encoding is the default and raw is the deliberate choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PayloadEncoding {
+    /// Percent-encode everything outside the unreserved set (`A-Z a-z 0-9 - _ . ~`).
+    #[default]
+    UrlUnsafe,
+    /// Substitute the payload byte for byte, for when the exact bytes on the wire are the test.
+    Raw,
+}
+
+impl PayloadEncoding {
+    pub fn label(self) -> &'static str {
+        match self {
+            PayloadEncoding::UrlUnsafe => "URL-encode unsafe characters",
+            PayloadEncoding::Raw => "Send raw",
+        }
+    }
+
+    /// Apply the encoding to one payload.
+    pub fn apply(self, payload: &str) -> String {
+        match self {
+            PayloadEncoding::UrlUnsafe => crate::codec::url_encode(payload, false),
+            PayloadEncoding::Raw => payload.to_string(),
+        }
+    }
+}
+
 /// An attack prepared for execution: it computes request `i` from its index on demand, so
 /// even a large Cluster bomb needs no memory beyond the template and the payload lists.
 ///
@@ -470,6 +505,7 @@ pub struct AttackPlan {
     defaults: Vec<String>,
     sets: Vec<Vec<String>>,
     len: usize,
+    encoding: PayloadEncoding,
 }
 
 impl AttackPlan {
@@ -496,7 +532,7 @@ impl AttackPlan {
             }
         };
         let len = if driving.is_empty() && !matches!(kind, AttackType::Sniper | AttackType::BatteringRam) { 0 } else { len };
-        AttackPlan { kind, parts, defaults, sets, len }
+        AttackPlan { kind, parts, defaults, sets, len, encoding: PayloadEncoding::default() }
     }
 
     /// Two payload lists, the shape the current UI produces: Sniper and Battering ram take
@@ -507,6 +543,13 @@ impl AttackPlan {
             AttackType::Pitchfork | AttackType::ClusterBomb => vec![set_a.to_vec(), set_b.to_vec()],
         };
         Self::new(kind, template, &sets)
+    }
+
+    /// How payloads are written into the request. Encoding is the default; this is how a
+    /// caller asks for the bytes to go out exactly as typed.
+    pub fn with_encoding(mut self, encoding: PayloadEncoding) -> Self {
+        self.encoding = encoding;
+        self
     }
 
     /// How many requests the attack sends.
@@ -559,7 +602,7 @@ impl AttackPlan {
                 }
             }
         }
-        (label_of(&values), fill_values(&self.parts, &self.defaults, &values))
+        (label_of(&values), fill_values(&self.parts, &self.defaults, &values, self.encoding))
     }
 }
 
@@ -1083,5 +1126,54 @@ mod tests {
         for (name, lines) in PRESETS {
             assert!(!lines.is_empty(), "{name}");
         }
+    }
+
+    /// A payload carrying characters that mean something in a URL is percent-encoded before it
+    /// is substituted, so it reaches the server as one value.
+    ///
+    /// Sent raw, a space ends the request line and everything after it is read as the HTTP
+    /// version; an `&` starts a new parameter. Either way the target sees something other than
+    /// the test vector and answers 200, so the results table looks healthy and the finding is
+    /// missed.
+    #[test]
+    fn payloads_are_percent_encoded_so_they_cannot_break_the_request() {
+        let template = "GET /s?q=\u{a7}seed\u{a7} HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let cases = [
+            ("a space", "1 OR 1", "q=1%20OR%201"),
+            ("an ampersand", "a&b=c", "q=a%26b%3dc"),
+            ("an equals sign", "x=y", "q=x%3dy"),
+            ("a hash", "a#b", "q=a%23b"),
+            ("a percent", "100%", "q=100%25"),
+            ("plain text is left alone", "simple", "q=simple"),
+        ];
+        assert_table!(cases, |(name, payload, expected)| {
+            let plan = AttackPlan::from_two(AttackType::Sniper, template, &[payload.to_string()], &[]);
+            let (_, req) = plan.request(0);
+            assert!(req.contains(expected), "{name}: expected {expected} in {req:?}");
+            assert!(req.starts_with("GET /s?q="), "{name}: the request line is intact: {req:?}");
+        });
+    }
+
+    /// The raw setting turns encoding off for the operator who needs the exact bytes on the
+    /// wire -- testing how a server parses a malformed request, say.
+    #[test]
+    fn raw_encoding_substitutes_the_payload_byte_for_byte() {
+        let template = "GET /s?q=\u{a7}seed\u{a7} HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let plan = AttackPlan::from_two(AttackType::Sniper, template, &["1 OR 1".to_string()], &[])
+            .with_encoding(PayloadEncoding::Raw);
+        let (_, req) = plan.request(0);
+        assert!(req.contains("q=1 OR 1"), "the payload is sent as written: {req:?}");
+    }
+
+    /// Encoding touches the payload only: a position left at its default is untouched, so a
+    /// template's own punctuation survives.
+    #[test]
+    fn encoding_leaves_unfilled_positions_at_their_written_default() {
+        let template = "POST /f HTTP/1.1\r\nHost: a.test\r\n\r\na=\u{a7}one\u{a7}&b=\u{a7}two two\u{a7}";
+        // Sniper fills one position at a time: the other keeps the default, spaces and all
+        let plan = AttackPlan::from_two(AttackType::Sniper, template, &["x y".to_string()], &[]);
+        let (_, req) = plan.request(0);
+        assert!(req.contains("a=x%20y"), "the filled position is encoded: {req:?}");
+        assert!(req.contains("b=two two"), "the default is left as written: {req:?}");
     }
 }

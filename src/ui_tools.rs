@@ -491,6 +491,24 @@ pub fn intruder(app: &mut App, ui: &mut Ui, p: &Palette) {
             ui.label(bold("Payload settings", 13.0).color(p.strong));
             ui.label(RichText::new("One payload per line. These strings are used as payloads.").size(11.5).color(p.text));
             ui.add_space(4.0);
+            // Encoding, not a cosmetic preference: a payload holding a space, & or = is read as
+            // the end of the value unless it is encoded, and the attack then quietly tests
+            // something shorter than what was typed.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for mode in [intruder::PayloadEncoding::UrlUnsafe, intruder::PayloadEncoding::Raw] {
+                    let hint = match mode {
+                        intruder::PayloadEncoding::UrlUnsafe =>
+                            "Percent-encode anything outside A-Z a-z 0-9 - _ . ~ before substituting, so a space, & or = cannot end the value early",
+                        intruder::PayloadEncoding::Raw =>
+                            "Substitute each payload byte for byte, for when the exact bytes on the wire are what is being tested",
+                    };
+                    if theme::pill(ui, p, mode.label(), app.int_payload_encoding == mode).on_hover_text(hint).clicked() {
+                        app.int_payload_encoding = mode;
+                    }
+                }
+            });
+            ui.add_space(4.0);
             // framed so the box reads as an input on the panel's dark background
             let payload_box = |ui: &mut Ui, text: &mut String, rows: usize, salt: &str| {
                 egui::Frame::new().fill(p.panel).stroke(Stroke::new(1.0_f32, p.header)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {

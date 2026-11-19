@@ -90,6 +90,18 @@ impl BaseRequest {
         BaseRequest { method: "GET".into(), url: url.to_string(), headers: Vec::new(), body: String::new() }
     }
 
+    /// What makes this request the same *endpoint* as another: its method, its path, and the
+    /// names of its insertion points -- never their values. A crawl turns up the same endpoint
+    /// under many values (`/s?q=hi`, `/s?q=there`), and auditing each of them repeats every
+    /// probe for nothing, so the audit deduplicates on this. It mirrors `Form::signature`, so a
+    /// form and a link to the same endpoint collapse together.
+    pub fn signature(&self) -> String {
+        let path = self.url.split(['?', '#']).next().unwrap_or(&self.url);
+        let mut names: Vec<String> = self.points().into_iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        format!("{} {} [{}]", self.method, path, names.join(","))
+    }
+
     /// The body structure named by the Content-Type header.
     pub fn body_kind(&self) -> BodyKind {
         let ct = self

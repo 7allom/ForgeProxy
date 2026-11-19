@@ -424,15 +424,57 @@ pub fn reflects_marker(body: &str, marker: &str) -> bool {
 
 /// Database error signatures; seeing one is a tentative SQL-injection signal.
 pub fn sql_error_signature(body: &str) -> Option<&'static str> {
-    const SIGS: [&str; 6] = [
+    // One phrasing per engine was never enough: the same database writes a different sentence
+    // depending on the driver in front of it, and the check only ever fires on a message the
+    // unmodified response did not already carry, so breadth here costs little and silence
+    // costs a confirmed finding. Each entry is distinctive enough not to match ordinary prose.
+    const SIGS: [&str; 26] = [
+        // MySQL and MariaDB
         "You have an error in your SQL syntax",
+        "check the manual that corresponds to your MySQL server version",
+        "mysql_fetch_array()",
+        "mysql_fetch_assoc()",
+        "valid MySQL result",
+        "MySQLSyntaxErrorException",
+        "MySqlException",
+        // SQL Server
         "Unclosed quotation mark after the character string",
-        "ORA-00933",
-        "SQLSTATE[",
+        "Incorrect syntax near",
+        "OLE DB Provider for SQL Server",
+        "System.Data.SqlClient.SqlException",
+        // Oracle
+        "quoted string not properly terminated",
+        "SQL command not properly ended",
+        "OracleException",
+        // PostgreSQL
         "PostgreSQL query failed",
+        "syntax error at or near",
+        "pg_query()",
+        "PSQLException",
+        // SQLite
         "SQLite3::query",
+        "SQLITE_ERROR",
+        "SQLiteException",
+        "sqlite3.OperationalError",
+        // Access and the ODBC drivers in front of it
+        "Microsoft Access Driver",
+        "Syntax error in string in query expression",
+        // driver-level, whatever the engine behind it
+        "SQLSTATE[",
+        "SQLSyntaxErrorException",
     ];
-    SIGS.into_iter().find(|s| body.contains(s))
+    SIGS.into_iter()
+        .find(|s| body.contains(s))
+        // Oracle numbers its errors in the thousands and the code is the message; matching the
+        // shape rather than a list of codes keeps every one of them recognised.
+        .or_else(|| ora_code(body).then_some("ORA-"))
+}
+
+/// Whether the body carries an Oracle error code: `ORA-` and at least five digits.
+fn ora_code(body: &str) -> bool {
+    body.match_indices("ORA-").any(|(i, _)| {
+        body[i + 4..].bytes().take(5).filter(|b| b.is_ascii_digit()).count() == 5
+    })
 }
 
 /// A URL's origin for comparison: (scheme, host, port). The host is lower-cased with any
@@ -545,6 +587,11 @@ pub struct ScanOutcome {
     pub findings: Vec<Finding>,
     /// Every exchange the scan made, oldest first, so a caller can keep them in a project.
     pub history: Vec<crate::http::HttpEntry>,
+    /// Things the operator asked for that the scan could not do -- credentials that were set
+    /// but never submitted, say. Not findings about the target: findings describe the site,
+    /// these describe the run, and a run that quietly did less than it was told to is worth
+    /// saying out loud.
+    pub warnings: Vec<String>,
 }
 
 // ---- Out-of-band (OAST) auditing -----------------------------------------
@@ -748,6 +795,51 @@ fn command_substitution_vector(canary: &str) -> String {
     format!("{open}nslookup {canary})")
 }
 
+/// Submit `login` to the first password form on `page`, given the response `pre` that page was
+/// fetched with. Returns the Cookie header to carry for the rest of the scan, or None when the
+/// page holds no login form.
+///
+/// The session-fixation check lives here because it needs both sides of the exchange: a session
+/// identifier that was already set before the login and is unchanged after it is one an attacker
+/// can fix in a victim's browser beforehand.
+#[allow(clippy::too_many_arguments)]
+fn attempt_login(
+    page: &str,
+    pre: &crate::http::SendResult,
+    login: &Login,
+    opts: &crate::http::SendOptions,
+    history: &mut Vec<crate::http::HttpEntry>,
+    next_id: &mut usize,
+    sink: &mut ScanSink<'_>,
+    findings: &mut Vec<Finding>,
+) -> Option<Vec<(String, String)>> {
+    let form = crate::crawler::parse_forms(page, &pre.body).into_iter().find(|f| f.has_password())?;
+    let pre_ids = session_ids(&pre.headers);
+    let req = crate::crawler::login_request(&form, &login.username, &login.password);
+    // Sent without following redirects: a login almost always answers 303/302 to the landing
+    // page, and the session is set by *that* response. Followed, the Set-Cookie is left behind
+    // on a hop the caller never sees and the scan carries on anonymously.
+    let post = crate::http::send(&req.method, &req.url, &req.headers, &req.body, false, true, opts);
+    record_exchange(history, next_id, &req.method, &req.url, std::time::Duration::ZERO, &post);
+    sink(&req.method, &req.url, std::time::Duration::ZERO, &post);
+    let post_ids = session_ids(&post.headers);
+    let (host, path) = crate::http::split_url(page);
+    for (name, before) in &pre_ids {
+        if post_ids.get(name) == Some(before) {
+            let mut f = Finding::new(SESSION_NOT_ROTATED, Confidence::Firm, &host, &path,
+                &format!("The session cookie \"{name}\" was not changed when the user logged in. An \
+                          attacker who fixes a victim's session identifier before login keeps access \
+                          after it (session fixation); issue a fresh session on authentication."));
+            f.point = format!("session cookie \"{name}\"");
+            findings.push(f);
+        }
+    }
+    // carry the freshest session forward for the authenticated crawl
+    let carry = if post_ids.is_empty() { &pre_ids } else { &post_ids };
+    let joined = carry.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
+    (!joined.is_empty()).then(|| vec![("Cookie".to_string(), joined)])
+}
+
 /// A scanner request, sent on the shared crawl agent when one could be built (so a long crawl
 /// reuses one client and its connection pool) and otherwise on a fresh client per request. All
 /// scanner traffic follows redirects and unpacks compressed bodies, as it always has.
@@ -844,6 +936,7 @@ pub fn run_scan(
 ) -> ScanOutcome {
     use std::sync::atomic::Ordering;
     let mut findings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut history = Vec::new();
     let mut next_id = 0usize;
     // One client for the whole crawl and the marker probe; falls back to a per-request client
@@ -858,40 +951,31 @@ pub fn run_scan(
     let in_scope = |url: &str| ctx.scope.is_none_or(|s| s.is_in_scope(url));
 
     let mut form_targets: Vec<crate::insertion::BaseRequest> = Vec::new();
+    // Crawled pages worth probing: a URL the crawl found carries insertion points of its own,
+    // and before these were collected the active audit only ever saw the start URL and the
+    // forms, so everything a click in went unprobed.
+    let mut page_targets: Vec<crate::insertion::BaseRequest> = Vec::new();
+    let mut page_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut form_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Authenticated crawl: log in once up front, check that the session identifier was rotated,
-    // and carry the session cookie on every later request. Skipped when no login is configured.
+    // Authenticated crawl: log in at the first password form the scan sees -- on the start page
+    // if it is there, otherwise on whichever crawled page carries it -- check that the session
+    // identifier was rotated, and carry the session cookie on every later request.
+    //
+    // A site almost never puts its login form on the page a scan is pointed at, so looking only
+    // at the start page meant the credentials were usually never sent and the authenticated half
+    // of the site went unvisited, without a word about it.
+    let wants_login = ctx.login.as_ref().is_some_and(|l| l.is_set());
     let mut cookie_header: Vec<(String, String)> = Vec::new();
-    if let Some(login) = ctx.login.as_ref().filter(|l| l.is_set() && !stop.load(Ordering::Relaxed)) {
+    let mut logged_in = false;
+    if wants_login && !stop.load(Ordering::Relaxed) {
         let pre = scan_send(&agent, "GET", start, &[], "", opts);
         record_exchange(&mut history, &mut next_id, "GET", start, std::time::Duration::ZERO, &pre);
         sink("GET", start, std::time::Duration::ZERO, &pre);
-        let pre_ids = session_ids(&pre.headers);
-        if let Some(form) = crate::crawler::parse_forms(start, &pre.body).into_iter().find(|f| f.has_password()) {
-            let req = crate::crawler::login_request(&form, &login.username, &login.password);
-            let post = scan_send(&agent, &req.method, &req.url, &req.headers, &req.body, opts);
-            record_exchange(&mut history, &mut next_id, &req.method, &req.url, std::time::Duration::ZERO, &post);
-            sink(&req.method, &req.url, std::time::Duration::ZERO, &post);
-            let post_ids = session_ids(&post.headers);
-            let (host, path) = crate::http::split_url(start);
-            // session fixation: a session id that was set before login and is unchanged after it
-            for (name, before) in &pre_ids {
-                if post_ids.get(name) == Some(before) {
-                    let mut f = Finding::new(SESSION_NOT_ROTATED, Confidence::Firm, &host, &path,
-                        &format!("The session cookie \"{name}\" was not changed when the user logged in. An \
-                                  attacker who fixes a victim's session identifier before login keeps access \
-                                  after it (session fixation); issue a fresh session on authentication."));
-                    f.point = format!("session cookie \"{name}\"");
-                    findings.push(f);
-                }
-            }
-            // carry the freshest session forward for the authenticated crawl
-            let carry = if post_ids.is_empty() { &pre_ids } else { &post_ids };
-            let joined = carry.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
-            if !joined.is_empty() {
-                cookie_header.push(("Cookie".to_string(), joined));
-            }
+        let login = ctx.login.as_ref().expect("checked by wants_login");
+        if let Some(c) = attempt_login(start, &pre, login, opts, &mut history, &mut next_id, sink, &mut findings) {
+            cookie_header = c;
+            logged_in = true;
         }
     }
 
@@ -911,6 +995,24 @@ pub fn run_scan(
         findings.extend(passive_checks(&host, &path, page.starts_with("https"), &r.headers, &r.body));
         sink("GET", &page, elapsed, &r);
 
+        // Still anonymous: this page may be the one holding the login form.
+        if wants_login && !logged_in {
+            let login = ctx.login.as_ref().expect("checked by wants_login");
+            if let Some(c) = attempt_login(&page, &r, login, opts, &mut history, &mut next_id, sink, &mut findings) {
+                cookie_header = c;
+                logged_in = true;
+                // Walk the site again with the session in hand. Pages that answered the
+                // anonymous visitor with a redirect to the login form now return their real
+                // content, and the links on them have never been seen. `max_pages` still bounds
+                // the whole crawl, and this happens at most once.
+                seen.clear();
+                seen.insert(start.to_string());
+                queue.clear();
+                queue.push_back((start.to_string(), 0));
+                continue;
+            }
+        }
+
         // Forms on the page: a passive anti-CSRF check always, and -- at active intensities -- a
         // deduplicated submission to audit, filled with realistic values and its hidden fields kept.
         for form in crate::crawler::parse_forms(&page, &r.body) {
@@ -925,6 +1027,16 @@ pub fn run_scan(
             }
         }
 
+        // The page itself: its query parameters are insertion points exactly as a form's fields
+        // are. Gated by the same scope the crawl uses and skipped for the start URL, which is
+        // audited below whether or not it was crawled.
+        if active && page != start && in_scope(&page) {
+            let req = crate::insertion::BaseRequest::get(&page);
+            if !req.points().is_empty() && page_sigs.insert(req.signature()) {
+                page_targets.push(req);
+            }
+        }
+
         if crawl && depth < limits.depth {
             for link in extract_links(&page, &r.body) {
                 if in_scope(&link) && seen.insert(link.clone()) {
@@ -932,6 +1044,18 @@ pub fn run_scan(
                 }
             }
         }
+    }
+
+    // Credentials that were set but never used: the scan ran as an anonymous visitor, so
+    // everything behind the login is missing from what it reports. Said plainly, because the
+    // alternative is a clean-looking report of half a site.
+    if wants_login && !logged_in {
+        warnings.push(
+            "Login credentials were set but never submitted: no login form was found on the start \
+             page or on any page the crawl reached. The scan ran without signing in, so nothing \
+             behind the login was crawled or audited."
+                .to_string(),
+        );
     }
 
     // the start page, audited actively: each insertion point is probed, the request as a whole
@@ -959,7 +1083,7 @@ pub fn run_scan(
         findings.extend(crate::checks::active::audit_endpoint(start, &host, &path, limits.intensity, &mut send));
         // Each form discovered during the crawl is submitted and audited like any other request,
         // so its fields become insertion points. The list is already deduplicated by signature.
-        for ft in &form_targets {
+        for ft in form_targets.iter().chain(page_targets.iter()) {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -980,7 +1104,7 @@ pub fn run_scan(
         }
     }
 
-    ScanOutcome { findings: consolidate(findings), history }
+    ScanOutcome { findings: consolidate(findings), history, warnings }
 }
 
 #[cfg(test)]
@@ -1099,7 +1223,10 @@ mod tests {
         let sql_cases = [
             ("MySQL syntax error", "Error: You have an error in your SQL syntax near ''", Some("You have an error in your SQL syntax")),
             ("MSSQL unclosed quote", "Unclosed quotation mark after the character string", Some("Unclosed quotation mark after the character string")),
-            ("Oracle ORA-00933", "ORA-00933: SQL command not properly ended", Some("ORA-00933")),
+            // the message itself now names the fault, which reads better on a finding than the
+            // bare code; any ORA- code is still recognised, including ones with no phrase
+            ("Oracle ORA-00933", "ORA-00933: SQL command not properly ended", Some("SQL command not properly ended")),
+            ("Oracle code alone", "ORA-01722", Some("ORA-")),
             ("PDO SQLSTATE", "Fatal: SQLSTATE[42000]: Syntax error", Some("SQLSTATE[")),
             ("PostgreSQL error", "Warning: PostgreSQL query failed: ERROR", Some("PostgreSQL query failed")),
             ("SQLite3 error", "Warning: SQLite3::query(): near \"'\"", Some("SQLite3::query")),
@@ -1370,5 +1497,215 @@ mod tests {
         let no_cookie = entry("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
         assert!(passive_audit_history(&[with_cookie]).iter().any(|f| f.name == CSWSH.1), "a cookie-authed handshake is flagged");
         assert!(!passive_audit_history(&[no_cookie]).iter().any(|f| f.name == CSWSH.1), "no cookie, no CSWSH");
+    }
+
+    /// A crawled page's query parameters are audited actively, not just the start URL's.
+    ///
+    /// The landing page carries no parameters of its own; the reflecting page is only reachable
+    /// by following a link. Before crawled URLs were audited this scan reported nothing above
+    /// the passive checks, which is the shape a real site has: the weaknesses are a click in.
+    #[test]
+    fn a_crawled_url_is_actively_audited_not_only_the_start_page() {
+        let target = crate::test_utils::ScanTarget::start();
+        let limits = ScanLimits {
+            depth: 2,
+            max_pages: 20,
+            oast_settle: std::time::Duration::from_millis(10),
+            intensity: crate::checks::Intensity::Standard,
+        };
+        let opts = crate::http::SendOptions::default();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = run_scan(&target.base, true, limits, None, &opts, &ScanContext::default(), &stop, &mut |_, _, _, _| {});
+
+        let xss: Vec<&Finding> = outcome.findings.iter().filter(|f| f.cwe == REFLECTED_XSS.0).collect();
+        assert!(!xss.is_empty(), "the crawled page's reflected parameter is reported: {:?}",
+            outcome.findings.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+        assert!(xss.iter().any(|f| f.path.starts_with("/s")), "the finding names the crawled page: {:?}",
+            xss.iter().map(|f| f.path.as_str()).collect::<Vec<_>>());
+        assert!(xss.iter().any(|f| f.point.contains("q")), "the finding names the parameter: {:?}",
+            xss.iter().map(|f| f.point.as_str()).collect::<Vec<_>>());
+    }
+
+    /// One endpoint is audited once, however many parameter *values* the crawl happens to find.
+    ///
+    /// `/s?q=hi` and `/s?q=there` are the same endpoint with the same parameter, so probing both
+    /// would double every request for nothing. The crawl still fetches each page once; only the
+    /// audit is deduplicated.
+    #[test]
+    fn two_crawled_urls_that_differ_only_in_parameter_values_are_audited_once() {
+        let target = crate::test_utils::ScanTarget::start();
+        let limits = ScanLimits {
+            depth: 2,
+            max_pages: 20,
+            oast_settle: std::time::Duration::from_millis(10),
+            intensity: crate::checks::Intensity::Standard,
+        };
+        let opts = crate::http::SendOptions::default();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        run_scan(&target.base, true, limits, None, &opts, &ScanContext::default(), &stop, &mut |_, _, _, _| {});
+
+        let reqs = target.requests();
+        let hits = |needle: &str| reqs.iter().filter(|r| r.contains(needle)).count();
+        // the crawl fetches each variant exactly once
+        assert_eq!(hits("GET /s?q=there"), 1, "the second variant is crawled but not audited: {reqs:?}");
+        // and the first variant carries the audit, so it is requested many times over
+        assert!(hits("GET /s?q=hi") > 1, "the endpoint is audited through the first variant: {reqs:?}");
+    }
+
+    /// Active probing of crawled pages honours the target scope and the chosen intensity.
+    ///
+    /// Scope is the operator's promise about what may be touched, and the audit sends far more
+    /// traffic than the crawl does, so an excluded page must be probed by neither.
+    #[test]
+    fn crawled_pages_are_probed_only_in_scope_and_only_at_active_intensities() {
+        let run = |intensity, scope: Option<&crate::scope::TargetScope>| {
+            let target = crate::test_utils::ScanTarget::start();
+            let limits = ScanLimits {
+                depth: 2,
+                max_pages: 20,
+                oast_settle: std::time::Duration::from_millis(10),
+                intensity,
+            };
+            let opts = crate::http::SendOptions::default();
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let ctx = ScanContext { scope, login: None };
+            run_scan(&target.base, true, limits, None, &opts, &ctx, &stop, &mut |_, _, _, _| {});
+            // how many times /s was asked for: once per crawl, many more if it was audited
+            target.requests().iter().filter(|r| r.starts_with("GET /s?")).count()
+        };
+
+        let probed = run(crate::checks::Intensity::Standard, None);
+        assert!(probed > 2, "with no scope set, the crawled page is audited: {probed}");
+
+        let passive = run(crate::checks::Intensity::PassiveOnly, None);
+        assert_eq!(passive, 2, "passive only sends no probes, just the two crawl fetches");
+
+        // a scope that admits the site but excludes the reflecting page
+        let mut scope = crate::scope::TargetScope::default();
+        scope.include.push(crate::scope::ScopeRule::new("http://127.0.0.1"));
+        scope.exclude.push(crate::scope::ScopeRule::new("http://127.0.0.1/s"));
+        let out_of_scope = run(crate::checks::Intensity::Standard, Some(&scope));
+        assert_eq!(out_of_scope, 0, "an excluded page is neither crawled nor probed");
+    }
+
+    /// Credentials are submitted to a login form the crawl finds, not only to one on the start
+    /// page, and the session they return opens the pages behind it.
+    ///
+    /// Pointing a scan at a site's root is the ordinary thing to do, and almost no site puts its
+    /// login form there. Before the crawl looked, the credentials were simply never sent and the
+    /// authenticated half of the site went unseen -- silently.
+    #[test]
+    fn credentials_reach_a_login_form_found_by_the_crawl() {
+        let target = crate::test_utils::ScanTarget::start();
+        let limits = ScanLimits {
+            depth: 3,
+            max_pages: 40,
+            oast_settle: std::time::Duration::from_millis(10),
+            intensity: crate::checks::Intensity::PassiveOnly,
+        };
+        let opts = crate::http::SendOptions::default();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ScanContext {
+            scope: None,
+            login: Some(Login { username: "agent".into(), password: "secret".into() }),
+        };
+        let outcome = run_scan(&target.base, true, limits, None, &opts, &ctx, &stop, &mut |_, _, _, _| {});
+
+        let reqs = target.requests();
+        assert!(
+            reqs.iter().any(|r| r.starts_with("POST /login") && r.contains("user=agent") && r.contains("pass=secret")),
+            "the configured credentials were submitted: {reqs:?}"
+        );
+        assert!(reqs.iter().any(|r| r.starts_with("GET /vault")),
+            "a page linked only from the authenticated area was reached: {reqs:?}");
+        assert!(outcome.warnings.is_empty(), "nothing to warn about when the login worked: {:?}", outcome.warnings);
+    }
+
+    /// Credentials that are configured but never submitted are reported, rather than the scan
+    /// quietly running as an anonymous visitor and reporting whatever it could see.
+    #[test]
+    fn a_login_that_never_happened_is_warned_about() {
+        // a target with no form anywhere: a bare page that links only to itself
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::Write;
+            for stream in listener.incoming().flatten() {
+                let _ = crate::test_utils::read_http_request(&stream);
+                let payload = "<html><body>nothing to sign in to</body></html>";
+                let mut stream = stream;
+                let _ = stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len()
+                ).as_bytes());
+            }
+        });
+
+        let limits = ScanLimits {
+            depth: 1,
+            max_pages: 5,
+            oast_settle: std::time::Duration::from_millis(10),
+            intensity: crate::checks::Intensity::PassiveOnly,
+        };
+        let opts = crate::http::SendOptions::default();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ScanContext {
+            scope: None,
+            login: Some(Login { username: "agent".into(), password: "secret".into() }),
+        };
+        let outcome = run_scan(&base, true, limits, None, &opts, &ctx, &stop, &mut |_, _, _, _| {});
+
+        assert_eq!(outcome.warnings.len(), 1, "exactly one warning: {:?}", outcome.warnings);
+        let w = &outcome.warnings[0];
+        assert!(w.contains("login"), "the warning names what went unused: {w}");
+        assert!(w.to_lowercase().contains("no login form"), "the warning says why: {w}");
+    }
+
+    /// Database error messages are recognised across the engines a tester actually meets, not
+    /// just the one phrasing per engine that the first pass covered.
+    ///
+    /// The check itself was never wrong -- it drew the error out and reported it. It simply did
+    /// not know most of the sentences a database writes, so a confirmed error-based weakness
+    /// went unreported because of the wording of the message.
+    #[test]
+    fn sql_error_signatures_cover_the_common_engines() {
+        let cases = [
+            // MySQL / MariaDB
+            ("mysql manual hint", "check the manual that corresponds to your MySQL server version"),
+            ("mysql fetch", "Warning: mysql_fetch_array() expects parameter 1 to be resource"),
+            ("mysql result", "supplied argument is not a valid MySQL result resource"),
+            ("mariadb driver", "com.mysql.jdbc.exceptions.MySQLSyntaxErrorException"),
+            // SQL Server
+            ("mssql incorrect syntax", "Incorrect syntax near the keyword 'FROM'"),
+            ("mssql ole db", "Microsoft OLE DB Provider for SQL Server error '80040e14'"),
+            ("mssql client", "System.Data.SqlClient.SqlException: Invalid column name"),
+            // Oracle
+            ("oracle quoted string", "ORA-01756: quoted string not properly terminated"),
+            ("oracle missing expression", "ORA-00936: missing expression"),
+            // PostgreSQL
+            ("postgres syntax", "ERROR: syntax error at or near \"'\""),
+            ("postgres pg_query", "Warning: pg_query(): Query failed"),
+            ("postgres jdbc", "org.postgresql.util.PSQLException: ERROR"),
+            // SQLite
+            ("sqlite token", "SQLITE_ERROR: unrecognized token: \"'\""),
+            ("sqlite python", "sqlite3.OperationalError: near \"'\": syntax error"),
+            // JDBC / generic
+            ("jdbc syntax", "java.sql.SQLSyntaxErrorException: malformed statement"),
+            ("odbc access", "Microsoft Access Driver] Syntax error in string in query expression"),
+        ];
+        assert_table!(cases, |(name, body)| {
+            assert!(sql_error_signature(body).is_some(), "{name} is recognised: {body}");
+        });
+
+        // and ordinary pages still say nothing, so the check stays quiet on a healthy response
+        let quiet = [
+            ("plain page", "<html><body>Welcome back</body></html>"),
+            ("the word sql alone", "Our SQL tutorial covers SELECT statements."),
+            ("an unrelated error", "ERROR: the file could not be opened"),
+            ("a price", "Total: 100% of the order"),
+        ];
+        assert_table!(quiet, |(name, body)| {
+            assert_eq!(sql_error_signature(body), None, "{name} is not a database error: {body}");
+        });
     }
 }

@@ -254,6 +254,9 @@ pub struct UserSettings {
     pub int_concurrency: usize,
     pub int_delay_ms: u64,
     pub int_update_host: bool,
+    /// How Intruder writes a payload into a marked position.
+    #[serde(default)]
+    pub int_payload_encoding: crate::intruder::PayloadEncoding,
     pub rep_follow: bool,
     pub rep_unpack: bool,
     pub sequencer_threads: usize,
@@ -324,6 +327,7 @@ impl Default for UserSettings {
             int_concurrency: crate::rules::POOL_CONCURRENT_LIMIT,
             int_delay_ms: 0,
             int_update_host: true,
+            int_payload_encoding: crate::intruder::PayloadEncoding::default(),
             rep_follow: crate::rules::REPEATER_FOLLOW_REDIRECTS,
             rep_unpack: true,
             sequencer_threads: crate::rules::SEQUENCER_THREADS,
@@ -571,6 +575,8 @@ pub struct App {
     pub show_attack: bool,
     /// "Update Host header to match target": send the target's host instead of the template's.
     pub int_update_host: bool,
+    /// How a payload is written into a marked position: encoded (the default) or byte for byte.
+    pub int_payload_encoding: crate::intruder::PayloadEncoding,
     pub int_msg: String,
     pub int_sel: Option<(usize, usize)>,
     /// The results-table row open in the detail viewer (its history id), if any.
@@ -909,6 +915,7 @@ impl App {
             int_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             show_attack: false,
             int_update_host: true,
+            int_payload_encoding: crate::intruder::PayloadEncoding::default(),
             int_msg: String::new(),
             int_sel: None,
             int_result_sel: None,
@@ -1091,6 +1098,7 @@ impl App {
         self.int_concurrency = s.int_concurrency;
         self.int_delay_ms = s.int_delay_ms;
         self.int_update_host = s.int_update_host;
+        self.int_payload_encoding = s.int_payload_encoding;
         self.rep_follow = s.rep_follow;
         self.rep_unpack = s.rep_unpack;
         self.sequencer_threads = s.sequencer_threads;
@@ -1109,6 +1117,7 @@ impl App {
         self.settings.int_concurrency = self.int_concurrency;
         self.settings.int_delay_ms = self.int_delay_ms;
         self.settings.int_update_host = self.int_update_host;
+        self.settings.int_payload_encoding = self.int_payload_encoding;
         self.settings.rep_follow = self.rep_follow;
         self.settings.rep_unpack = self.rep_unpack;
         self.settings.sequencer_threads = self.sequencer_threads;
@@ -1853,6 +1862,28 @@ mod settings_tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(dir.join(SETTINGS_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Intruder payload encoding is remembered between sessions, and a settings file
+    /// written before the setting existed opens with payloads encoded rather than raw.
+    ///
+    /// The default matters: a file from an older build must not silently reinstate the
+    /// behaviour where a payload with a space is cut short on the wire.
+    #[test]
+    fn the_payload_encoding_is_remembered_and_defaults_to_encoding() {
+        let dir = temp_dir("payload-encoding");
+        let s = UserSettings { int_payload_encoding: crate::intruder::PayloadEncoding::Raw, ..Default::default() };
+        s.save(&dir).unwrap();
+        assert_eq!(UserSettings::load(&dir).unwrap().int_payload_encoding, crate::intruder::PayloadEncoding::Raw);
+
+        // a file written before the setting existed
+        std::fs::write(dir.join(SETTINGS_FILE), r#"{"http_timeout_secs": 30}"#).unwrap();
+        assert_eq!(
+            UserSettings::load(&dir).unwrap().int_payload_encoding,
+            crate::intruder::PayloadEncoding::UrlUnsafe,
+            "an older settings file opens with payloads encoded"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
