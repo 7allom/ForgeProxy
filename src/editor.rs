@@ -390,8 +390,26 @@ pub fn set_view_mode(ctx: &egui::Context, id: &str, mode: MessageViewMode) {
 ///
 /// The size and the Copy live here rather than in each of the dozen callers, so every message
 /// pane in the app says the same things in the same place.
+/// The view a pane actually draws, given the one the operator chose and whether this message
+/// has a GraphQL document in it.
+///
+/// The choice is kept as the operator made it -- stepping onto a response, or onto a request
+/// that is not an operation, must not forget that they had asked for GraphQL -- but a pane with
+/// no document to show falls back to Pretty, and the buttons mark Pretty as the one in force so
+/// the view that is on screen is the view that reads as selected.
+fn effective_mode(stored: MessageViewMode, has_graphql: bool) -> MessageViewMode {
+    match stored {
+        MessageViewMode::GraphQl if !has_graphql => MessageViewMode::Pretty,
+        other => other,
+    }
+}
+
 fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMode {
-    let mut mode = view_mode(ui.ctx(), id);
+    // offered only where it has something of its own to draw, so it is never a button that
+    // changes nothing
+    let has_graphql = crate::graphql::formatted(text).is_some();
+    let mut chosen = view_mode(ui.ctx(), id);
+    let mode = effective_mode(chosen, has_graphql);
     ui.horizontal(|ui| {
         egui::Frame::new()
             .stroke(egui::Stroke::new(1.0_f32, p.border_subtle))
@@ -399,7 +417,7 @@ fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMod
             .inner_margin(egui::Margin::same(1))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                for m in MessageViewMode::ALL {
+                for m in MessageViewMode::ALL.into_iter().filter(|m| *m != MessageViewMode::GraphQl || has_graphql) {
                     let tip = match m {
                         MessageViewMode::Raw => "The message as received",
                         MessageViewMode::Pretty => "JSON re-indented and coloured; XML and HTML tags indented",
@@ -415,7 +433,7 @@ fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMod
                         .on_hover_text(tip)
                         .clicked()
                     {
-                        mode = m;
+                        chosen = m;
                     }
                 }
             });
@@ -441,8 +459,9 @@ fn mode_switch(ui: &mut Ui, p: &Palette, id: &str, text: &str) -> MessageViewMod
             .on_hover_text("Bytes and lines in this message");
         });
     });
-    set_view_mode(ui.ctx(), id, mode);
-    mode
+    // the operator's choice is remembered as they made it; what this pane draws is what it can
+    set_view_mode(ui.ctx(), id, chosen);
+    effective_mode(chosen, has_graphql)
 }
 
 #[derive(Default)]
@@ -640,6 +659,7 @@ fn show_text(ui: &mut Ui, p: &Palette, id: &str, buf: Buffer, style: Style, min_
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::test_utils::assert_table;
 
     /// The GraphQL view shows the operation's document re-indented, not the escaped JSON
@@ -713,5 +733,33 @@ mod tests {
         assert_eq!(super::human_size(900), "900 bytes");
         assert_eq!(super::human_size(256 * 1024), "256 KiB");
         assert_eq!(super::human_size(12 * 1024 * 1024 + 300 * 1024), "12.3 MiB");
+    }
+
+    /// The GraphQL view is offered only by a message that has a GraphQL document to show, and
+    /// never stands selected over a pane it is doing nothing to.
+    ///
+    /// It used to be offered on every pane. On a response it drew exactly what Pretty drew --
+    /// pixel for pixel -- while sitting there highlighted as though it were a view of its own,
+    /// and the same went for any request that was not a GraphQL operation.
+    #[test]
+    fn the_graphql_view_is_offered_only_where_it_shows_something() {
+        let query = "POST /graphql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"query\":\"{ users { id } }\"}";
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"data\":{\"users\":[{\"id\":1}]}}";
+        let plain = "GET /item?id=1 HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+        assert!(crate::graphql::formatted(query).is_some(), "a GraphQL request has a document");
+        assert!(crate::graphql::formatted(response).is_none(), "a GraphQL response does not");
+        assert!(crate::graphql::formatted(plain).is_none(), "nor does an ordinary request");
+
+        // what the pane draws, and what the buttons show as chosen
+        let cases = [
+            ("chosen and available", MessageViewMode::GraphQl, true, MessageViewMode::GraphQl),
+            ("chosen but nothing to show", MessageViewMode::GraphQl, false, MessageViewMode::Pretty),
+            ("raw is unaffected", MessageViewMode::Raw, false, MessageViewMode::Raw),
+            ("hex is unaffected", MessageViewMode::Hex, true, MessageViewMode::Hex),
+        ];
+        assert_table!(cases, |(name, stored, has_graphql, expected)| {
+            assert_eq!(effective_mode(stored, has_graphql), expected, "{name}");
+        });
     }
 }

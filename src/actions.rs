@@ -39,7 +39,9 @@ pub fn send_repeater(app: &mut App) {
     let rec = app.recorder();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let mut r = http::send(&method, &url, &hv, &body2, follow, unpack, &opts);
+        // Repeater reads the socket itself, so the response keeps the header names the
+        // server wrote them in -- the pane is labelled Raw and has to earn it.
+        let mut r = http::send_raw(&method, &url, &hv, &body2, follow, unpack, &opts);
         let elapsed = started.elapsed();
         let elapsed_ms = elapsed.as_millis();
         let (rh, rb) = rewrite::apply(&rules_copy, false, &r.headers, &r.body);

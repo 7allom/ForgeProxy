@@ -458,6 +458,311 @@ pub fn send_with(
     }
 }
 
+impl SendResult {
+    /// A result standing in for a request that never got an answer: the note goes where the
+    /// body would, which is how the rest of the app already shows a failed send.
+    fn transport_error(note: &str) -> SendResult {
+        SendResult {
+            status: "— (transport error)".into(),
+            version: String::new(),
+            body: note.to_string(),
+            headers: String::new(),
+            length: 0,
+            mime: String::new(),
+            error: Some(note.to_string()),
+        }
+    }
+}
+
+// ---- verbatim sending -----------------------------------------------------------------
+//
+// Everything above goes through a client that normalises as it reads: header names come back
+// lowercased, because that is what makes them compare cheaply. For the scanner and the
+// intruder that is the right trade -- they match on headers, they do not read them. For the
+// tools a person reads with, it is not: a pane labelled Raw that quietly re-spells what the
+// server sent is a pane that cannot be used as evidence, and the Proxy, which reads its bytes
+// off the socket, disagreed with Repeater about the very same response.
+//
+// So those two read the socket themselves. The body is still joined up and unpacked -- a
+// recorded message has to describe the body it carries -- but the names and their order are
+// the server's own.
+
+/// Most bytes of response head read before giving up, so a server that never ends its head
+/// cannot make the client grow without bound.
+const MAX_HEAD: usize = 256 * 1024;
+
+/// How many redirects are followed before the chain is called a loop.
+const MAX_HOPS: usize = 10;
+
+/// Send one request and read the response with its header block exactly as it arrived.
+///
+/// Routing (direct, HTTP CONNECT or SOCKS5) and TLS are the ones the rest of the app uses;
+/// only the reading is ours. `follow_redirects` walks `Location` the way a browser would, up
+/// to [`MAX_HOPS`]; `unpack` decompresses a `content-encoding` the way [`send`] does.
+pub fn send_raw(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    follow_redirects: bool,
+    unpack: bool,
+    opts: &SendOptions,
+) -> SendResult {
+    let mut target = url.to_string();
+    for _ in 0..=MAX_HOPS {
+        let r = send_raw_once(method, &target, headers, body, unpack, opts);
+        if !follow_redirects || r.error.is_some() {
+            return r;
+        }
+        let code = status_code(&r.status);
+        let location = header_value(&r.headers, "location");
+        match (code, location) {
+            (Some(301..=308), Some(loc)) => target = absolute(&target, &loc),
+            _ => return r,
+        }
+    }
+    SendResult::transport_error(&format!("More than {MAX_HOPS} redirects from {url}"))
+}
+
+/// One hop: connect, write the request, read the whole response.
+fn send_raw_once(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    unpack: bool,
+    opts: &SendOptions,
+) -> SendResult {
+    let https = url.starts_with("https://");
+    let (authority, path) = split_url(url);
+    let (host, port) = match split_host_port(&authority, https) {
+        Some(hp) => hp,
+        None => return SendResult::transport_error(&format!("{url} names no host")),
+    };
+    let route = match opts.net.upstream.route() {
+        Ok(r) => r,
+        Err(e) => return SendResult::transport_error(&e.to_string()),
+    };
+    let wire = request_bytes(method, &path, &authority, headers, body);
+
+    let tcp = match crate::upstream::connect(route.as_ref(), &host, port, opts.timeout) {
+        Ok(t) => t,
+        Err(e) => return SendResult::transport_error(&format!("Could not connect to {host}:{port}: {e}")),
+    };
+    let _ = tcp.set_read_timeout(Some(opts.timeout));
+    let _ = tcp.set_write_timeout(Some(opts.timeout));
+
+    if https {
+        let config = if opts.net.verify_tls {
+            crate::proxy::upstream_client_config()
+        } else {
+            crate::upstream::insecure_client_config()
+        };
+        let name = match rustls::pki_types::ServerName::try_from(host.clone()) {
+            Ok(n) => n,
+            Err(_) => return SendResult::transport_error(&format!("{host} is not a valid server name")),
+        };
+        let conn = match rustls::ClientConnection::new(config, name) {
+            Ok(c) => c,
+            Err(e) => return SendResult::transport_error(&format!("TLS to {host}:{port} failed: {e}")),
+        };
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        exchange(&mut tls, &wire, unpack, opts)
+    } else {
+        let mut plain = tcp;
+        exchange(&mut plain, &wire, unpack, opts)
+    }
+}
+
+/// Write the request and read the answer off one stream.
+fn exchange(s: &mut (impl std::io::Read + std::io::Write), wire: &[u8], unpack: bool, opts: &SendOptions) -> SendResult {
+    if let Err(e) = std::io::Write::write_all(s, wire).and_then(|()| std::io::Write::flush(s)) {
+        return SendResult::transport_error(&format!("Could not send the request: {e}"));
+    }
+    let mut reader = std::io::BufReader::new(s);
+    let head = match read_head_bytes(&mut reader) {
+        Ok(h) => h,
+        Err(e) => return SendResult::transport_error(&e),
+    };
+    let mut raw = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut reader, opts.max_body.saturating_add(1)), &mut raw);
+    parse_raw_response(&head, raw, unpack)
+}
+
+/// Read up to and including the blank line that ends the head.
+fn read_head_bytes(r: &mut impl std::io::BufRead) -> Result<String, String> {
+    let mut head = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let n = std::io::BufRead::read_until(r, b'\n', &mut line)
+            .map_err(|e| format!("No response: {e}"))?;
+        if n == 0 {
+            return if head.is_empty() { Err("No response: the connection closed".into()) } else { Ok(String::from_utf8_lossy(&head).into_owned()) };
+        }
+        let blank = line == b"\r\n" || line == b"\n";
+        head.extend_from_slice(&line);
+        if blank {
+            return Ok(String::from_utf8_lossy(&head).into_owned());
+        }
+        if head.len() > MAX_HEAD {
+            return Err("The response head is longer than this client will read".into());
+        }
+    }
+}
+
+/// Turn a verbatim head and the bytes after it into a [`SendResult`], keeping the header names
+/// as they were written.
+fn parse_raw_response(head: &str, raw: Vec<u8>, unpack: bool) -> SendResult {
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or("").trim_end();
+    let (version, status) = match status_line.split_once(' ') {
+        Some((v, rest)) if v.starts_with("HTTP/") => (v.to_string(), rest.trim().to_string()),
+        _ => (String::new(), status_line.to_string()),
+    };
+
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut chunked = false;
+    let mut encoding = String::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else { continue };
+        let (name, value) = (name.trim_end(), value.trim());
+        let lower = name.to_ascii_lowercase();
+        if lower == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
+            chunked = true;
+            // the chunks are joined below, so the framing no longer describes the body
+            continue;
+        }
+        if lower == "content-encoding" {
+            encoding = value.to_ascii_lowercase();
+        }
+        kept.push((name.to_string(), value.to_string()));
+    }
+
+    let mut data = if chunked { dechunk(&raw) } else { raw };
+    let wire_len = data.len();
+    if unpack {
+        if let Some(plain) = unpack_body(&encoding, &data) {
+            data = plain;
+        }
+    }
+    let text = String::from_utf8_lossy(&data).into_owned();
+    let mime = kept
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+
+    // the length has to describe the body that is actually carried, so it is rewritten when the
+    // body was joined up or unpacked, and added when the response never gave one
+    let mut headers = String::new();
+    let mut wrote_length = false;
+    for (name, value) in &kept {
+        if name.eq_ignore_ascii_case("content-length") {
+            headers.push_str(&format!("{name}: {}\n", text.len()));
+            wrote_length = true;
+        } else {
+            headers.push_str(&format!("{name}: {value}\n"));
+        }
+    }
+    if !wrote_length {
+        headers.push_str(&format!("Content-Length: {}\n", text.len()));
+    }
+    SendResult { status, version, body: text, headers, length: wire_len, mime, error: None }
+}
+
+/// Join a chunked body. A malformed chunk ends the body where it stops, which is what a
+/// reader gets to see anyway.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let Some(nl) = raw[i..].iter().position(|&b| b == b'\n') else { break };
+        let line = String::from_utf8_lossy(&raw[i..i + nl]);
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else { break };
+        i += nl + 1;
+        if size == 0 {
+            break;
+        }
+        let end = (i + size).min(raw.len());
+        out.extend_from_slice(&raw[i..end]);
+        i = end;
+        // step over the CRLF that closes the chunk
+        while i < raw.len() && (raw[i] == b'\r' || raw[i] == b'\n') {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The request as bytes, with the headers the caller gave and the ones a one-shot exchange
+/// needs: a Host when none was given, and a close so the read ends at the response.
+fn request_bytes(method: &str, path: &str, authority: &str, headers: &[(String, String)], body: &str) -> Vec<u8> {
+    let mut out = format!("{method} {path} HTTP/1.1\r\n");
+    let named = |n: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+    if !named("host") {
+        out.push_str(&format!("Host: {authority}\r\n"));
+    }
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if !body.is_empty() {
+        out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
+/// "example.test:8080" split into its host and port, filling in the scheme's default.
+fn split_host_port(authority: &str, https: bool) -> Option<(String, u16)> {
+    let default = if https { 443 } else { 80 };
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':').map_or(Some(default), |p| p.parse().ok())?;
+        return Some((h.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => Some((h.to_string(), p.parse().ok()?)),
+        _ if !authority.is_empty() => Some((authority.to_string(), default)),
+        _ => None,
+    }
+}
+
+/// One header's value out of a recorded block, matched without regard to case.
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
+/// A `Location` resolved against the URL it came from.
+fn absolute(base: &str, location: &str) -> String {
+    if location.contains("://") {
+        return location.to_string();
+    }
+    let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let origin_end = base[scheme_end..].find('/').map_or(base.len(), |i| i + scheme_end);
+    let origin = &base[..origin_end];
+    if location.starts_with('/') {
+        return format!("{origin}{location}");
+    }
+    let dir = match base.rfind('/') {
+        Some(i) if i >= origin_end => &base[..=i],
+        _ => origin,
+    };
+    format!("{dir}{location}")
+}
+
 /// Split a URL into (host, path) for the history table.
 pub fn split_url(url: &str) -> (String, String) {
     let rest = url.split("://").nth(1).unwrap_or(url);
@@ -1059,5 +1364,69 @@ mod client_tests {
             let _ = rec.record(|id| entry_with(id, &format!("/p{i}")));
         }
         assert_eq!(rec.history.lock().unwrap().len(), 5, "the new limit took effect on the same recorder");
+    }
+
+    /// A raw server that answers with exactly the bytes it is given, so a test can say what
+    /// goes on the wire down to the capitalisation.
+    fn raw_server(reply: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = crate::test_utils::read_http_request(&stream);
+                let mut stream = stream;
+                let _ = std::io::Write::write_all(&mut stream, reply);
+            }
+        });
+        origin
+    }
+
+    /// The response is recorded with its header names spelled as the server spelled them.
+    ///
+    /// Read back through a client that normalises, `Content-Length` came out `content-length`
+    /// and `X-Frame-Options` came out `x-frame-options`, so the same response read one way in
+    /// Proxy history and another in Repeater. Casing is evidence in its own right -- which
+    /// header a server echoes, and how, is often the whole finding -- so a pane labelled Raw
+    /// has to show what arrived.
+    #[test]
+    fn a_raw_send_keeps_the_header_names_the_server_wrote() {
+        let origin = raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Frame-Options: DENY\r\n\
+              Set-Cookie: a=b\r\nSeRvEr: odd/1.0\r\n\r\nok",
+        );
+        let opts = SendOptions::default();
+        let r = send_raw("GET", &format!("{origin}/x"), &[], "", false, true, &opts);
+        assert_eq!(r.error, None, "the request went out: {:?}", r.error);
+        assert_eq!(r.status, "200 OK");
+        assert!(r.headers.contains("Content-Length: 2"), "casing kept: {:?}", r.headers);
+        assert!(r.headers.contains("X-Frame-Options: DENY"), "casing kept: {:?}", r.headers);
+        assert!(r.headers.contains("SeRvEr: odd/1.0"), "even odd casing is kept: {:?}", r.headers);
+        assert_eq!(r.body, "ok");
+    }
+
+    /// A chunked body is joined up and given a length that matches it, as the recorded message
+    /// has to describe the body it actually carries.
+    #[test]
+    fn a_raw_send_joins_a_chunked_body_and_relabels_it() {
+        let origin = raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n\
+              4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        );
+        let opts = SendOptions::default();
+        let r = send_raw("GET", &format!("{origin}/c"), &[], "", false, true, &opts);
+        assert_eq!(r.body, "Wikipedia", "the chunks are joined: {:?}", r.body);
+        assert!(!r.headers.to_lowercase().contains("transfer-encoding"),
+            "the framing that no longer applies is gone: {:?}", r.headers);
+        assert!(r.headers.contains("Content-Length: 9"), "and a length that matches: {:?}", r.headers);
+    }
+
+    /// Redirects are followed only when asked, so a 302 can be read as a 302.
+    #[test]
+    fn a_raw_send_follows_a_redirect_only_when_told_to() {
+        let origin = raw_server(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n");
+        let opts = SendOptions::default();
+        let r = send_raw("GET", &format!("{origin}/go"), &[], "", false, true, &opts);
+        assert_eq!(r.status, "302 Found", "left alone, the redirect is the response");
+        assert!(r.headers.contains("Location: /next"), "and its Location is readable: {:?}", r.headers);
     }
 }

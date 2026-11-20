@@ -1245,7 +1245,7 @@ fn sub_repeat(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 
 
     let _ = writeln!(err, "{method} {url}");
     let started = std::time::Instant::now();
-    let mut r = crate::http::send(&method, &url, &hv, &body, parsed.has("--follow-redirects"), true, &settings.send_options());
+    let mut r = crate::http::send_raw(&method, &url, &hv, &body, parsed.has("--follow-redirects"), true, &settings.send_options());
     let elapsed_ms = started.elapsed().as_millis();
     if !rules.is_empty() {
         let (rh, rb) = crate::rewrite::apply(&rules, false, &r.headers, &r.body);
