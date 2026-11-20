@@ -1236,11 +1236,8 @@ fn record_message(sh: &Shared, m: crate::websocket::Message, direction: crate::w
     // Everything expensive happens before the lock: rendering a megabyte of binary as hex is
     // an allocation per byte, and the window reads this store on every frame it draws.
     let length = m.payload.len();
-    // text when it is text, and hex when it is not, so a reader always has something to see
-    let payload = match std::str::from_utf8(&m.payload) {
-        Ok(t) => t.to_string(),
-        Err(_) => crate::codec::hex_encode(&m.payload),
-    };
+    // text when the frame carries text, hex when it carries bytes
+    let payload = crate::websocket::payload_for(m.opcode, &m.payload);
     let message = crate::websocket::WsMessage {
         id: 0,
         entry_id,

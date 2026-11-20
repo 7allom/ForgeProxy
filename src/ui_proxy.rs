@@ -260,6 +260,12 @@ fn websockets(app: &mut App, ui: &mut Ui, p: &Palette) {
                     ui.label(RichText::new(m.direction.label()).color(p.strong));
                     ui.label(RichText::new(m.opcode.label()).color(p.text));
                     ui.label(RichText::new(format!("{} bytes in {} frame(s)", m.length, m.frames)).size(11.5).color(p.disabled));
+                    // a binary payload is kept as hex, so say so rather than leave a reader to
+                    // wonder why the "text" is all digits
+                    if matches!(m.opcode, crate::websocket::Opcode::Binary | crate::websocket::Opcode::Reserved(_)) {
+                        ui.label(RichText::new("shown as hex").size(11.5).color(p.badge_info))
+                            .on_hover_text("This frame carries bytes, not text, so its payload is written out as hex");
+                    }
                     if m.compressed {
                         ui.label(RichText::new("compressed").size(11.5).color(p.badge_info));
                     }

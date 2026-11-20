@@ -459,9 +459,25 @@ pub fn masking_key() -> [u8; 4] {
     key
 }
 
+/// How a frame's payload is recorded for reading: text when the frame carries text, hex when
+/// it carries bytes.
+///
+/// The opcode decides, not whether the bytes happen to form valid UTF-8. A binary frame of
+/// small values -- a length prefix, a protocol tag, a run of flags -- is valid UTF-8 and reads
+/// as a row of replacement boxes, which tells a reader nothing and hides what was sent. A text
+/// frame that is not valid UTF-8 is broken in a way worth seeing, so that falls back to hex too.
+pub fn payload_for(opcode: Opcode, bytes: &[u8]) -> String {
+    let binary = matches!(opcode, Opcode::Binary | Opcode::Reserved(_));
+    match (binary, std::str::from_utf8(bytes)) {
+        (false, Ok(t)) => t.to_string(),
+        _ => crate::codec::hex_encode(bytes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_table;
 
     /// Build a frame the way a peer would send one.
     fn frame_bytes(fin: bool, rsv1: bool, opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
@@ -808,5 +824,28 @@ mod tests {
         let mut bytes = vec![0x82, 127];
         bytes.extend_from_slice(&(u64::MAX / 2).to_be_bytes());
         assert_eq!(next_frame(&bytes), Err(FrameError::TooLarge(u64::MAX / 2)));
+    }
+
+    /// A binary frame is recorded as hex, whatever its bytes happen to spell.
+    ///
+    /// The old rule was "valid UTF-8 is text", and a run of control bytes is perfectly valid
+    /// UTF-8 -- so a binary frame of 0x00..0x0F was kept as text and drawn as a row of
+    /// replacement boxes, unreadable in the table and in the detail pane alike. The protocol
+    /// already says which kind of payload it is; that is what decides now.
+    #[test]
+    fn a_binary_frame_is_recorded_as_hex_even_when_its_bytes_are_valid_utf8() {
+        let control: Vec<u8> = (0u8..16).collect();
+        assert!(std::str::from_utf8(&control).is_ok(), "the bytes really are valid UTF-8");
+
+        let cases: [(&str, Opcode, Vec<u8>, &str); 5] = [
+            ("binary that looks like text", Opcode::Binary, control.clone(), "000102030405060708090a0b0c0d0e0f"),
+            ("binary that is plainly not text", Opcode::Binary, vec![0xff, 0xfe], "fffe"),
+            ("text stays text", Opcode::Text, b"hello".to_vec(), "hello"),
+            ("text with invalid bytes falls back to hex", Opcode::Text, vec![0xff, 0x00], "ff00"),
+            ("a close frame's reason is text", Opcode::Close, b"bye".to_vec(), "bye"),
+        ];
+        assert_table!(cases, |(name, opcode, bytes, expected)| {
+            assert_eq!(payload_for(opcode, &bytes), expected, "{name}");
+        });
     }
 }
